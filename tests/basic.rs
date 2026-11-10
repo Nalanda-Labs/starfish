@@ -2264,3 +2264,97 @@ fn direct_io_reader_reads_ahead() {
         })
         .unwrap();
 }
+
+#[test]
+fn select_takes_whichever_comes_first() {
+    use starfish::sync::oneshot;
+    use starfish::{interval, select, Either};
+
+    rt(1)
+        .run(|| async {
+            // A message or a timeout, whichever is first.
+            let (sender, mut inbox) = channel::<u32>(4);
+            let quiet = select(inbox.recv(), sleep(Duration::from_millis(10))).await;
+            assert_eq!(quiet, Either::Second(()));
+            sender.send(7).await.unwrap();
+            let busy = select(inbox.recv(), sleep(Duration::from_secs(5))).await;
+            assert_eq!(busy, Either::First(Some(7)));
+
+            // Losing a race costs a channel nothing: the next value is
+            // still there for the next call.
+            for value in 0..50 {
+                let waiting = select(inbox.recv(), yield_now()).await;
+                assert_eq!(waiting, Either::Second(()));
+                sender.send(value).await.unwrap();
+                assert_eq!(select(inbox.recv(), sleep(Duration::from_secs(5))).await, Either::First(Some(value)));
+            }
+
+            // A long job watched by a ticker: the job is kept across the
+            // rounds by passing a reference.
+            let job = std::pin::pin!(async {
+                sleep(Duration::from_millis(35)).await;
+                "done"
+            });
+            let mut job = job;
+            let mut every = interval(Duration::from_millis(10));
+            let mut ticks = 0;
+            let result = loop {
+                match select(job.as_mut(), every.tick()).await {
+                    Either::First(result) => break result,
+                    Either::Second(()) => ticks += 1,
+                }
+            };
+            assert_eq!(result, "done");
+            assert_eq!(ticks, 3);
+
+            // Losing cancels: the accept below never completes, and the
+            // listener is free afterwards.
+            let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let (stop, stopped) = oneshot();
+            let accepting = spawn(async move {
+                match select(listener.accept(), stopped).await {
+                    Either::First(_) => panic!("nobody connects"),
+                    Either::Second(reason) => (reason, listener),
+                }
+            });
+            yield_now().await;
+            stop.send("shutting down").unwrap();
+            let (reason, listener) = accepting.await.unwrap();
+            assert_eq!(reason, Some("shutting down"));
+            let addr = listener.local_addr().unwrap();
+            let client = spawn(async move { TcpStream::connect(addr).await.unwrap() });
+            timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
+            client.await.unwrap();
+        })
+        .unwrap();
+}
+
+#[test]
+fn interval_ticks_without_drifting_and_skips_what_it_missed() {
+    use starfish::interval;
+
+    rt(1)
+        .run(|| async {
+            let period = Duration::from_millis(10);
+            let start = Instant::now();
+            let mut every = interval(period);
+            assert_eq!(every.period(), period);
+            // Work that takes most of a period does not push the ticks back.
+            for tick in 1..=5u32 {
+                every.tick().await;
+                let at = start.elapsed();
+                assert!(at >= period * tick, "tick {tick} early, at {at:?}");
+                assert!(at < period * tick + Duration::from_millis(8), "tick {tick} late, at {at:?}");
+                sleep(Duration::from_millis(6)).await;
+            }
+            // After a long pause there is one tick at once, not a burst.
+            sleep(Duration::from_millis(45)).await;
+            let resumed = Instant::now();
+            every.tick().await;
+            assert!(resumed.elapsed() < Duration::from_millis(5));
+            every.tick().await;
+            let gap = resumed.elapsed();
+            assert!(gap >= Duration::from_millis(9) && gap < Duration::from_millis(20), "{gap:?}");
+        })
+        .unwrap();
+}

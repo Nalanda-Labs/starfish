@@ -44,6 +44,7 @@
 //! [`channel`](sync::channel) to pass values with backpressure, and a
 //! [`Gate`](sync::Gate) to wait for work in progress before shutting down.
 //! Code that blocks goes to [`run_blocking`], off the shard.
+//! [`select`] waits for whichever of two things happens first.
 //! A task that is no longer wanted is cancelled with [`JoinHandle::abort`],
 //! and [`signal::termination`] tells the program when it is asked to stop.
 //!
@@ -94,6 +95,7 @@ mod ioqueue;
 mod reactor;
 mod runtime;
 mod sched;
+mod select;
 mod shared_channel;
 mod sharded;
 mod smp;
@@ -117,6 +119,7 @@ pub use error::{Error, Result};
 pub use ioqueue::IoProperties;
 pub use runtime::{shard_count, shard_id, Runtime};
 pub use sched::{maybe_yield, need_preempt, SchedulingGroup};
+pub use select::{interval, select, Either, Interval};
 pub use sharded::Sharded;
 pub use smp::{submit_to, submit_to_all};
 pub use task::{spawn, yield_now, JoinHandle};

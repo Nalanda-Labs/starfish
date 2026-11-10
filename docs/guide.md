@@ -12,6 +12,7 @@ the code.
 - [Tasks](#tasks)
 - [Time](#time)
 - [Yielding](#yielding)
+- [Waiting for one of several things](#waiting-for-one-of-several-things)
 - [Blocking work](#blocking-work)
 - [Working across shards](#working-across-shards)
 - [Services with an instance per shard](#services-with-an-instance-per-shard)
@@ -211,7 +212,10 @@ async fn time() {
 - A timer fires when its shard next goes round its event loop after the
   deadline, never before. While a task hogs the shard, timers are late by
   as long as it does.
-- There is no interval type; the loop above is the way to tick.
+- For a periodic tick there is [`interval`](crate::interval), which does
+  what the loop above does. If a tick is missed by a whole period or
+  more, the ticks in between are skipped: there is never a burst to catch
+  up, so a count of ticks is not a measure of time.
 - `timeout` stops the wait by dropping the future. What that means for
   the operation inside is described under [Cancellation](#cancellation):
   in short, a timed-out read or write may still have happened.
@@ -254,6 +258,55 @@ that calls `maybe_yield`.
 - Code that cannot await (a long sort, a compression call, a library that
   takes its time) cannot yield either. Cut the work into pieces or move
   it to a thread.
+
+# Waiting for one of several things
+
+[`select`](crate::select) waits for whichever of two futures finishes
+first: a message or a timer, a connection or the order to stop.
+
+```rust,no_run
+use std::time::Duration;
+use starfish::sync::{channel, oneshot};
+use starfish::{interval, select, Either};
+
+async fn worker() {
+    let (_jobs, mut inbox) = channel::<u32>(16);
+    let (_stop, stopped) = oneshot::<()>();
+    // Pinned and passed by reference, so that it survives losing a round.
+    let mut stopped = std::pin::pin!(stopped);
+    let mut report = interval(Duration::from_secs(10));
+    loop {
+        // Three things at once, by nesting. Rarest first.
+        match select(stopped.as_mut(), select(report.tick(), inbox.recv())).await {
+            Either::First(_) => return,
+            Either::Second(Either::First(())) => println!("still here"),
+            Either::Second(Either::Second(Some(job))) => println!("job {job}"),
+            Either::Second(Either::Second(None)) => return,
+        }
+    }
+}
+```
+
+**Caveats**
+
+- The first future is looked at first, and if it is ready the second is
+  not looked at at all. In a loop where the first is always ready, the
+  second starves. Put the rarer event first: the stop signal before the
+  timer, the timer before the queue of work. The `select` example was
+  first written the other way round and its timer never fired.
+- A future passed by value is dropped the moment the other one wins.
+  That is cancellation, with all it implies (see
+  [Cancellation](#cancellation)): harmless for a channel, a permit or a
+  timer, not for a read or a write.
+- To keep a future across rounds of a loop, pin it and pass
+  `future.as_mut()`. Recreating it each round is fine for things that
+  lose nothing when dropped, such as `recv` or `tick`, and wrong for
+  anything that holds progress, such as a half-finished request.
+- There are two futures, not many. More are had by nesting, which gets
+  unwieldy past three; beyond that a task per source feeding one channel
+  is clearer.
+- It is a function, not a macro: both futures are created before it is
+  called, even the one that will lose.
 
 # Blocking work
 
@@ -1521,7 +1574,8 @@ async fn serve_until_stopped(acceptor: JoinHandle<()>, serving: Gate) -> starfis
   out idle reads, or abort the connection tasks on shutdown.
 - A second Ctrl-C does nothing unless the program listens for it. To let
   an impatient operator force the exit, keep a
-  [`Signals`](crate::signal::Signals) and return at the second signal.
+  [`Signals`](crate::signal::Signals) and [`select`](crate::select)
+  between the gate closing and the next signal.
 - At the very end the runtime cancels every operation still in the
   kernel and waits until the kernel has let go of all buffers, so that
   none is freed while in use. That is normally immediate.
@@ -1722,8 +1776,9 @@ the pieces fit.
   in a low-priority [scheduling group](#scheduling-groups) writes a
   snapshot of the data to a new file, while the log's writer carries on
   and remembers what it writes; the writer then adds that to the new
-  file and switches. Handing the finished file back is done by sending
-  the writer a message on its own channel, since there is no `select`.
+  file and switches. The finished file is handed back by sending the
+  writer a message on its own channel, which keeps the writer a plain
+  loop over one queue.
 - The slowest writes take tens of milliseconds, and it is the device:
   now and then a sync takes 10 to 30 ms, on every shard at the same
   moment. Moving compaction to the background did not change that. A
@@ -1739,5 +1794,5 @@ the pieces fit.
 - No calls for links or for changing permissions.
 - No cross-shard channel with several receivers.
 - No work stealing or load balancing between shards.
-- No interval timer and no `select` over several futures.
+- No `select` over more than two futures at once, except by nesting.
 - Only Linux on x86-64.

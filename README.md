@@ -43,7 +43,7 @@ wrong). `cargo doc --open` shows it together with the API reference.
 
 ## Examples
 
-There are 48 programs in `examples/`. Run one with
+There are 49 programs in `examples/`. Run one with
 `cargo run --release --example <name>`. Those marked *server* run until
 Ctrl-C; the others do their work and exit.
 
@@ -53,6 +53,7 @@ Ctrl-C; the others do their work and exit.
 | | `tasks` | Spawning tasks, collecting results, sharing state with `Rc` |
 | | `timers` | `sleep`, `timeout` and a periodic tick that does not drift |
 | | `abort` | Cancelling a task and what happens to its state |
+| | `select` | Waiting for a job, a timer or a stop signal, whichever is first |
 | | `yielding` | The cost of not yielding, and `maybe_yield` |
 | | `panics` | A panic ends one task, not the shard |
 | | `blocking` | Running blocking code off the shard with `run_blocking` |
@@ -101,7 +102,7 @@ The servers listen on 127.0.0.1, ports 7000 to 7006.
 ## What is in it
 
 - **Tasks:** `spawn`, `JoinHandle` (with `abort`), `sleep`, `timeout`,
-  `yield_now`. A task is one allocation.
+  `interval`, `select`, `yield_now`. A task is one allocation.
 - **Blocking work:** `run_blocking` runs a closure on a thread outside the
   runtime, for system calls and libraries with no asynchronous form.
 - **Coordination:** `sync::Semaphore` to bound what runs at once on a shard,
