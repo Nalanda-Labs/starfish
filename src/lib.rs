@@ -100,6 +100,7 @@ mod timer;
 pub mod alloc;
 pub mod buf;
 pub mod fs;
+pub mod io;
 pub mod iotune;
 pub mod net;
 pub mod signal;

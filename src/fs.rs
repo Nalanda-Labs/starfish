@@ -545,6 +545,160 @@ impl File {
     }
 }
 
+/// Reads or writes a [`File`] in order, keeping the position that the file
+/// itself does not have.
+///
+/// It makes a file usable with [`BufReader`](crate::io::BufReader) and
+/// [`BufWriter`](crate::io::BufWriter). The file may be borrowed, owned or
+/// in an `Rc`; several cursors on one file each have their own position.
+///
+/// ```no_run
+/// use starfish::fs::{Cursor, File};
+/// use starfish::io::BufWriter;
+///
+/// # async fn example() -> std::io::Result<()> {
+/// let file = File::create("/tmp/report").await?;
+/// let mut out = BufWriter::new(Cursor::new(&file));
+/// for n in 0..1000 {
+///     out.write_all(format!("line {n}\n").as_bytes()).await?;
+/// }
+/// out.flush().await?;
+/// file.sync_data().await?;
+/// # Ok(())
+/// # }
+/// ```
+pub struct Cursor<F> {
+    file: F,
+    position: u64,
+}
+
+impl<F: std::borrow::Borrow<File>> Cursor<F> {
+    /// A cursor at the start of the file.
+    pub fn new(file: F) -> Cursor<F> {
+        Cursor { file, position: 0 }
+    }
+
+    /// A cursor at `position`. To append, start at the file's
+    /// [`size`](File::size).
+    pub fn at(file: F, position: u64) -> Cursor<F> {
+        Cursor { file, position }
+    }
+
+    /// Where the next read or write will take place.
+    ///
+    /// Under a [`BufReader`](crate::io::BufReader) this runs ahead of what
+    /// has been read from the reader, by the bytes still in its buffer;
+    /// under a [`BufWriter`](crate::io::BufWriter) it lags behind by the
+    /// bytes not yet flushed.
+    pub fn position(&self) -> u64 {
+        self.position
+    }
+
+    /// Moves the cursor.
+    pub fn set_position(&mut self, position: u64) {
+        self.position = position;
+    }
+
+    /// The file.
+    pub fn get_ref(&self) -> &File {
+        self.file.borrow()
+    }
+
+    /// Gives the file back.
+    pub fn into_inner(self) -> F {
+        self.file
+    }
+}
+
+impl<F: std::borrow::Borrow<File>> crate::io::Read for Cursor<F> {
+    async fn read_some(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+        let (result, buf) = self.file.borrow().read_at(buf, self.position).await;
+        if let Ok(read) = &result {
+            self.position = self.position.saturating_add(*read as u64);
+        }
+        (result, buf)
+    }
+}
+
+impl<F: std::borrow::Borrow<File>> crate::io::Write for Cursor<F> {
+    async fn write_whole(&mut self, buf: Vec<u8>) -> (io::Result<()>, Vec<u8>) {
+        let (result, buf) = self.file.borrow().write_all_at(buf, self.position).await;
+        if result.is_ok() {
+            self.position = self.position.saturating_add(buf.len() as u64);
+        }
+        (result, buf)
+    }
+}
+
+/// What the filesystem records about a file or directory, as returned by
+/// [`metadata`].
+#[derive(Clone, Copy, Debug)]
+pub struct Metadata {
+    len: u64,
+    mode: u32,
+    modified: std::time::SystemTime,
+}
+
+impl Metadata {
+    /// Length in bytes.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Whether the length is zero.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Whether this is a regular file.
+    pub fn is_file(&self) -> bool {
+        self.mode & libc::S_IFMT == libc::S_IFREG
+    }
+
+    /// Whether this is a directory.
+    pub fn is_dir(&self) -> bool {
+        self.mode & libc::S_IFMT == libc::S_IFDIR
+    }
+
+    /// The permission bits, as in `chmod`: `0o644` and the like.
+    pub fn permissions(&self) -> u32 {
+        self.mode & 0o7777
+    }
+
+    /// When the contents were last changed.
+    pub fn modified(&self) -> std::time::SystemTime {
+        self.modified
+    }
+}
+
+/// Looks up a path, following symbolic links. Fails with `NotFound` if
+/// nothing is there, which makes it the way to ask whether a file exists.
+pub async fn metadata(path: impl AsRef<Path>) -> io::Result<Metadata> {
+    let path = c_path(path.as_ref())?;
+    let mut buf: Vec<libc::statx> = Vec::with_capacity(1);
+    let sqe = opcode::Statx::new(types::Fd(libc::AT_FDCWD), path.as_ptr(), buf.as_mut_ptr().cast())
+        .mask(libc::STATX_BASIC_STATS)
+        .build();
+    // SAFETY: the pointers target the heap allocations of the CString and
+    // the Vec, both owned by the op.
+    let (result, (_path, mut buf)) = unsafe { Op::new(sqe, (path, buf)) }.await;
+    result?;
+    // SAFETY: on success the kernel initialised the one element.
+    unsafe { buf.set_len(1) };
+    let stat = buf.first().ok_or_else(|| io::Error::other("statx returned nothing"))?;
+    let since_epoch = std::time::Duration::new(
+        u64::try_from(stat.stx_mtime.tv_sec).unwrap_or(0),
+        stat.stx_mtime.tv_nsec,
+    );
+    Ok(Metadata {
+        len: stat.stx_size,
+        mode: u32::from(stat.stx_mode),
+        modified: std::time::UNIX_EPOCH
+            .checked_add(since_epoch)
+            .unwrap_or(std::time::UNIX_EPOCH),
+    })
+}
+
 /// A heap buffer with aligned memory and a capacity that is a whole number
 /// of blocks, as direct I/O requires.
 ///

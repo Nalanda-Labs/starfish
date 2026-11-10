@@ -1860,3 +1860,81 @@ fn blocking_work_runs_off_the_shard() {
         })
         .unwrap();
 }
+
+#[test]
+fn files_are_read_and_written_in_order_through_a_cursor() {
+    use starfish::fs::{metadata, remove_file, Cursor};
+
+    let path = scratch("cursor");
+    rt(1)
+        .run({
+            let path = path.clone();
+            move || async move {
+                let missing = metadata(&path).await.unwrap_err();
+                assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+
+                // Many small writes, few trips to the kernel.
+                let file = File::create(&path).await.unwrap();
+                let mut out = BufWriter::with_capacity(4096, Cursor::new(&file));
+                let mut expected = String::new();
+                for n in 0..2000 {
+                    let line = format!("line number {n}\n");
+                    out.write_all(line.as_bytes()).await.unwrap();
+                    expected.push_str(&line);
+                }
+                // The cursor is behind by what has not been flushed.
+                assert!(out.get_ref().position() < expected.len() as u64);
+                assert_eq!(out.get_ref().position() % 4096, 0);
+                out.flush().await.unwrap();
+                assert_eq!(out.get_ref().position(), expected.len() as u64);
+                file.sync_data().await.unwrap();
+
+                let found = metadata(&path).await.unwrap();
+                assert_eq!(found.len(), expected.len() as u64);
+                assert!(found.is_file() && !found.is_dir() && !found.is_empty());
+                assert_eq!(found.permissions() & 0o600, 0o600);
+                let age = found.modified().elapsed().unwrap_or_default();
+                assert!(age < Duration::from_secs(60), "{age:?}");
+                assert!(metadata(path.parent().unwrap()).await.unwrap().is_dir());
+
+                // Read back line by line, with a buffer that splits lines.
+                let mut lines = BufReader::with_capacity(100, Cursor::new(&file));
+                let mut count = 0;
+                while let Some(line) = lines.next_line().await.unwrap() {
+                    assert_eq!(line, format!("line number {count}"));
+                    count += 1;
+                }
+                assert_eq!(count, 2000);
+                // The end of a file stays the end.
+                assert_eq!(lines.next_line().await.unwrap(), None);
+
+                // Two cursors on one file keep their own places.
+                let mut head = BufReader::new(Cursor::new(&file));
+                let mut tail = BufReader::new(Cursor::at(&file, expected.len() as u64 - 17));
+                assert_eq!(tail.next_line().await.unwrap().as_deref(), Some("line number 1999"));
+                assert_eq!(head.next_line().await.unwrap().as_deref(), Some("line number 0"));
+                let mut exact = [0u8; 4];
+                head.read_exact(&mut exact).await.unwrap();
+                assert_eq!(&exact, b"line");
+
+                // Appending: start where the file ends. An owned file works
+                // as well as a borrowed one.
+                let size = file.size().await.unwrap();
+                drop((head, tail, lines));
+                let mut out = BufWriter::new(Cursor::at(file, size));
+                out.write_all(b"the end\n").await.unwrap();
+                out.flush().await.unwrap();
+                let cursor = out.into_inner();
+                assert_eq!(cursor.position(), size + 8);
+                let file = cursor.into_inner();
+                let mut tail = Cursor::new(&file);
+                tail.set_position(size);
+                let mut tail = BufReader::new(tail);
+                assert_eq!(tail.next_line().await.unwrap().as_deref(), Some("the end"));
+                assert_eq!(tail.get_ref().get_ref().size().await.unwrap(), size + 8);
+
+                remove_file(&path).await.unwrap();
+            }
+        })
+        .unwrap();
+}

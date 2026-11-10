@@ -79,7 +79,7 @@ Ctrl-C; the others do their work and exit.
 | | `kv_server` | *Server.* A text-protocol key-value store split by key |
 | | `udp_echo` | *Server.* UDP echo with a socket per shard |
 | Files | `file_copy` | Reading and writing at offsets through the page cache |
-| | `line_count` | Reading a file from start to end |
+| | `line_count` | Reading a file line by line through a cursor |
 | | `direct_io` | Aligned block I/O with `DmaFile` |
 | | `log_writer` | Many tasks appending to one file through a channel |
 | | `atomic_update` | Replacing a file safely: write, sync, rename |
@@ -113,14 +113,15 @@ The servers listen on 127.0.0.1, ports 7000 to 7005.
   Preemption is cooperative (`maybe_yield`), and the check is two memory
   reads.
 - **Disk:** `fs::File` (page cache) and `fs::DmaFile` (direct I/O), with
-  sizes, truncation, preallocation and syncing, plus directories, renaming
-  and listing. Dropping a file closes it without blocking the shard. Every
+  sizes, truncation, preallocation and syncing, plus directories, renaming,
+  listing and metadata. Dropping a file closes it without blocking the shard. Every
   device has an I/O queue per shard that orders waiting requests by group
   shares. Declare a device's capacity (`Runtime::io_properties`, measured
   with `iotune::measure`) and all shards together stay within it.
-- **Network:** `net::TcpListener`, `TcpStream`, `UdpSocket`, and
-  `BufReader`/`BufWriter` for line and length-framed protocols. Networking
+- **Network:** `net::TcpListener`, `TcpStream`, `UdpSocket`. Networking
   uses the kernel stack; there is no userspace TCP stack.
+- **Buffered I/O:** `io::BufReader` and `io::BufWriter` for lines and
+  length-framed data, over TCP streams and, through `fs::Cursor`, files.
 - **Buffers:** I/O takes owned buffers (`Vec<u8>`, `AlignedBuf`, and others
   through `buf::IoBuf`). `buf::FixedBuf` comes from a per-shard pool
   registered with io_uring; `TcpStream::send_zc` sends from one without

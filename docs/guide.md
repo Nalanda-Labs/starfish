@@ -712,6 +712,31 @@ async fn shout_lines(stream: TcpStream) -> std::io::Result<()> {
 The reader has `next_line`, `read_line`, `read_until`, `read_exact`,
 `read`, and `fill_buf` with `consume` underneath.
 
+The same two types work on files. A file has no position of its own, so a
+[`Cursor`](crate::fs::Cursor) supplies one:
+
+```rust,no_run
+use starfish::fs::{Cursor, File};
+use starfish::io::{BufReader, BufWriter};
+
+async fn copy_lines(from: &File, to: &File) -> std::io::Result<u64> {
+    let mut lines = BufReader::new(Cursor::new(from));
+    // To append instead, start the cursor at the file's size.
+    let mut out = BufWriter::new(Cursor::new(to));
+    let mut count = 0;
+    while let Some(line) = lines.next_line().await? {
+        out.write_all(line.as_bytes()).await?;
+        out.write_all(b"\n").await?;
+        count += 1;
+    }
+    out.flush().await?;
+    to.sync_data().await?; // flushed is not yet on the device
+    Ok(count)
+}
+```
+
+Both types live in [`io`](crate::io) and are re-exported from `net`.
+
 **Caveats**
 
 - Without [`limit`](crate::net::BufReader::limit), a peer that never
@@ -731,7 +756,16 @@ The reader has `next_line`, `read_line`, `read_until`, `read_exact`,
   stream.
 - A line that is not valid UTF-8 is an error from `read_line` and
   `next_line`, and is consumed. Use `read_until` for bytes.
-- These work on TCP streams only, not on files.
+- On a file, `flush` only hands the data to the kernel. It is on the
+  device after the file's own `sync_data`.
+- A cursor's position runs ahead of a reader by what is still in the
+  reader's buffer, and lags behind a writer by what is not yet flushed.
+  Do not mix reads through a `BufReader` with reads through its cursor.
+- Two writers on one file, each with its own cursor, overwrite each
+  other. Appending from several tasks needs one writer that the others
+  send to; the `log_writer` example does this.
+- A `Cursor` works on [`File`](crate::fs::File) only. Direct I/O needs
+  aligned, whole-block transfers and has no buffered interface.
 
 # UDP
 
@@ -900,8 +934,8 @@ Free functions in [`fs`](crate::fs) cover the rest:
 [`create_dir`](crate::fs::create_dir),
 [`create_dir_all`](crate::fs::create_dir_all),
 [`remove_dir`](crate::fs::remove_dir),
-[`remove_file`](crate::fs::remove_file), [`rename`](crate::fs::rename) and
-[`read_dir`](crate::fs::read_dir).
+[`remove_file`](crate::fs::remove_file), [`rename`](crate::fs::rename),
+[`read_dir`](crate::fs::read_dir) and [`metadata`](crate::fs::metadata).
 
 ```rust,no_run
 use starfish::fs::{create_dir_all, read_dir, rename, File};
@@ -946,8 +980,9 @@ async fn replace(dir: &str, name: &str, contents: Vec<u8>) -> std::io::Result<()
 - New directories get mode `0777` less the process's umask.
 - Relative paths are relative to the process's current directory, which
   all shards share.
-- There is no call for a file's metadata by path, for links, or for
-  permissions.
+- [`metadata`](crate::fs::metadata) gives a path's length, kind,
+  permission bits and modification time, following symbolic links. There
+  are no calls for creating links or changing permissions.
 
 # Registered buffers and zero-copy sends
 
@@ -1417,8 +1452,8 @@ has let go of it.
 - Networking uses the kernel's stack. There is no userspace TCP.
 - No TLS, no HTTP, no DNS resolution: addresses are `SocketAddr`s.
 - No Unix-domain sockets.
-- No buffered or streaming interface for files, and no metadata, links
-  or permissions calls.
+- No buffered interface for direct I/O, and no calls for links or for
+  changing permissions.
 - A [`shared_channel`](crate::sync::shared_channel) has one sender and one
   receiver. There is no cross-shard channel with several senders.
 - No work stealing or load balancing between shards.

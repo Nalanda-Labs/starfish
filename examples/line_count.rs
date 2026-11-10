@@ -1,26 +1,32 @@
-//! Reading a file from start to end.
+//! Reading a file line by line.
+//!
+//! A file has no position of its own, so a `Cursor` supplies one, and a
+//! `BufReader` on top finds the lines.
 //!
 //! Run with `cargo run --example line_count -- <file>`; without an
-//! argument it counts the lines of `Cargo.toml`.
+//! argument it reads `Cargo.toml`.
 
-use starfish::fs::File;
+use starfish::fs::{metadata, Cursor, File};
+use starfish::io::BufReader;
 use starfish::Runtime;
 
 async fn count(path: std::path::PathBuf) -> starfish::Result<()> {
+    let size = metadata(&path).await?.len();
     let file = File::open(&path).await?;
-    let (mut lines, mut bytes) = (0u64, 0u64);
-    let mut buf = Vec::with_capacity(256 * 1024);
+    let mut lines = BufReader::with_capacity(256 * 1024, Cursor::new(&file));
+
+    let (mut count, mut longest) = (0u64, 0usize);
+    // Bytes, not text: a file may hold anything.
+    let mut line = Vec::new();
     loop {
-        let (result, filled) = file.read_at(buf, bytes).await;
-        // `Ok(0)` is the end of the file.
-        if result? == 0 {
+        line.clear();
+        if lines.read_until(b'\n', &mut line).await? == 0 {
             break;
         }
-        lines += filled.iter().filter(|byte| **byte == b'\n').count() as u64;
-        bytes += filled.len() as u64;
-        buf = filled;
+        count += 1;
+        longest = longest.max(line.len());
     }
-    println!("{lines} lines, {bytes} bytes: {}", path.display());
+    println!("{count} lines, the longest {longest} bytes, {size} bytes in all: {}", path.display());
     Ok(())
 }
 
