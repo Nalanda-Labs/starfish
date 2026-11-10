@@ -1,0 +1,15 @@
+[package]
+name = "brine"
+version = "0.1.0"
+edition = "2021"
+description = "A shared-nothing, thread-per-core async runtime on io_uring, modelled on Seastar"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+io-uring = "0.7"
+libc = "0.2"
+slab = "0.4"
+socket2 = { version = "0.5", features = ["all"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time"] }

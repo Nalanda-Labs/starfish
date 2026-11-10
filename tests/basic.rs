@@ -1,0 +1,1077 @@
+use std::cell::Cell;
+
+// The whole suite runs on the per-shard allocator.
+#[global_allocator]
+static GLOBAL: brine::alloc::ShardAlloc = brine::alloc::ShardAlloc;
+
+use std::net::SocketAddr;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+
+use brine::fs::{AlignedBuf, DmaFile, File, DMA_ALIGNMENT};
+use brine::net::{TcpListener, TcpStream};
+use brine::{shard_count, shard_id, sleep, spawn, submit_to, submit_to_all, timeout, yield_now};
+use brine::{maybe_yield, Error, Runtime, SchedulingGroup, Sharded};
+use std::cell::RefCell;
+
+/// Tests run in parallel in one process. Unpinned, so that their shards do
+/// not all pile onto the same few CPUs and distort each other's timing.
+fn rt(shards: usize) -> Runtime {
+    Runtime::new().shards(shards).pin_threads(false)
+}
+
+#[test]
+fn spawn_and_join() {
+    let out = rt(1)
+        .run(|| async {
+            let local = Rc::new(Cell::new(0));
+            let handles: Vec<_> = (0..10)
+                .map(|i| {
+                    let local = local.clone();
+                    spawn(async move {
+                        yield_now().await;
+                        local.set(local.get() + i);
+                        i * 2
+                    })
+                })
+                .collect();
+            let mut sum = 0;
+            for handle in handles {
+                sum += handle.await.unwrap();
+            }
+            (sum, local.get())
+        })
+        .unwrap();
+    assert_eq!(out, (90, 45));
+}
+
+#[test]
+fn sleep_wakes_in_deadline_order() {
+    let order = rt(1)
+        .run(|| async {
+            let start = Instant::now();
+            let slow = spawn(async move {
+                sleep(Duration::from_millis(60)).await;
+                ("slow", start.elapsed())
+            });
+            let fast = spawn(async move {
+                sleep(Duration::from_millis(20)).await;
+                ("fast", start.elapsed())
+            });
+            let fast = fast.await.unwrap();
+            let slow = slow.await.unwrap();
+            vec![fast, slow]
+        })
+        .unwrap();
+    assert!(order[0].1 >= Duration::from_millis(20));
+    assert!(order[1].1 >= Duration::from_millis(60));
+    assert!(order[0].1 < order[1].1);
+}
+
+#[test]
+fn submit_to_runs_on_the_target_shard() {
+    let ids = rt(4)
+        .run(|| async {
+            assert_eq!(shard_id().unwrap(), 0);
+            assert_eq!(shard_count().unwrap(), 4);
+            let mut ids = Vec::new();
+            for shard in 0..4 {
+                ids.push(submit_to(shard, || async { shard_id().unwrap() }).await.unwrap());
+            }
+            // A shard can call back into the shard that called it.
+            let nested = submit_to(2, || async { submit_to(0, || async { shard_id() }).await }).await;
+            assert_eq!(nested.unwrap().unwrap().unwrap(), 0);
+            ids
+        })
+        .unwrap();
+    assert_eq!(ids, vec![0, 1, 2, 3]);
+}
+
+#[test]
+fn many_cross_shard_calls() {
+    let total = rt(3)
+        .run(|| async {
+            let handles: Vec<_> = (0..3000u64)
+                .map(|i| spawn(submit_to((i % 3) as usize, move || async move { i })))
+                .collect();
+            let mut total = 0;
+            for handle in handles {
+                total += handle.await.unwrap().unwrap();
+            }
+            total
+        })
+        .unwrap();
+    assert_eq!(total, 3000 * 2999 / 2);
+}
+
+#[test]
+fn sharded_service() {
+    let (sum, on_two, ids) = rt(4)
+        .run(|| async {
+            // Cell is neither Send nor Sync; each shard owns its own.
+            let counters = Sharded::start(|shard| Cell::new(shard as u64 * 100)).await.unwrap();
+            counters.invoke_on_all(|c| async move { c.set(c.get() + 1) }).await.unwrap();
+            counters.invoke_on(2, |c| async move { c.set(c.get() + 5) }).await.unwrap();
+            let sum = counters.map_reduce(|c| async move { c.get() }, 0, |a, b| a + b).await.unwrap();
+            let on_two = counters.invoke_on(2, |c| async move { c.get() }).await.unwrap();
+            let ids = counters.invoke_on_all(|_| async { shard_id().unwrap() }).await.unwrap();
+            assert_eq!(counters.local().unwrap().get(), 1);
+            counters.stop().await.unwrap();
+            assert!(matches!(counters.local(), Err(Error::ServiceStopped)));
+            (sum, on_two, ids)
+        })
+        .unwrap();
+    assert_eq!(sum, 100 + 200 + 300 + 4 + 5);
+    assert_eq!(on_two, 206);
+    assert_eq!(ids, vec![0, 1, 2, 3]);
+}
+
+async fn echo(stream: TcpStream) {
+    let mut buf = Vec::with_capacity(4096);
+    loop {
+        let (result, returned) = stream.read(buf).await;
+        match result {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+        let (result, returned) = stream.write_all(returned).await;
+        if result.is_err() {
+            return;
+        }
+        buf = returned;
+    }
+}
+
+#[test]
+fn tcp_echo_on_every_shard() {
+    let served_by = rt(3)
+        .run(|| async {
+            // Pick a free port on shard 0, then bind it on every shard.
+            let first = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr: SocketAddr = first.local_addr().unwrap();
+            drop(first);
+
+            let hits = Sharded::start(|_| Cell::new(0u32)).await.unwrap();
+            let bound = submit_to_all(move || async move {
+                let listener = TcpListener::bind(addr)?;
+                spawn(async move {
+                    while let Ok(stream) = listener.accept().await {
+                        let hits = hits.local().unwrap();
+                        hits.set(hits.get() + 1);
+                        spawn(echo(stream));
+                    }
+                });
+                Ok::<(), std::io::Error>(())
+            })
+            .await
+            .unwrap();
+            for result in bound {
+                result.unwrap();
+            }
+
+            let clients: Vec<_> = (0..24u32)
+                .map(|i| {
+                    spawn(async move {
+                        let stream = TcpStream::connect(addr).await.unwrap();
+                        stream.set_nodelay(true).unwrap();
+                        let message = format!("hello from client {i}").repeat(50).into_bytes();
+                        let (result, sent) = stream.write_all(message).await;
+                        result.unwrap();
+                        let mut received = Vec::new();
+                        let mut buf = Vec::with_capacity(512);
+                        while received.len() < sent.len() {
+                            let (result, returned) = stream.read(buf).await;
+                            assert!(result.unwrap() > 0, "server closed early");
+                            received.extend_from_slice(&returned);
+                            buf = returned;
+                        }
+                        assert_eq!(received, sent);
+                    })
+                })
+                .collect();
+            for client in clients {
+                client.await.unwrap();
+            }
+            hits.invoke_on_all(|h| async move { h.get() }).await.unwrap()
+            // The accept loops are still parked in the kernel here; shutdown
+            // has to cancel them.
+        })
+        .unwrap();
+    assert_eq!(served_by.iter().sum::<u32>(), 24);
+}
+
+#[test]
+fn timeout_cancels_pending_io() {
+    rt(2)
+        .run(|| async {
+            let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            // Nobody connects: the accept is cancelled in the kernel.
+            let start = Instant::now();
+            let result = timeout(Duration::from_millis(30), listener.accept()).await;
+            assert!(result.is_err());
+            assert!(start.elapsed() >= Duration::from_millis(30));
+
+            // The listener still works afterwards.
+            let client = spawn(async move { TcpStream::connect(addr).await.unwrap() });
+            let server = timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
+            let client = client.await.unwrap();
+            assert_eq!(server.peer_addr().unwrap(), client.local_addr().unwrap());
+
+            // A read with no data is cancelled too, and the buffer is not lost.
+            let read = timeout(Duration::from_millis(30), server.read(Vec::with_capacity(64))).await;
+            assert!(read.is_err());
+            let (result, _) = client.write_all(b"late".to_vec()).await;
+            result.unwrap();
+            let (result, buf) = server.read(Vec::with_capacity(64)).await;
+            assert_eq!(result.unwrap(), 4);
+            assert_eq!(buf, b"late");
+        })
+        .unwrap();
+}
+
+#[test]
+fn file_round_trip_on_another_shard() {
+    let path = scratch("round-trip.bin");
+    let path_in = path.clone();
+    let read_back = rt(2)
+        .run(move || async move {
+            let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+            let expected = data.clone();
+            let path = path_in.clone();
+            submit_to(1, move || async move {
+                let file = File::create(&path).await?;
+                let (result, _) = file.write_all_at(data, 0).await;
+                result?;
+                file.sync_all().await
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+            let file = File::open(&path_in).await.unwrap();
+            let mut contents = Vec::new();
+            let mut buf = Vec::with_capacity(64 * 1024);
+            loop {
+                let (result, returned) = file.read_at(buf, contents.len() as u64).await;
+                if result.unwrap() == 0 {
+                    break;
+                }
+                contents.extend_from_slice(&returned);
+                buf = returned;
+            }
+            assert!(File::open("/definitely/not/here").await.is_err());
+            contents == expected
+        })
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(read_back);
+}
+
+#[test]
+fn foreign_thread_can_wake_a_task() {
+    let value = rt(1)
+        .run(|| async {
+            let (tx, rx) = std::sync::mpsc::channel::<std::task::Waker>();
+            let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let setter = flag.clone();
+            let thread = std::thread::spawn(move || {
+                let waker = rx.recv().unwrap();
+                std::thread::sleep(Duration::from_millis(20));
+                setter.store(true, std::sync::atomic::Ordering::SeqCst);
+                waker.wake();
+            });
+            let mut sent = false;
+            std::future::poll_fn(|cx| {
+                if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    return std::task::Poll::Ready(());
+                }
+                if !sent {
+                    tx.send(cx.waker().clone()).unwrap();
+                    sent = true;
+                }
+                std::task::Poll::Pending
+            })
+            .await;
+            thread.join().unwrap();
+            7
+        })
+        .unwrap();
+    assert_eq!(value, 7);
+}
+
+#[test]
+fn task_panic_is_contained() {
+    let (panicked, after, pending) = rt(1)
+        .run(|| async {
+            let bad = spawn(async {
+                yield_now().await;
+                if shard_id().is_ok() {
+                    panic!("boom in a task");
+                }
+                1
+            });
+            let panicked = bad.await;
+            // The shard keeps running other tasks afterwards.
+            let after = spawn(async { 2 }).await;
+            // A task that is still pending when the runtime stops is dropped.
+            let pending = spawn(std::future::pending::<()>());
+            (panicked, after, pending)
+        })
+        .unwrap();
+    assert!(matches!(panicked, Err(Error::Panicked)));
+    assert_eq!(after.unwrap(), 2);
+    drop(pending);
+}
+
+#[test]
+fn remote_panic_is_reported_and_the_shard_survives() {
+    rt(3)
+        .run(|| async {
+            let in_future = submit_to(1, || async {
+                yield_now().await;
+                if shard_id().is_ok() {
+                    panic!("boom on shard 1");
+                }
+                5
+            })
+            .await;
+            assert!(matches!(in_future, Err(Error::Panicked)));
+
+            #[allow(unreachable_code)]
+            let in_closure = submit_to(2, || {
+                panic!("boom before the future exists");
+                async { 5 }
+            })
+            .await;
+            assert!(matches!(in_closure, Err(Error::Panicked)));
+
+            // Both shards still answer.
+            assert_eq!(submit_to(1, || async { shard_id().unwrap() }).await.unwrap(), 1);
+            assert_eq!(submit_to(2, || async { shard_id().unwrap() }).await.unwrap(), 2);
+
+            // A panicking factory fails the start and leaves nothing behind.
+            let service = Sharded::start(|shard| {
+                if shard == 1 {
+                    panic!("boom in a factory");
+                }
+                Cell::new(0u8)
+            })
+            .await;
+            assert!(matches!(service, Err(Error::Panicked)));
+
+            // A value whose Drop panics does not take the shard down either.
+            struct Bomb;
+            impl Drop for Bomb {
+                fn drop(&mut self) {
+                    panic!("boom in a destructor");
+                }
+            }
+            let bomb = Bomb;
+            let held = spawn(async move {
+                let _bomb = bomb;
+                std::future::pending::<()>().await;
+            });
+            drop(held);
+            yield_now().await;
+        })
+        .unwrap();
+}
+
+#[test]
+fn main_panic_becomes_an_error() {
+    let in_future: Result<(), Error> = rt(2).run(|| async {
+        yield_now().await;
+        panic!("boom in main");
+    });
+    assert!(matches!(in_future, Err(Error::Panicked)));
+
+    #[allow(unreachable_code)]
+    let in_closure = rt(2).run(|| {
+        panic!("boom before main's future exists");
+        async {}
+    });
+    assert!(matches!(in_closure, Err(Error::Panicked)));
+
+    // The thread is usable for a fresh runtime afterwards.
+    assert_eq!(rt(2).run(|| async { 3 }).unwrap(), 3);
+}
+
+#[test]
+fn misuse_returns_errors() {
+    // Outside a runtime.
+    assert!(matches!(shard_id(), Err(Error::NoRuntime)));
+    assert!(matches!(shard_count(), Err(Error::NoRuntime)));
+    let handle = spawn(async { 1 });
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(waker);
+    let mut handle = std::pin::pin!(handle);
+    assert!(matches!(
+        std::future::Future::poll(handle.as_mut(), &mut cx),
+        std::task::Poll::Ready(Err(Error::NoRuntime))
+    ));
+    let mut accept = std::pin::pin!(async {
+        let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        listener.accept().await.map(|_| ())
+    });
+    assert!(matches!(
+        std::future::Future::poll(accept.as_mut(), &mut cx),
+        std::task::Poll::Ready(Err(_))
+    ));
+
+    rt(2)
+        .run(|| async {
+            let missing = submit_to(9, || async {}).await;
+            assert!(matches!(missing, Err(Error::InvalidShard { shard: 9, count: 2 })));
+            // A runtime cannot be started from inside a runtime.
+            let nested = Runtime::new().shards(1).run(|| async {});
+            assert!(matches!(nested, Err(Error::AlreadyRunning)));
+            // An absurd duration sleeps "forever" instead of overflowing.
+            let forever = timeout(Duration::from_millis(10), sleep(Duration::MAX)).await;
+            assert!(forever.is_err());
+        })
+        .unwrap();
+}
+
+/// A file path on a real filesystem (direct I/O needs one).
+fn scratch(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{}-{name}", std::process::id()))
+}
+
+#[test]
+fn scheduling_groups_are_inherited() {
+    rt(2)
+        .run(|| async {
+            assert_eq!(SchedulingGroup::current().unwrap(), SchedulingGroup::DEFAULT);
+            assert_eq!(SchedulingGroup::DEFAULT.cpu_shares().unwrap(), 1000);
+            assert_eq!(SchedulingGroup::DEFAULT.name().unwrap(), "main");
+
+            let group = SchedulingGroup::create("background", 50).unwrap();
+            assert_eq!(group.name().unwrap(), "background");
+            assert_eq!((group.cpu_shares().unwrap(), group.io_shares().unwrap()), (50, 50));
+            group.set_cpu_shares(70).unwrap();
+            group.set_io_shares(900).unwrap();
+            assert_eq!((group.cpu_shares().unwrap(), group.io_shares().unwrap()), (70, 900));
+            let split = SchedulingGroup::create_with("split", 10, 20_000).unwrap();
+            assert_eq!((split.cpu_shares().unwrap(), split.io_shares().unwrap()), (10, 10_000));
+
+            let direct = group.spawn(async { SchedulingGroup::current() }).await;
+            assert_eq!(direct.unwrap().unwrap(), group);
+            let nested = group.spawn(async { spawn(async { SchedulingGroup::current() }).await }).await;
+            assert_eq!(nested.unwrap().unwrap().unwrap(), group);
+            let remote = group
+                .spawn(async { submit_to(1, || async { SchedulingGroup::current() }).await })
+                .await;
+            assert_eq!(remote.unwrap().unwrap().unwrap(), group);
+            // The caller itself is still in the default group.
+            assert_eq!(SchedulingGroup::current().unwrap(), SchedulingGroup::DEFAULT);
+
+            // There is no limit on the number of groups, and one created
+            // late works on a shard that has never heard of it.
+            let mut last = group;
+            for i in 0..300 {
+                last = SchedulingGroup::create(&format!("g{i}"), 100).unwrap();
+            }
+            assert_eq!(last.name().unwrap(), "g299");
+            let remote = last
+                .spawn(async { submit_to(1, || async { SchedulingGroup::current() }).await })
+                .await;
+            assert_eq!(remote.unwrap().unwrap().unwrap(), last);
+        })
+        .unwrap();
+    assert!(matches!(SchedulingGroup::create("outside", 1), Err(Error::NoRuntime)));
+}
+
+#[test]
+fn cpu_time_follows_shares() {
+    let (low, high) = rt(1)
+        .run(|| async {
+            let low = SchedulingGroup::create("low", 100).unwrap();
+            let high = SchedulingGroup::create("high", 300).unwrap();
+            let stop = Rc::new(Cell::new(false));
+            let spin = |stop: Rc<Cell<bool>>| async move {
+                let mut iterations = 0u64;
+                while !stop.get() {
+                    iterations += 1;
+                    maybe_yield().await;
+                }
+                iterations
+            };
+            let low = low.spawn(spin(stop.clone()));
+            let high = high.spawn(spin(stop.clone()));
+            // The sleeper is in the default group and still gets to run.
+            let start = Instant::now();
+            sleep(Duration::from_millis(300)).await;
+            assert!(start.elapsed() < Duration::from_millis(400), "sleeper was starved");
+            stop.set(true);
+            (low.await.unwrap(), high.await.unwrap())
+        })
+        .unwrap();
+    let ratio = high as f64 / low as f64;
+    assert!((2.0..4.5).contains(&ratio), "expected about 3x, got {ratio:.2} ({high} vs {low})");
+}
+
+#[test]
+fn disk_queue_follows_shares() {
+    let path = scratch("disk-queue.bin");
+    let path_in = path.clone();
+    let order = rt(1)
+        .io_depth(1)
+        .run(move || async move {
+            // Equal CPU shares: only the I/O shares differ.
+            let low = SchedulingGroup::create_with("low", 500, 100).unwrap();
+            let high = SchedulingGroup::create_with("high", 500, 400).unwrap();
+            let file = Rc::new(File::create(&path_in).await.unwrap());
+            let order = Rc::new(RefCell::new(Vec::new()));
+            let mut handles = Vec::new();
+            for (tag, group) in [(b'l', low), (b'h', high)] {
+                for i in 0..150u64 {
+                    let file = file.clone();
+                    let order = order.clone();
+                    handles.push(group.spawn(async move {
+                        let (result, _) = file.write_all_at(vec![tag; 4096], i * 4096).await;
+                        result.unwrap();
+                        order.borrow_mut().push(tag);
+                    }));
+                }
+            }
+            for handle in handles {
+                handle.await.unwrap();
+            }
+            let order = order.borrow().clone();
+            order
+        })
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(order.len(), 300);
+    // While both groups have requests waiting, `high` gets 4 of every 5.
+    let high_first = order[..100].iter().filter(|&&tag| tag == b'h').count();
+    assert!((65..=95).contains(&high_first), "high got {high_first} of the first 100");
+}
+
+#[test]
+fn direct_io_round_trip() {
+    let path = scratch("dma.bin");
+    let path_in = path.clone();
+    rt(1)
+        .run(move || async move {
+            let data: Vec<u8> = (0..10_000u32).map(|i| (i % 253) as u8).collect();
+            let buf = AlignedBuf::padded_from(&data).unwrap();
+            assert_eq!(buf.len(), 3 * DMA_ALIGNMENT);
+
+            let file = DmaFile::create(&path_in).await.unwrap();
+            // The device's own requirements, as reported by the kernel.
+            let (memory, disk) = (file.memory_alignment(), file.disk_alignment());
+            assert!(memory.is_power_of_two() && disk.is_power_of_two());
+            assert!(memory <= DMA_ALIGNMENT && disk <= DMA_ALIGNMENT, "{memory} {disk}");
+            let exact = file.alloc(1).unwrap();
+            assert_eq!(exact.capacity(), memory.max(disk));
+            assert_eq!(exact.alignment(), memory.max(disk));
+            assert!(AlignedBuf::with_alignment(100, 3).is_err());
+            let (result, buf) = file.write_at(buf, 0).await;
+            assert_eq!(result.unwrap(), 3 * DMA_ALIGNMENT);
+            file.sync_all().await.unwrap();
+
+            // Misuse is rejected before it reaches the kernel.
+            let (result, mut buf) = file.write_at(buf, 100).await;
+            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+            buf.set_len(disk + 1);
+            let (result, _) = file.write_at(buf, 0).await;
+            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+
+            let file = DmaFile::open(&path_in).await.unwrap();
+            let (result, buf) = file.read_at(AlignedBuf::new(16 * 1024).unwrap(), 0).await;
+            assert_eq!(result.unwrap(), 3 * DMA_ALIGNMENT);
+            assert_eq!(&buf[..data.len()], &data[..]);
+            assert!(buf[data.len()..].iter().all(|&byte| byte == 0));
+
+            let (result, buf) = file.read_at(buf, 2 * DMA_ALIGNMENT as u64).await;
+            assert_eq!(result.unwrap(), DMA_ALIGNMENT);
+            assert_eq!(&buf[..], &AlignedBuf::padded_from(&data).unwrap()[2 * DMA_ALIGNMENT..]);
+            let (result, _) = file.read_at(buf, 3 * DMA_ALIGNMENT as u64).await;
+            assert_eq!(result.unwrap(), 0);
+        })
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn dropped_disk_requests_are_withdrawn() {
+    let path = scratch("withdrawn.bin");
+    let path_in = path.clone();
+    rt(1)
+        .io_depth(1)
+        .run(move || async move {
+            let file = Rc::new(File::create(&path_in).await.unwrap());
+            // Far more requests than the queue depth, most dropped while
+            // still waiting in the scheduler.
+            let handles: Vec<_> = (0..200u64)
+                .map(|i| {
+                    let file = file.clone();
+                    spawn(async move {
+                        let write = file.write_all_at(vec![7; 4096], i * 4096);
+                        timeout(Duration::from_micros(i * 5), write).await.is_ok()
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.await.unwrap();
+            }
+            // The queue still works afterwards.
+            let (result, _) = file.write_all_at(vec![9; 4096], 0).await;
+            result.unwrap();
+            let (result, buf) = file.read_at(Vec::with_capacity(4096), 0).await;
+            assert_eq!(result.unwrap(), 4096);
+            assert!(buf.iter().all(|&byte| byte == 9));
+        })
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn device_capacity_is_shared_by_all_shards() {
+    const MIB: u64 = 1 << 20;
+    let directory = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let properties = brine::IoProperties {
+        write_bytes_per_sec: Some(4 * MIB),
+        ..Default::default()
+    };
+    let elapsed = rt(2)
+        .io_properties(&directory, properties)
+        .run(|| async {
+            let start = Instant::now();
+            // Each of the two shards writes 1 MiB: 2 MiB against a device
+            // declared to take 4 MiB per second.
+            let written = submit_to_all(|| async {
+                let path = scratch(&format!("capacity-{}.bin", shard_id().unwrap()));
+                let file = Rc::new(File::create(&path).await.unwrap());
+                let writes: Vec<_> = (0..16u64)
+                    .map(|i| {
+                        let file = file.clone();
+                        spawn(async move {
+                            let (result, _) = file.write_all_at(vec![1; 64 << 10], i * (64 << 10)).await;
+                            result.unwrap();
+                        })
+                    })
+                    .collect();
+                for write in writes {
+                    write.await.unwrap();
+                }
+                // Read rates were not declared, so a read costs next to
+                // nothing; it only waits for the device to catch up with
+                // the writes already admitted.
+                let (result, _) = file.read_at(Vec::with_capacity(64 << 10), 0).await;
+                assert_eq!(result.unwrap(), 64 << 10);
+                brine::fs::remove_file(&path).await.unwrap();
+            })
+            .await
+            .unwrap();
+            assert_eq!(written.len(), 2);
+            start.elapsed()
+        })
+        .unwrap();
+    // 2 MiB at 4 MiB/s is half a second, whichever shard does the writing.
+    assert!(elapsed >= Duration::from_millis(400), "finished in {elapsed:?}");
+    assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
+}
+
+#[test]
+fn iotune_measures_all_four_rates() {
+    let directory = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let properties = rt(2)
+        .run(move || async move {
+            let options = brine::iotune::Options {
+                file_size: 16 << 20,
+                phase: Duration::from_millis(60),
+                depth: 8,
+                ..Default::default()
+            };
+            brine::iotune::measure(&directory, options).await
+        })
+        .unwrap()
+        .unwrap();
+    for rate in [
+        properties.read_iops,
+        properties.read_bytes_per_sec,
+        properties.write_iops,
+        properties.write_bytes_per_sec,
+    ] {
+        assert!(rate.unwrap() > 1, "{properties:?}");
+    }
+    // Sequential megabyte requests move more data than random 4 KiB ones.
+    assert!(properties.read_bytes_per_sec.unwrap() > properties.read_iops.unwrap() * 4096 / 4);
+    let leftovers = std::fs::read_dir(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap()
+        .filter(|entry| entry.as_ref().unwrap().file_name().to_string_lossy().contains("iotune"))
+        .count();
+    assert_eq!(leftovers, 0);
+}
+
+#[test]
+fn registered_buffers_on_sockets_and_files() {
+    use brine::buf::FixedBuf;
+
+    let path = scratch("fixed.bin");
+    let path_in = path.clone();
+    rt(2)
+        .fixed_buffers(4, 10_000)
+        .run(move || async move {
+            // Sizes are rounded up to whole pages.
+            let buf = FixedBuf::try_acquire().unwrap();
+            assert_eq!((buf.len(), buf.capacity()), (0, 12_288));
+            drop(buf);
+
+            // An echo server and a client that both use registered memory:
+            // receives go into it, sends are zero-copy from it.
+            let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = spawn(async move {
+                let stream = listener.accept().await.unwrap();
+                let mut buf = FixedBuf::acquire().await.unwrap();
+                let mut echoed = 0;
+                loop {
+                    let (result, returned) = stream.read(buf).await;
+                    let n = result.unwrap();
+                    if n == 0 {
+                        return echoed;
+                    }
+                    let (result, returned) = stream.write_all(returned).await;
+                    result.unwrap();
+                    echoed += n;
+                    buf = returned;
+                }
+            });
+            let client = TcpStream::connect(addr).await.unwrap();
+            let mut expected = Vec::new();
+            let mut received = Vec::new();
+            let mut buf = FixedBuf::acquire().await.unwrap();
+            for round in 0..40u32 {
+                let message: Vec<u8> = (0..3000 + round * 100).map(|i| (i + round) as u8).collect();
+                assert_eq!(buf.fill_from(&message), message.len());
+                let (result, returned) = client.write_all(buf).await;
+                result.unwrap();
+                expected.extend_from_slice(&message);
+                buf = returned;
+                while received.len() < expected.len() {
+                    let (result, returned) = client.read(buf).await;
+                    assert!(result.unwrap() > 0);
+                    received.extend_from_slice(&returned);
+                    buf = returned;
+                }
+            }
+            assert_eq!(received, expected);
+            client.shutdown(std::net::Shutdown::Write).unwrap();
+            assert_eq!(server.await.unwrap(), expected.len());
+
+            // The same buffer against files, buffered and direct.
+            let file = File::create(&path_in).await.unwrap();
+            buf.fill_from(&[5u8; 8192]);
+            let (result, buf) = file.write_all_at(buf, 0).await;
+            result.unwrap();
+            let (result, buf) = file.read_at(buf, 4096).await;
+            assert_eq!(result.unwrap(), 4096);
+            assert!(buf.iter().all(|&byte| byte == 5));
+            drop(file);
+            let direct = DmaFile::open(&path_in).await.unwrap();
+            let (result, buf) = direct.read_at(buf, 0).await;
+            assert_eq!(result.unwrap(), 8192);
+            assert!(buf.iter().all(|&byte| byte == 5));
+            drop(buf);
+
+            // A pool is per shard and bounded; `acquire` waits its turn.
+            let held: Vec<FixedBuf> = std::iter::from_fn(FixedBuf::try_acquire).collect();
+            assert_eq!(held.len(), 4);
+            assert!(timeout(Duration::from_millis(20), FixedBuf::acquire()).await.is_err());
+            let waiter = spawn(async { FixedBuf::acquire().await.map(|buf| buf.capacity()) });
+            yield_now().await;
+            drop(held);
+            assert_eq!(waiter.await.unwrap().unwrap(), 12_288);
+            let elsewhere = submit_to(1, || async {
+                // Collected, not counted: a dropped buffer goes straight back.
+                let all: Vec<FixedBuf> = std::iter::from_fn(FixedBuf::try_acquire).collect();
+                all.len()
+            })
+            .await
+            .unwrap();
+            assert_eq!(elsewhere, 4);
+        })
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn any_owned_buffer_can_be_written() {
+    use brine::buf::FixedBuf;
+
+    rt(1)
+        .run(|| async {
+            // No pool was configured.
+            assert!(FixedBuf::try_acquire().is_none());
+            assert!(matches!(FixedBuf::acquire().await, Err(Error::NoFixedBuffers)));
+
+            let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let client = spawn(async move {
+                let stream = TcpStream::connect(addr).await.unwrap();
+                let (result, _) = stream.write_all("static str, ").await;
+                result.unwrap();
+                let (result, _) = stream.write_all(&b"static bytes, "[..]).await;
+                result.unwrap();
+                let (result, _) = stream.write_all(String::from("string, ")).await;
+                result.unwrap();
+                let (result, _) = stream.write_all(Vec::from(&b"boxed"[..]).into_boxed_slice()).await;
+                result.unwrap();
+            });
+            let stream = listener.accept().await.unwrap();
+            client.await.unwrap();
+            let mut received = Vec::new();
+            let mut buf = AlignedBuf::new(4096).unwrap();
+            loop {
+                let (result, returned) = stream.read(buf).await;
+                if result.unwrap() == 0 {
+                    break;
+                }
+                received.extend_from_slice(&returned);
+                buf = returned;
+            }
+            assert_eq!(received, b"static str, static bytes, string, boxed");
+        })
+        .unwrap();
+    assert!(FixedBuf::try_acquire().is_none());
+}
+
+#[test]
+fn zero_copy_send_returns_before_the_buffer_does() {
+    use brine::buf::FixedBuf;
+
+    rt(1)
+        .fixed_buffers(4, 64 << 10)
+        .run(|| async {
+            let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let reader = spawn(async move {
+                let stream = listener.accept().await.unwrap();
+                let mut total = Vec::new();
+                let mut buf = Vec::with_capacity(64 << 10);
+                loop {
+                    let (result, returned) = stream.read(buf).await;
+                    if result.unwrap() == 0 {
+                        return total;
+                    }
+                    total.extend_from_slice(&returned);
+                    buf = returned;
+                }
+            });
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let mut expected = Vec::new();
+            // More sends than the pool has buffers: each one must come back.
+            for round in 0..64u32 {
+                let mut buf = FixedBuf::acquire().await.unwrap();
+                let chunk: Vec<u8> = (0..40_000u32).map(|i| (i ^ round) as u8).collect();
+                buf.fill_from(&chunk);
+                let mut sent = stream.send_zc(buf).await.unwrap();
+                // A short send is finished by copying the rest.
+                while sent < chunk.len() {
+                    let (result, _) = stream.write(chunk[sent..].to_vec()).await;
+                    sent += result.unwrap();
+                }
+                expected.extend_from_slice(&chunk);
+            }
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            assert!(reader.await.unwrap() == expected);
+            // Every buffer is back in the pool.
+            let mut all = Vec::new();
+            for _ in 0..4 {
+                all.push(timeout(Duration::from_secs(5), FixedBuf::acquire()).await.unwrap().unwrap());
+            }
+        })
+        .unwrap();
+}
+
+#[test]
+fn statistics_describe_the_shard() {
+    let path = scratch("stats.bin");
+    let path_in = path.clone();
+    rt(2)
+        .run(move || async move {
+            let group = SchedulingGroup::create("worker", 200).unwrap();
+            let before = brine::stats::shard().unwrap();
+            assert_eq!(before.shard, 0);
+
+            let spinner = group.spawn(async {
+                let start = Instant::now();
+                while start.elapsed() < Duration::from_millis(30) {
+                    maybe_yield().await;
+                }
+            });
+            spinner.await.unwrap();
+            submit_to(1, || async {}).await.unwrap();
+            sleep(Duration::from_millis(20)).await;
+            let file = File::create(&path_in).await.unwrap();
+            let (result, _) = file.write_all_at(vec![1u8; 10_000], 0).await;
+            result.unwrap();
+
+            let after = brine::stats::shard().unwrap();
+            assert!(after.tasks >= 1);
+            assert!(after.tasks_polled > before.tasks_polled);
+            assert!(after.loops > before.loops);
+            assert!(after.sleeps > before.sleeps);
+            assert!(after.busy >= Duration::from_millis(25), "{after:?}");
+            assert!(after.idle >= Duration::from_millis(15), "{after:?}");
+            assert!(after.messages_sent > before.messages_sent);
+            assert!(after.messages_received > before.messages_received);
+
+            let groups = brine::stats::groups().unwrap();
+            let worker = groups.iter().find(|group| group.name == "worker").unwrap();
+            assert_eq!((worker.cpu_shares, worker.io_shares), (200, 200));
+            assert!(worker.cpu_time >= Duration::from_millis(25), "{worker:?}");
+            // The spinner yielded every time its slice ran out.
+            assert!(worker.tasks_polled > 10, "{worker:?}");
+            assert_eq!(groups[0].name, "main");
+
+            let devices = brine::stats::devices().unwrap();
+            assert_eq!(devices.len(), 1);
+            assert_eq!((devices[0].dispatched, devices[0].bytes), (1, 10_000));
+            assert_eq!((devices[0].queued, devices[0].in_flight), (0, 0));
+
+            // Other shards keep their own books.
+            let other = submit_to(1, || async { brine::stats::shard().unwrap() }).await.unwrap();
+            assert_eq!(other.shard, 1);
+            assert!(other.messages_received >= 2);
+        })
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(matches!(brine::stats::shard(), Err(Error::NoRuntime)));
+}
+
+static STALLS: std::sync::Mutex<Vec<brine::stats::StallReport>> = std::sync::Mutex::new(Vec::new());
+
+#[inline(never)]
+fn hog_the_cpu_for_a_while(duration: Duration) -> u64 {
+    let start = Instant::now();
+    let mut spins = 0u64;
+    while start.elapsed() < duration {
+        spins = std::hint::black_box(spins + 1);
+    }
+    spins
+}
+
+#[test]
+fn stalls_are_counted_and_reported_with_a_backtrace() {
+    let stats = rt(1)
+        .stall_threshold(Duration::from_millis(10))
+        .stall_backtraces(true)
+        .on_stall(|report| STALLS.lock().unwrap().push(report.clone()))
+        .run(|| async {
+            let group = SchedulingGroup::create("hog", 100).unwrap();
+            // Well-behaved work does not count.
+            for _ in 0..100 {
+                yield_now().await;
+            }
+            assert_eq!(brine::stats::shard().unwrap().stalls, 0);
+            group.spawn(async { hog_the_cpu_for_a_while(Duration::from_millis(80)) }).await.unwrap();
+            brine::stats::shard().unwrap()
+        })
+        .unwrap();
+    assert_eq!(stats.stalls, 1);
+    assert!(stats.longest_stall >= Duration::from_millis(80));
+
+    let reports = STALLS.lock().unwrap();
+    assert_eq!(reports.len(), 1);
+    let report = &reports[0];
+    assert_eq!((report.shard, report.group.as_str()), (0, "hog"));
+    assert!(report.duration >= Duration::from_millis(80));
+    // Caught in the act: the stack is the test binary's, several frames deep.
+    assert!(report.backtrace.len() > 3, "{report:?}");
+    assert!(report.backtrace.iter().any(|frame| frame.contains("basic")), "{report:?}");
+}
+
+#[test]
+fn memory_pressure_asks_the_application_to_free() {
+    rt(1)
+        .memory_limit(8 << 20)
+        .run(|| async {
+            let cache: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+            let evictions = Rc::new(Cell::new(0u32));
+            let (held, count) = (cache.clone(), evictions.clone());
+            brine::alloc::on_pressure(move || {
+                held.borrow_mut().clear();
+                count.set(count.get() + 1);
+            })
+            .unwrap();
+
+            // Below the limit nothing happens.
+            cache.borrow_mut().push(vec![0u8; 1 << 20]);
+            for _ in 0..200 {
+                yield_now().await;
+            }
+            assert_eq!(evictions.get(), 0);
+
+            // Above it the cache is emptied, once.
+            for _ in 0..16 {
+                cache.borrow_mut().push(vec![0u8; 1 << 20]);
+            }
+            assert!(brine::alloc::stats().unwrap().allocated_bytes > 16 << 20);
+            for _ in 0..200 {
+                yield_now().await;
+            }
+            assert_eq!(evictions.get(), 1);
+            assert!(cache.borrow().is_empty());
+            assert!(brine::alloc::stats().unwrap().allocated_bytes < 8 << 20);
+        })
+        .unwrap();
+}
+
+#[test]
+fn udp_datagrams() {
+    use brine::net::UdpSocket;
+
+    rt(2)
+        .run(|| async {
+            let server = UdpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let server_addr = server.local_addr().unwrap();
+            let client = UdpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let client_addr = client.local_addr().unwrap();
+
+            // Datagrams keep their boundaries and name their sender.
+            for message in [&b"first"[..], &b"second, longer"[..], &b""[..]] {
+                let (result, _) = client.send_to(message, server_addr).await;
+                assert_eq!(result.unwrap(), message.len());
+            }
+            for message in [&b"first"[..], &b"second, longer"[..], &b""[..]] {
+                let (result, buf) = server.recv_from(Vec::with_capacity(1500)).await;
+                assert_eq!(result.unwrap(), (message.len(), client_addr));
+                assert_eq!(buf, message);
+            }
+
+            // One that does not fit is cut to the buffer.
+            let (result, _) = client.send_to(vec![9u8; 3000], server_addr).await;
+            assert_eq!(result.unwrap(), 3000);
+            let (result, buf) = server.recv_from(Vec::with_capacity(100)).await;
+            assert_eq!(result.unwrap().0, 100);
+            assert!(buf.len() == 100 && buf.iter().all(|&byte| byte == 9));
+
+            // Connected sockets, with the reply sent from another shard.
+            client.connect(server_addr).unwrap();
+            let (result, _) = client.send(String::from("ping")).await;
+            assert_eq!(result.unwrap(), 4);
+            submit_to(1, move || async move {
+                let (result, buf) = server.recv_from(Vec::with_capacity(64)).await;
+                let (_, from) = result.unwrap();
+                assert_eq!(buf, b"ping");
+                let (result, _) = server.send_to("pong", from).await;
+                result.unwrap();
+            })
+            .await
+            .unwrap();
+            let (result, buf) = client.recv(Vec::with_capacity(64)).await;
+            assert_eq!(result.unwrap(), 4);
+            assert_eq!(buf, b"pong");
+
+            // A receive with nothing coming is cancelled cleanly.
+            let waiting = timeout(Duration::from_millis(20), client.recv(Vec::with_capacity(64))).await;
+            assert!(waiting.is_err());
+        })
+        .unwrap();
+}

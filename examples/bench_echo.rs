@@ -1,0 +1,170 @@
+//! Request-response throughput over loopback TCP, brine against Tokio.
+//!
+//! `cargo run --release --example bench_echo -- <brine|tokio> [threads] [connections] [seconds]`
+//!
+//! Server and clients share the same threads in both cases: each
+//! connection sends a 64-byte message and waits for it to come back.
+
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+#[global_allocator]
+static GLOBAL: brine::alloc::ShardAlloc = brine::alloc::ShardAlloc;
+
+const MESSAGE: usize = 64;
+
+fn run_brine(threads: usize, connections: usize, seconds: u64) -> u64 {
+    use brine::net::{TcpListener, TcpStream};
+    use brine::{shard_id, sleep, spawn, submit_to_all, Runtime};
+
+    Runtime::new()
+        .shards(threads)
+        .run(move || async move {
+            let probe = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr: SocketAddr = probe.local_addr().unwrap();
+            drop(probe);
+            submit_to_all(move || async move {
+                let listener = TcpListener::bind(addr).unwrap();
+                spawn(async move {
+                    while let Ok(stream) = listener.accept().await {
+                        spawn(async move {
+                            stream.set_nodelay(true).ok();
+                            let mut buf = Vec::with_capacity(4096);
+                            loop {
+                                let (result, returned) = stream.read(buf).await;
+                                if !matches!(result, Ok(n) if n > 0) {
+                                    return;
+                                }
+                                let (result, returned) = stream.write_all(returned).await;
+                                if result.is_err() {
+                                    return;
+                                }
+                                buf = returned;
+                            }
+                        });
+                    }
+                });
+            })
+            .await
+            .unwrap();
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = stop.clone();
+            let counters = spawn(submit_to_all(move || {
+                let stop = flag.clone();
+                async move {
+                    let shard = shard_id().unwrap();
+                    let mine = (0..connections).filter(|c| c % threads == shard).count();
+                    let clients: Vec<_> = (0..mine)
+                        .map(|_| {
+                            let stop = stop.clone();
+                            spawn(async move {
+                                let stream = TcpStream::connect(addr).await.unwrap();
+                                stream.set_nodelay(true).ok();
+                                let mut out = vec![7u8; MESSAGE];
+                                let mut buf = Vec::with_capacity(4096);
+                                let mut done = 0u64;
+                                while !stop.load(Ordering::Relaxed) {
+                                    let (result, returned) = stream.write_all(out).await;
+                                    result.unwrap();
+                                    out = returned;
+                                    let mut got = 0;
+                                    while got < MESSAGE {
+                                        let (result, returned) = stream.read(buf).await;
+                                        got += result.unwrap();
+                                        buf = returned;
+                                    }
+                                    done += 1;
+                                }
+                                done
+                            })
+                        })
+                        .collect();
+                    let mut total = 0;
+                    for client in clients {
+                        total += client.await.unwrap();
+                    }
+                    total
+                }
+            }));
+            sleep(Duration::from_secs(seconds)).await;
+            stop.store(true, Ordering::Relaxed);
+            counters.await.unwrap().unwrap().into_iter().sum()
+        })
+        .unwrap()
+}
+
+fn run_tokio(threads: usize, connections: usize, seconds: u64) -> u64 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(threads)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async move {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    stream.set_nodelay(true).ok();
+                    let mut buf = vec![0u8; 4096];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(n) if n > 0 => {
+                                if stream.write_all(&buf[..n]).await.is_err() {
+                                    return;
+                                }
+                            }
+                            _ => return,
+                        }
+                    }
+                });
+            }
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let total = Arc::new(AtomicU64::new(0));
+        let mut clients = Vec::new();
+        for _ in 0..connections {
+            let (stop, total) = (stop.clone(), total.clone());
+            clients.push(tokio::spawn(async move {
+                let mut stream = TcpStream::connect(addr).await.unwrap();
+                stream.set_nodelay(true).ok();
+                let out = [7u8; MESSAGE];
+                let mut buf = [0u8; MESSAGE];
+                let mut done = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    stream.write_all(&out).await.unwrap();
+                    stream.read_exact(&mut buf).await.unwrap();
+                    done += 1;
+                }
+                total.fetch_add(done, Ordering::Relaxed);
+            }));
+        }
+        tokio::time::sleep(Duration::from_secs(seconds)).await;
+        stop.store(true, Ordering::Relaxed);
+        for client in clients {
+            client.await.unwrap();
+        }
+        total.load(Ordering::Relaxed)
+    })
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let which = args.get(1).map(String::as_str).unwrap_or("brine");
+    let threads = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4);
+    let connections = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(64);
+    let seconds = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(3);
+    let start = Instant::now();
+    let requests = match which {
+        "tokio" => run_tokio(threads, connections, seconds),
+        _ => run_brine(threads, connections, seconds),
+    };
+    let rate = requests as f64 / start.elapsed().as_secs_f64();
+    println!("{which:6} threads={threads} connections={connections}: {rate:>10.0} requests/s");
+}
