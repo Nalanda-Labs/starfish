@@ -20,13 +20,20 @@ pub enum Error {
     /// or the target shard is shutting down.
     Canceled,
     /// The shard index does not exist.
-    InvalidShard { shard: usize, count: usize },
+    InvalidShard {
+        /// The index that was asked for.
+        shard: usize,
+        /// How many shards the runtime has; valid indexes are below this.
+        count: usize,
+    },
     /// The sharded service has been stopped, or was never started here.
     ServiceStopped,
     /// The scheduling group does not belong to the running runtime.
     InvalidGroup,
     /// The runtime was started without a pool of registered buffers.
     NoFixedBuffers,
+    /// The semaphore or gate has been closed.
+    Closed,
 }
 
 /// `Result` with the runtime's [`Error`].
@@ -46,6 +53,7 @@ impl fmt::Display for Error {
             Error::ServiceStopped => f.write_str("sharded service is not running on this shard"),
             Error::InvalidGroup => f.write_str("scheduling group does not belong to this runtime"),
             Error::NoFixedBuffers => f.write_str("the runtime has no pool of registered buffers"),
+            Error::Closed => f.write_str("closed"),
         }
     }
 }

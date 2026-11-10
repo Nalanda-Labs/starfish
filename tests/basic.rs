@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 
 use starfish::fs::{AlignedBuf, DmaFile, File, DMA_ALIGNMENT};
 use starfish::net::{TcpListener, TcpStream};
+use starfish::signal::Signals;
+use starfish::sync::{channel, Gate, Semaphore};
 use starfish::{shard_count, shard_id, sleep, spawn, submit_to, submit_to_all, timeout, yield_now};
 use starfish::{maybe_yield, Error, Runtime, SchedulingGroup, Sharded};
 use std::cell::RefCell;
@@ -1072,6 +1074,277 @@ fn udp_datagrams() {
             // A receive with nothing coming is cancelled cleanly.
             let waiting = timeout(Duration::from_millis(20), client.recv(Vec::with_capacity(64))).await;
             assert!(waiting.is_err());
+        })
+        .unwrap();
+}
+
+/// Sets its flag when dropped.
+struct DropFlag(Rc<Cell<bool>>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.set(true);
+    }
+}
+
+#[test]
+fn abort_cancels_a_task_and_its_io() {
+    rt(1)
+        .run(|| async {
+            let listener = Rc::new(TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap());
+            let addr = listener.local_addr().unwrap();
+            let dropped = Rc::new(Cell::new(false));
+
+            // Nobody connects: the task sits in the kernel's accept.
+            let task = spawn({
+                let listener = listener.clone();
+                let flag = DropFlag(dropped.clone());
+                async move {
+                    let _flag = flag;
+                    listener.accept().await.map(|_| ())
+                }
+            });
+            sleep(Duration::from_millis(10)).await;
+            assert!(!task.is_finished());
+
+            // The future, and what it holds, is gone when the call returns.
+            task.abort();
+            assert!(dropped.get());
+            assert!(task.is_finished());
+            assert!(matches!(task.await, Err(Error::Canceled)));
+
+            // The accept was cancelled in the kernel; the listener is intact.
+            let client = spawn(async move { TcpStream::connect(addr).await.unwrap() });
+            let server = timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
+            let client = client.await.unwrap();
+            assert_eq!(server.peer_addr().unwrap(), client.local_addr().unwrap());
+
+            // A task can be aborted before it has run at all.
+            let dropped = Rc::new(Cell::new(false));
+            let ran = Rc::new(Cell::new(false));
+            let task = spawn({
+                let flag = DropFlag(dropped.clone());
+                let ran = ran.clone();
+                async move {
+                    let _flag = flag;
+                    ran.set(true);
+                }
+            });
+            task.abort();
+            assert!(dropped.get());
+            drop(task);
+            sleep(Duration::from_millis(5)).await;
+            assert!(!ran.get());
+
+            // Too late: the task has finished and keeps its output.
+            let task = spawn(async { 3 });
+            yield_now().await;
+            assert!(task.is_finished());
+            task.abort();
+            assert_eq!(task.await.unwrap(), 3);
+        })
+        .unwrap();
+}
+
+#[test]
+fn semaphore_bounds_what_runs_at_once() {
+    let (peak, served) = rt(1)
+        .run(|| async {
+            let semaphore = Semaphore::new(3);
+            let running = Rc::new(Cell::new(0u32));
+            let peak = Rc::new(Cell::new(0u32));
+            let handles: Vec<_> = (0..20)
+                .map(|_| {
+                    let semaphore = semaphore.clone();
+                    let running = running.clone();
+                    let peak = peak.clone();
+                    spawn(async move {
+                        let _permit = semaphore.acquire(1).await.unwrap();
+                        running.set(running.get() + 1);
+                        peak.set(peak.get().max(running.get()));
+                        sleep(Duration::from_millis(2)).await;
+                        running.set(running.get() - 1);
+                    })
+                })
+                .collect();
+            let mut served = 0;
+            for handle in handles {
+                handle.await.unwrap();
+                served += 1;
+            }
+            assert_eq!(semaphore.available(), 3);
+
+            // Giving up on a wait, by timeout or by abort, loses nothing.
+            let all = semaphore.acquire(3).await.unwrap();
+            assert!(timeout(Duration::from_millis(10), semaphore.acquire(1)).await.is_err());
+            let waiting = spawn({
+                let semaphore = semaphore.clone();
+                async move { semaphore.acquire(2).await.map(|permit| permit.count()) }
+            });
+            let aborted = spawn({
+                let semaphore = semaphore.clone();
+                async move { semaphore.acquire(1).await.map(|permit| permit.count()) }
+            });
+            yield_now().await;
+            aborted.abort();
+            drop(all);
+            assert_eq!(waiting.await.unwrap().unwrap(), 2);
+            assert_eq!(semaphore.available(), 3);
+
+            // Closing releases those who wait.
+            let all = semaphore.acquire(3).await.unwrap();
+            let waiting = spawn({
+                let semaphore = semaphore.clone();
+                async move { semaphore.acquire(1).await.map(|permit| permit.count()) }
+            });
+            yield_now().await;
+            semaphore.close();
+            assert!(matches!(waiting.await.unwrap(), Err(Error::Closed)));
+            drop(all);
+            (peak.get(), served)
+        })
+        .unwrap();
+    assert_eq!((peak, served), (3, 20));
+}
+
+#[test]
+fn gate_close_waits_for_work_in_progress() {
+    rt(1)
+        .run(|| async {
+            let gate = Gate::new();
+            let finished = Rc::new(Cell::new(0u32));
+            for i in 0..5u64 {
+                let guard = gate.enter().unwrap();
+                let finished = finished.clone();
+                spawn(async move {
+                    let _guard = guard;
+                    sleep(Duration::from_millis(2 * (i + 1))).await;
+                    finished.set(finished.get() + 1);
+                });
+            }
+            // One piece of work is aborted; its guard goes with its future.
+            let stuck = spawn({
+                let guard = gate.enter().unwrap();
+                async move {
+                    let _guard = guard;
+                    std::future::pending::<()>().await;
+                }
+            });
+            assert_eq!(gate.active(), 6);
+
+            let closing = gate.close();
+            assert!(matches!(gate.enter(), Err(Error::Closed)));
+            assert_eq!(finished.get(), 0);
+            stuck.abort();
+            assert_eq!(gate.active(), 5);
+            closing.await;
+            assert_eq!(finished.get(), 5);
+            assert_eq!(gate.active(), 0);
+        })
+        .unwrap();
+}
+
+#[test]
+fn channel_slows_the_producer_to_the_consumer() {
+    let (received, most_queued) = rt(1)
+        .run(|| async {
+            let (sender, mut receiver) = channel(4);
+            let producers: Vec<_> = (0..3u32)
+                .map(|producer| {
+                    let sender = sender.clone();
+                    spawn(async move {
+                        for i in 0..50 {
+                            sender.send(producer * 1000 + i).await.unwrap();
+                        }
+                    })
+                })
+                .collect();
+            drop(sender);
+
+            let mut received = Vec::new();
+            let mut most_queued = 0;
+            // Ends by itself when the last producer has finished.
+            while let Some(value) = receiver.recv().await {
+                most_queued = most_queued.max(receiver.len() + 1);
+                received.push(value);
+                if received.len() % 16 == 0 {
+                    sleep(Duration::from_millis(1)).await;
+                }
+            }
+            for producer in producers {
+                producer.await.unwrap();
+            }
+
+            // A producer blocked on a full channel is released by an abort
+            // and by the receiver going away.
+            let (sender, receiver) = channel(1);
+            sender.send(0).await.unwrap();
+            let aborted = spawn({
+                let sender = sender.clone();
+                async move { sender.send(1).await.is_ok() }
+            });
+            let refused = spawn(async move { sender.send(2).await.is_ok() });
+            yield_now().await;
+            aborted.abort();
+            assert!(matches!(aborted.await, Err(Error::Canceled)));
+            drop(receiver);
+            assert!(!refused.await.unwrap());
+            (received, most_queued)
+        })
+        .unwrap();
+    assert_eq!(received.len(), 150);
+    assert!(most_queued <= 4, "queued {most_queued}");
+    // Each producer's values arrive in the order it sent them.
+    for producer in 0..3 {
+        let own: Vec<_> = received.iter().filter(|value| *value / 1000 == producer).collect();
+        assert!(own.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(own.len(), 50);
+    }
+}
+
+fn send_signal_to_self(signal: i32) {
+    // SAFETY: plain syscalls. The signal has a listener, so it does not
+    // end the process.
+    unsafe {
+        libc::kill(libc::getpid(), signal);
+    }
+}
+
+#[test]
+fn signals_reach_every_listener_on_any_shard() {
+    rt(2)
+        .run(|| async {
+            let mut here = Signals::new(&[libc::SIGUSR1, libc::SIGUSR2]).unwrap();
+            let mut there = Signals::new(&[libc::SIGUSR1]).unwrap();
+            let remote = spawn(submit_to(1, move || async move { there.next().await }));
+
+            assert!(timeout(Duration::from_millis(20), here.next()).await.is_err());
+
+            send_signal_to_self(libc::SIGUSR1);
+            let signal = timeout(Duration::from_secs(5), here.next()).await.unwrap();
+            assert_eq!(signal, libc::SIGUSR1);
+            assert_eq!(remote.await.unwrap().unwrap(), libc::SIGUSR1);
+            assert!(timeout(Duration::from_millis(20), here.next()).await.is_err());
+
+            // Signals that arrive while nobody is waiting are kept.
+            send_signal_to_self(libc::SIGUSR2);
+            send_signal_to_self(libc::SIGUSR1);
+            sleep(Duration::from_millis(20)).await;
+            let mut both = [here.next().await, here.next().await];
+            both.sort_unstable();
+            let mut expected = [libc::SIGUSR1, libc::SIGUSR2];
+            expected.sort_unstable();
+            assert_eq!(both, expected);
+
+            // A listener only hears what arrives after it was created.
+            let mut late = Signals::new(&[libc::SIGUSR1]).unwrap();
+            assert!(timeout(Duration::from_millis(20), late.next()).await.is_err());
+
+            assert!(Signals::new(&[]).is_err());
+            assert!(Signals::new(&[0]).is_err());
+            assert!(Signals::new(&[1000]).is_err());
+            assert!(Signals::new(&[libc::SIGSEGV]).is_err());
+            assert!(Signals::new(&[libc::SIGKILL]).is_err());
         })
         .unwrap();
 }

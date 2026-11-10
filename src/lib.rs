@@ -35,6 +35,13 @@
 //! it keeps the device's own queue short, so that those priorities take
 //! effect quickly.
 //!
+//! Tasks on one shard coordinate through [`sync`]: a
+//! [`Semaphore`](sync::Semaphore) to bound what runs at once, a
+//! [`channel`](sync::channel) to pass values with backpressure, and a
+//! [`Gate`](sync::Gate) to wait for work in progress before shutting down.
+//! A task that is no longer wanted is cancelled with [`JoinHandle::abort`],
+//! and [`signal::termination`] tells the program when it is asked to stop.
+//!
 //! I/O uses owned buffers: a call takes the buffer by value and hands it back
 //! with the result, because the kernel keeps writing to it even if the future
 //! is dropped.
@@ -81,7 +88,9 @@ pub mod buf;
 pub mod fs;
 pub mod iotune;
 pub mod net;
+pub mod signal;
 pub mod stats;
+pub mod sync;
 
 pub use error::{Error, Result};
 pub use ioqueue::IoProperties;

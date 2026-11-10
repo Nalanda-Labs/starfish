@@ -9,8 +9,9 @@
 //!
 //! - The [`Header`]'s reference count, queued flag, shard, key, group and
 //!   vtable are atomic or never change. Any thread may read them.
-//! - The state, the join waker, the future and the output belong to the
-//!   shard that spawned the task. Only that thread reads or writes them.
+//! - The state, the abort request, the join waker, the future and the
+//!   output belong to the shard that spawned the task. Only that thread
+//!   reads or writes them.
 //!
 //! A future or output must never be dropped on a foreign thread, since
 //! neither has to be `Send`. The shard keeps its own reference for as long
@@ -52,6 +53,11 @@ struct Header {
     state: Cell<u8>,
     /// Nobody will ask for the output.
     detached: Cell<bool>,
+    /// The future is being polled right now, so it cannot be dropped.
+    polling: Cell<bool>,
+    /// The task was aborted while it was being polled: the future is to
+    /// be dropped as soon as that poll returns.
+    abort: Cell<bool>,
     /// The task awaiting this one's `JoinHandle`.
     join_waker: Cell<Option<Waker>>,
     shard: Arc<ShardShared>,
@@ -189,6 +195,8 @@ impl Task {
                 queued: AtomicBool::new(true),
                 state: Cell::new(RUNNING),
                 detached: Cell::new(detached),
+                polling: Cell::new(false),
+                abort: Cell::new(false),
                 join_waker: Cell::new(None),
                 shard,
                 key,
@@ -241,9 +249,18 @@ impl Task {
         let mut cx = Context::from_waker(&waker);
         // No shard state is borrowed here: the task is free to spawn,
         // submit I/O and arm timers. A panic stops at this boundary.
+        header.polling.set(true);
         let polled = catch_unwind(AssertUnwindSafe(|| (header.vtable.poll)(self.0, &mut cx)));
+        header.polling.set(false);
         match polled {
-            Ok(Poll::Pending) => return false,
+            Ok(Poll::Pending) => {
+                if !header.abort.get() {
+                    return false;
+                }
+                // Aborted from inside its own poll.
+                self.cancel();
+                return true;
+            }
             Ok(Poll::Ready(())) => {
                 if header.detached.get() {
                     self.discard_output();
@@ -261,12 +278,13 @@ impl Task {
         true
     }
 
-    /// Destroys the future if it has not finished, as happens to every
-    /// remaining task when the runtime shuts down.
+    /// Destroys the future if it has not finished, as happens to an aborted
+    /// task and to every remaining task when the runtime shuts down.
     ///
     /// # Safety
     ///
-    /// Must be called on the thread of the shard that spawned the task.
+    /// Must be called on the thread of the shard that spawned the task,
+    /// and not while the task is being polled.
     pub(crate) unsafe fn cancel(&self) {
         let header = self.header();
         if header.state.get() == RUNNING {
@@ -364,11 +382,13 @@ enum Joined<T> {
     Failed(Option<Error>),
 }
 
-/// Awaits the outcome of a spawned task. Dropping it detaches the task.
+/// Awaits the outcome of a spawned task. Dropping it detaches the task: the
+/// task keeps running and its output is discarded. To stop the task, call
+/// [`abort`](Self::abort).
 ///
 /// Resolves to [`Error::Panicked`] if the task panicked, [`Error::Canceled`]
-/// if it was dropped before finishing, and [`Error::NoRuntime`] if it was
-/// spawned outside a runtime.
+/// if it was aborted or otherwise dropped before finishing, and
+/// [`Error::NoRuntime`] if it was spawned outside a runtime.
 pub struct JoinHandle<T> {
     inner: Joined<T>,
     /// The output is read on the shard that produced it.
@@ -382,6 +402,43 @@ impl<T> JoinHandle<T> {
         JoinHandle {
             inner: Joined::Failed(Some(error)),
             _not_send: PhantomData,
+        }
+    }
+
+    /// Cancels the task. Its future is dropped before this call returns,
+    /// which cancels any I/O it has in flight and releases whatever it
+    /// holds: permits, gate guards, buffers, sockets. The handle then
+    /// resolves to [`Error::Canceled`].
+    ///
+    /// The one exception is a task that aborts itself, from inside its own
+    /// future. That future is dropped when it next yields, and never
+    /// resumes after that.
+    ///
+    /// A task that has already finished is not affected and its output can
+    /// still be collected.
+    pub fn abort(&self) {
+        let Joined::Task { task, .. } = &self.inner else { return };
+        let header = task.header();
+        if header.state.get() != RUNNING {
+            return;
+        }
+        if header.polling.get() {
+            header.abort.set(true);
+            return;
+        }
+        // SAFETY: the handle cannot leave the shard that spawned the task,
+        // and the task is not being polled.
+        unsafe { task.cancel() };
+        // Its shard still lists the task; a last turn makes it let go.
+        task.clone().schedule();
+    }
+
+    /// Whether the task has ended: its future returned, panicked or was
+    /// dropped. Awaiting the handle then completes without waiting.
+    pub fn is_finished(&self) -> bool {
+        match &self.inner {
+            Joined::Task { task, .. } => task.header().state.get() != RUNNING,
+            Joined::Failed(_) => true,
         }
     }
 }
@@ -658,6 +715,64 @@ mod tests {
         assert!(matches!(poll_once(&mut joined), Poll::Ready(Ok(Err(Error::Canceled)))));
         unsafe { task.cancel() };
         assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn aborting_drops_the_future_at_once() {
+        let (shard, inbox) = ShardShared::for_test();
+        let (captured, drops) = tracked();
+        let gate = Rc::new(Cell::new(false));
+        let slot = Rc::new(Cell::new(None));
+        let (task, mut handle) = start(&shard, {
+            let wait = gated(gate.clone(), slot.clone());
+            async move {
+                let _captured = captured;
+                wait.await;
+                7
+            }
+        });
+        assert!(!unsafe { task.run() });
+        assert!(!handle.is_finished());
+
+        handle.abort();
+        assert_eq!(drops.get(), 1);
+        assert!(handle.is_finished());
+        handle.abort();
+        assert!(matches!(poll_once(&mut handle), Poll::Ready(Err(Error::Canceled))));
+        // One more turn, for the shard to let go of the task.
+        assert_eq!(run_woken(&inbox), 1);
+        assert_eq!(drops.get(), 1);
+        drop(slot.take());
+
+        // A task that has finished keeps its output.
+        let (task, mut handle) = start(&shard, async { 7 });
+        assert!(unsafe { task.run() });
+        handle.abort();
+        assert_eq!(run_woken(&inbox), 0);
+        assert!(matches!(poll_once(&mut handle), Poll::Ready(Ok(7))));
+    }
+
+    #[test]
+    fn a_task_that_aborts_itself_is_dropped_when_it_yields() {
+        let (shard, inbox) = ShardShared::for_test();
+        let (captured, drops) = tracked();
+        let own: Rc<Cell<Option<JoinHandle<()>>>> = Rc::new(Cell::new(None));
+        let inner = own.clone();
+        let inner_drops = drops.clone();
+        let (task, handle) = start(&shard, async move {
+            let _captured = captured;
+            // Aborted from inside its own poll, then the handle is dropped.
+            // The future cannot go while it runs; it goes when it yields.
+            if let Some(handle) = inner.take() {
+                handle.abort();
+            }
+            assert_eq!(inner_drops.get(), 0);
+            std::future::pending::<()>().await;
+        });
+        own.set(Some(handle));
+        assert!(unsafe { task.run() });
+        assert_eq!(drops.get(), 1);
+        assert_eq!(run_woken(&inbox), 0);
     }
 
     #[test]
