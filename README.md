@@ -202,6 +202,33 @@ tasks, behind Tokio on one thread and well ahead of it on four, and ahead
 of both at making and dropping connections. (That last row is the range of
 five runs of three seconds on one pinned core, over a Unix-domain socket.)
 
+### Where the time goes
+
+A profile of the one-thread echo test (`perf`, same machine) puts the
+figures above in proportion:
+
+| Share of CPU time | starfish | Tokio |
+|---|---|---|
+| Kernel network stack | 69% | 69% |
+| The machine's firewall (nftables and connection tracking, on loopback) | 17% | 19% |
+| The runtime and the benchmark's own code | 14% | 11% |
+
+- The runtime is about a seventh of the cost of a request. No change to
+  it can make this test much faster.
+- The firewall on this machine costs more than the runtime does, and
+  holds down every network figure here.
+- Per request, both io_uring runtimes execute about 2,000 more
+  instructions in the kernel than Tokio's epoll path (30.8k against
+  28.7k), and starfish about 1,300 more of its own (4,467 against 3,150;
+  Monoio 4,097). That is the whole of Tokio's lead on one thread.
+
+Throughput varies by several per cent from run to run on this machine, as
+the processor's clock speed does. To compare two builds, count cycles and
+instructions per request with `perf stat`, pinned to one core, alternating
+the builds.
+
+### A complete server
+
 `examples/kvdb.rs` is a durable key-value server built from the library's
 pieces, and `kvdb_bench` loads it. With the server on 8 cores and the load
 generator on 8 others of the same machine, over loopback, 100-byte values
