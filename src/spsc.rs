@@ -12,9 +12,23 @@ use std::sync::Arc;
 
 /// Keeps the two indexes on separate cache lines, so the producer and the
 /// consumer do not slow each other down by sharing one.
+///
+/// Each index is written by one side and only occasionally read by the other.
+/// On one cache line, every write by either side would take the line away
+/// from the other's processor, though they never touch the same data.
 #[repr(align(128))]
 struct CachePadded<T>(T);
 
+/// The storage shared by the two ends: a fixed array of slots, used as a
+/// ring, and the two positions in it.
+///
+/// `head` and `tail` count values taken and values put, without wrapping at
+/// the array's length; the slot for a count is the count modulo the length,
+/// which is a mask since the length is a power of two. The queue is empty
+/// when they are equal and full when they differ by the length.
+///
+/// The slots between `head` and `tail` hold values; the rest are
+/// uninitialised.
 struct Ring<T> {
     slots: Box<[UnsafeCell<MaybeUninit<T>>]>,
     mask: usize,
@@ -31,6 +45,9 @@ unsafe impl<T: Send> Send for Ring<T> {}
 unsafe impl<T: Send> Sync for Ring<T> {}
 
 impl<T> Drop for Ring<T> {
+    /// Drops whatever was sent and never received. Runs when both ends are
+    /// gone, on whichever thread let go last, which is why the values must be
+    /// `Send`.
     fn drop(&mut self) {
         // Both handles are gone, so whatever was sent but never received is
         // dropped here.
@@ -47,6 +64,9 @@ impl<T> Drop for Ring<T> {
     }
 }
 
+/// The sending end of the queue. There is exactly one, and `push` takes
+/// `&mut self`, so two threads can never put values at the same time: the
+/// type system enforces what the algorithm requires.
 pub(crate) struct Producer<T> {
     ring: Arc<Ring<T>>,
     tail: usize,
@@ -55,6 +75,8 @@ pub(crate) struct Producer<T> {
     head: usize,
 }
 
+/// The receiving end of the queue. There is exactly one, and `pop` takes
+/// `&mut self`, for the same reason as [`Producer`].
 pub(crate) struct Consumer<T> {
     ring: Arc<Ring<T>>,
     head: usize,
@@ -64,7 +86,10 @@ pub(crate) struct Consumer<T> {
 }
 
 /// Creates a queue holding up to `capacity` values, rounded up to a power
-/// of two.
+/// of two (and at least 2), and returns its two ends.
+///
+/// A power of two lets a position be turned into a slot with a mask instead
+/// of a division. Each end can be moved to the thread that will use it.
 pub(crate) fn channel<T>(capacity: usize) -> (Producer<T>, Consumer<T>) {
     let capacity = capacity.max(2).checked_next_power_of_two().unwrap_or(1 << 16);
     let slots: Box<[UnsafeCell<MaybeUninit<T>>]> = (0..capacity)
@@ -92,6 +117,11 @@ pub(crate) fn channel<T>(capacity: usize) -> (Producer<T>, Consumer<T>) {
 
 impl<T> Producer<T> {
     /// Appends a value, or hands it back if the queue is full.
+    ///
+    /// Never waits and never fails for any other reason. The producer keeps a
+    /// copy of where the consumer was when it last looked, and looks again only
+    /// when the queue seems full by that copy, so that in the common case a push
+    /// touches none of the consumer's memory.
     pub(crate) fn push(&mut self, value: T) -> Result<(), T> {
         let capacity = self.ring.slots.len();
         if self.tail.wrapping_sub(self.head) >= capacity {
@@ -114,6 +144,9 @@ impl<T> Producer<T> {
 
 impl<T> Consumer<T> {
     /// Removes the oldest value, if there is one.
+    ///
+    /// Never waits. Like the producer, the consumer works from a copy of the
+    /// other side's position and refreshes it only when the queue seems empty.
     pub(crate) fn pop(&mut self) -> Option<T> {
         if self.head == self.tail {
             self.tail = self.ring.tail.0.load(Ordering::Acquire);

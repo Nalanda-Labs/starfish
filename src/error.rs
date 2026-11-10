@@ -4,6 +4,31 @@ use std::fmt;
 use std::io;
 
 /// Why a runtime call could not produce a value.
+///
+/// Every fallible function of the runtime itself returns this type: starting a
+/// runtime, spawning and joining tasks, calls to other shards, the
+/// coordination primitives. Functions that are plain I/O (sockets, files)
+/// return `std::io::Error` instead, and the two convert into each other with
+/// `?` in either direction: an `io::Error` becomes [`Error::Io`], and any
+/// other variant becomes an `io::Error` of kind `Other` that keeps the
+/// original as its source.
+///
+/// The type is `#[non_exhaustive]`: later versions may add variants, so a
+/// `match` on it needs a wildcard arm.
+///
+/// ```
+/// use starfish::Error;
+///
+/// fn describe(error: &Error) -> &'static str {
+///     match error {
+///         Error::Io(_) => "the kernel refused",
+///         Error::Panicked { .. } => "the task panicked",
+///         Error::Canceled => "the task was dropped",
+///         _ => "something else",
+///     }
+/// }
+/// assert_eq!(describe(&Error::Canceled), "the task was dropped");
+/// ```
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
@@ -41,10 +66,18 @@ pub enum Error {
     Closed,
 }
 
-/// `Result` with the runtime's [`Error`].
+/// `Result` with the runtime's [`Error`] as its error type.
+///
+/// This is what the runtime's own functions return. It is a plain alias, so
+/// `starfish::Result<T>` and `Result<T, starfish::Error>` are the same type
+/// and `?` works between them and `std::io::Result` (see [`Error`]).
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl fmt::Display for Error {
+    /// Writes a one-line, lower-case description of the error, without a
+    /// trailing full stop, as is usual for error messages that get embedded in
+    /// longer ones. For [`Error::Io`] it includes the kernel's own message, and
+    /// for [`Error::Panicked`] the panic's message when there is one.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Io(err) => write!(f, "I/O error: {err}"),
@@ -65,6 +98,8 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {
+    /// The underlying `io::Error` for [`Error::Io`], and `None` for every other
+    /// variant, which have no lower-level cause.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Io(err) => Some(err),
@@ -74,12 +109,20 @@ impl std::error::Error for Error {
 }
 
 impl From<io::Error> for Error {
+    /// Wraps an I/O error as [`Error::Io`], which is what lets `?` turn a failed
+    /// socket or file call into a `starfish::Result` error.
     fn from(err: io::Error) -> Error {
         Error::Io(err)
     }
 }
 
 impl From<Error> for io::Error {
+    /// Turns a runtime error into an I/O error, which is what lets `?` be used
+    /// on runtime calls inside functions that return `std::io::Result`.
+    ///
+    /// [`Error::Io`] gives back the I/O error it held, unchanged. Any other
+    /// variant becomes an error of kind `Other` whose source is the original
+    /// `Error`, so nothing is lost: `err.get_ref()` and downcasting recover it.
     fn from(err: Error) -> io::Error {
         match err {
             Error::Io(err) => err,

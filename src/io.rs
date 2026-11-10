@@ -61,13 +61,20 @@ pub trait Read {
 ///
 /// This is what [`BufWriter`] writes to.
 pub trait Write {
-    /// Writes all of `buf`.
+    /// Writes all of `buf`, in as many steps as it takes, and hands the buffer
+    /// back with the outcome. On an error, how much was written before it is not
+    /// known.
     fn write_whole(&mut self, buf: Vec<u8>) -> impl Future<Output = (io::Result<()>, Vec<u8>)>;
 }
 
-/// Default size of the buffers of [`BufReader`] and [`BufWriter`].
+/// Default size of the buffers of [`BufReader`] and [`BufWriter`]: large
+/// enough that small reads and writes are batched well, small enough to be
+/// cheap per connection.
 const DEFAULT_BUFFER: usize = 8 * 1024;
 
+/// An `InvalidData` error with the given message: the stream held
+/// something the reader cannot return, such as a line that is too long or is
+/// not text.
 fn invalid_data(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
@@ -126,12 +133,20 @@ pub struct BufReader<S> {
 }
 
 impl<S: Read> BufReader<S> {
-    /// A reader with an 8 KiB buffer.
+    /// A reader with an 8 KiB buffer, which suits most line-based protocols.
+    ///
+    /// Nothing is read until the first call that needs data, and the buffer is
+    /// allocated then.
     pub fn new(stream: S) -> BufReader<S> {
         BufReader::with_capacity(DEFAULT_BUFFER, stream)
     }
 
     /// A reader with a buffer of `capacity` bytes (at least one).
+    ///
+    /// The capacity is how much is asked of the stream at a time. A larger buffer
+    /// means fewer reads for the same data; it does not limit the length of a
+    /// line, which may span any number of buffers (see [`limit`](Self::limit) for
+    /// that).
     pub fn with_capacity(capacity: usize, stream: S) -> BufReader<S> {
         BufReader {
             stream,
@@ -156,30 +171,55 @@ impl<S: Read> BufReader<S> {
         self
     }
 
-    /// What is being read from.
+    /// What is being read from: the stream or cursor the reader was given.
+    ///
+    /// Reading from it directly while the reader holds buffered data would skip
+    /// that data. Use it for things that do not read, such as asking a socket
+    /// for its peer's address.
     pub fn get_ref(&self) -> &S {
         &self.stream
     }
 
-    /// Gives back what was being read from. Bytes that were received but
-    /// not yet read from the reader are lost; see [`buffer`](Self::buffer).
+    /// Gives back what was being read from, ending the reader.
+    ///
+    /// Bytes that were received but not yet read from the reader are lost, as is
+    /// a read that was in progress; see [`buffer`](Self::buffer). To switch from
+    /// buffered to direct reading without losing data, take what
+    /// [`buffer`](Self::buffer) holds first.
     pub fn into_inner(self) -> S {
         self.stream
     }
 
-    /// The bytes received from the stream and not yet read.
+    /// The bytes received from the stream and not yet read: what the next read
+    /// would return without waiting. Empty when the reader has to fetch more.
     pub fn buffer(&self) -> &[u8] {
         self.buf.get(self.pos..).unwrap_or(&[])
     }
 
-    /// Marks the first `count` bytes of [`buffer`](Self::buffer) as read.
+    /// Marks the first `count` bytes of [`buffer`](Self::buffer) as read, so
+    /// that the next read starts after them. A `count` larger than the buffer
+    /// consumes all of it.
+    ///
+    /// This is the second half of the [`fill_buf`](Self::fill_buf) and `consume`
+    /// pair, for parsing in place without copying.
     pub fn consume(&mut self, count: usize) {
         self.pos = self.pos.saturating_add(count).min(self.buf.len());
     }
 
-    /// Returns the bytes not yet read, first receiving more from the
-    /// stream if there are none. An empty result means the peer has
-    /// stopped sending. Follow with [`consume`](Self::consume).
+    /// Returns the bytes not yet read, first receiving more from the stream if
+    /// there are none. An empty result means the peer has stopped sending (or the
+    /// file has ended).
+    ///
+    /// The bytes stay in the reader until [`consume`](Self::consume) says how
+    /// many were used, so a parser can look at them, find that it needs more, and
+    /// call again later. All the other reading methods are built on this one.
+    ///
+    /// If the returned future is dropped while it waits, a read from a socket is
+    /// kept and picked up by the next call; nothing is lost.
+    ///
+    /// # Errors
+    ///
+    /// The stream's error, if the read failed.
     pub async fn fill_buf(&mut self) -> io::Result<&[u8]> {
         if self.pos >= self.buf.len() {
             if self.pending.is_none() {
@@ -213,8 +253,12 @@ impl<S: Read> BufReader<S> {
         Ok(self.buffer())
     }
 
-    /// Reads some bytes into `out` and returns how many. `Ok(0)` means the
-    /// peer has stopped sending (or `out` is empty).
+    /// Reads some bytes into `out` and returns how many: at least one unless
+    /// the stream has ended, and at most `out.len()`. `Ok(0)` means the peer has
+    /// stopped sending (or `out` is empty).
+    ///
+    /// It returns what is buffered, or what one read brings, without waiting for
+    /// `out` to be filled; use [`read_exact`](Self::read_exact) for that.
     pub async fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         let available = self.fill_buf().await?;
         let count = available.len().min(out.len());
@@ -352,12 +396,16 @@ pub struct BufWriter<S> {
 }
 
 impl<S: Write> BufWriter<S> {
-    /// A writer with an 8 KiB buffer.
+    /// A writer with an 8 KiB buffer. The buffer is allocated at the first
+    /// write.
     pub fn new(stream: S) -> BufWriter<S> {
         BufWriter::with_capacity(DEFAULT_BUFFER, stream)
     }
 
     /// A writer with a buffer of `capacity` bytes (at least one).
+    ///
+    /// The capacity is how much collects before it is sent without being asked.
+    /// Data longer than the buffer is sent in buffer-sized pieces.
     pub fn with_capacity(capacity: usize, stream: S) -> BufWriter<S> {
         BufWriter {
             stream,
@@ -366,13 +414,17 @@ impl<S: Write> BufWriter<S> {
         }
     }
 
-    /// What is being written to.
+    /// What is being written to: the stream or cursor the writer was given.
+    ///
+    /// Writing to it directly while the writer holds buffered data would put the
+    /// new data ahead of the old. Flush first.
     pub fn get_ref(&self) -> &S {
         &self.stream
     }
 
-    /// Gives back what was being written to. Bytes still in the buffer
-    /// are lost; [`flush`](Self::flush) first.
+    /// Gives back what was being written to, ending the writer.
+    ///
+    /// Bytes still in the buffer are lost; [`flush`](Self::flush) first.
     pub fn into_inner(self) -> S {
         self.stream
     }
@@ -403,7 +455,18 @@ impl<S: Write> BufWriter<S> {
         Ok(())
     }
 
-    /// Sends everything in the buffer.
+    /// Sends everything in the buffer, and returns once the stream has
+    /// accepted it all.
+    ///
+    /// For a socket that means the data is in the kernel's hands, on its way to
+    /// the peer. For a file it means the data is in the page cache, not yet on
+    /// the device: follow with the file's `sync_data` if it has to survive a
+    /// crash. Flushing an empty buffer does nothing.
+    ///
+    /// # Errors
+    ///
+    /// The stream's error. The buffer is emptied all the same; how much of it
+    /// was sent before the error is not known.
     pub async fn flush(&mut self) -> io::Result<()> {
         if self.buf.is_empty() {
             return Ok(());

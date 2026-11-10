@@ -8,6 +8,20 @@ use std::time::{Duration, Instant};
 use crate::timer::sleep;
 
 /// Which of the two futures given to [`select`] finished, with its output.
+///
+/// The two type parameters are the outputs of the first and second future, in
+/// the order they were passed. Matching on the value is how the caller finds
+/// out what happened:
+///
+/// ```
+/// use starfish::Either;
+///
+/// let outcome: Either<u32, &str> = Either::Second("timed out");
+/// match outcome {
+///     Either::First(number) => println!("got {number}"),
+///     Either::Second(reason) => println!("{reason}"),
+/// }
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Either<A, B> {
     /// The first future finished.
@@ -83,7 +97,8 @@ pub async fn select<A: Future, B: Future>(first: A, second: B) -> Either<A::Outp
 }
 
 /// Which of the three futures given to [`select3`] finished, with its
-/// output.
+/// output. The type parameters are the outputs of the first, second and third
+/// future, in the order they were passed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Either3<A, B, C> {
     /// The first future finished.
@@ -94,9 +109,29 @@ pub enum Either3<A, B, C> {
     Third(C),
 }
 
-/// Waits for whichever of three futures finishes first. Everything said
-/// of [`select`] holds: the others are dropped unless passed by reference,
-/// and they are looked at in order, so put the rarest event first.
+/// Waits for whichever of three futures finishes first.
+///
+/// Everything said of [`select`] holds here. A future passed by value is
+/// dropped the moment another wins, which cancels what it was waiting for;
+/// one that is pinned and passed by reference carries on in the next call.
+/// The futures are looked at in the order given, and when one is ready those
+/// after it are not looked at, so put the rarest event first.
+///
+/// ```no_run
+/// use std::time::Duration;
+/// use starfish::sync::{channel, oneshot};
+/// use starfish::{select3, sleep, Either3};
+///
+/// # async fn example() {
+/// let (_jobs, mut inbox) = channel::<u32>(8);
+/// let (_stop, stopped) = oneshot::<()>();
+/// match select3(stopped, sleep(Duration::from_secs(60)), inbox.recv()).await {
+///     Either3::First(_) => println!("told to stop"),
+///     Either3::Second(()) => println!("idle for a minute"),
+///     Either3::Third(job) => println!("job: {job:?}"),
+/// }
+/// # }
+/// ```
 pub async fn select3<A: Future, B: Future, C: Future>(
     first: A,
     second: B,
@@ -139,7 +174,9 @@ pub async fn select3<A: Future, B: Future, C: Future>(
 /// ```
 pub async fn select_all<F: Future>(futures: impl IntoIterator<Item = F>) -> (usize, F::Output) {
     thread_local! {
-        /// Where the last call on this thread started looking.
+        /// Where the last call to `select_all` on this thread started looking. Kept
+        /// per thread, so that it needs no synchronisation and every shard rotates
+        /// independently.
         static TURN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
     // Boxed so that each stays put while the list is walked.
@@ -172,6 +209,12 @@ pub async fn select_all<F: Future>(futures: impl IntoIterator<Item = F>) -> (usi
 }
 
 /// Ticks at a fixed rate, without drifting. Made by [`interval`].
+///
+/// It remembers when the next tick is due, as a point in time, and each call
+/// to [`tick`](Self::tick) sleeps until that point and then moves it one
+/// period on. Because the schedule is in absolute times, the time the caller
+/// spends working between ticks does not push later ticks back, which it
+/// would if the caller slept for a fixed duration after each piece of work.
 pub struct Interval {
     period: Duration,
     next: Instant,
@@ -198,7 +241,7 @@ impl Interval {
         self.next = if after <= now { now.checked_add(self.period).unwrap_or(now) } else { after };
     }
 
-    /// The time between ticks.
+    /// The time between ticks, as given to [`interval`].
     pub fn period(&self) -> Duration {
         self.period
     }

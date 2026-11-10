@@ -9,6 +9,12 @@ use crate::runtime::{catch_panic, current, try_current, wake_quietly, Message};
 use crate::sched::DEFAULT_GROUP;
 use crate::sync::Permit;
 
+/// Where the result of a call to another shard is left for the caller.
+///
+/// It is shared between the two shards, behind a mutex: the shard that ran
+/// the call puts the result in and wakes the caller; the caller takes it out.
+/// The mutex is held only for those few instructions, never across an await
+/// or a call into user code.
 struct Reply<T> {
     value: Option<Result<T>>,
     waker: Option<Waker>,
@@ -16,21 +22,34 @@ struct Reply<T> {
     done: bool,
 }
 
+/// Locks a reply slot, recovering it if a thread panicked while holding the
+/// lock. Nothing panics while holding it, and the slot holds a consistent
+/// value at every point, so a poisoned lock is safe to use.
 fn lock<T>(reply: &Mutex<Reply<T>>) -> MutexGuard<'_, Reply<T>> {
     // Nothing panics while holding this lock, and a poisoned lock would
     // still hold a consistent value.
     reply.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The sending half of a reply. If it is dropped without a value the caller
-/// is told why: the remote closure panicked (dropped during unwinding), or
-/// the target shard went away before running it.
+/// The sending half of a reply: owned by the task that runs the call on the
+/// target shard.
+///
+/// Its `Drop` is what guarantees that a caller is always answered. If it is
+/// dropped without a result having been sent, the caller is told why: the
+/// call panicked (the sender is being dropped by unwinding), or the target
+/// shard went away before it could run the call.
 struct ReplySender<T> {
     reply: Arc<Mutex<Reply<T>>>,
     done: bool,
 }
 
 impl<T> ReplySender<T> {
+    /// Stores the call's outcome and wakes the caller, if it is already
+    /// waiting. If it is not, it will find the outcome on its first look and no
+    /// wake-up is needed.
+    ///
+    /// The waker belongs to a task on the calling shard. Calling it from here
+    /// sends that task back to its own shard as a message.
     fn finish(&mut self, value: Result<T>) {
         self.done = true;
         let waker = {
@@ -48,6 +67,9 @@ impl<T> ReplySender<T> {
 }
 
 impl<T> Drop for ReplySender<T> {
+    /// Answers the caller if nothing has been sent yet: with
+    /// [`Error::Panicked`] if this drop is part of a panic's unwinding, otherwise
+    /// with [`Error::Canceled`], which means the call was thrown away unrun.
     fn drop(&mut self) {
         if !self.done {
             let reason = if std::thread::panicking() {
@@ -61,7 +83,12 @@ impl<T> Drop for ReplySender<T> {
 }
 
 /// The caller's side of a call in progress on another shard. It holds the
-/// call's permit from the limit on calls between the two shards.
+/// call's permit from the limit on calls between the two shards
+/// (`Runtime::submit_limit`).
+///
+/// It exists so that the permit is released at the right moment whatever
+/// happens to the caller: when the reply is collected, or, if the caller
+/// stops waiting first, only once the other shard has really finished.
 struct Call<T: Send + 'static> {
     reply: Arc<Mutex<Reply<T>>>,
     /// `None` once the call is over and the permit has been returned.
@@ -69,6 +96,13 @@ struct Call<T: Send + 'static> {
 }
 
 impl<T: Send + 'static> Drop for Call<T> {
+    /// Called when the caller is done with the call, one way or the other.
+    ///
+    /// If the reply has been collected, or the call is over, the permit is simply
+    /// returned. If the caller is giving up while the other shard is still at
+    /// work, the permit is handed to a small task that waits for the call to end
+    /// and returns it then. Returning it at once would let a caller that abandons
+    /// its calls exceed the limit without bound.
     fn drop(&mut self) {
         let Some(permit) = self.permit.take() else { return };
         if lock(&self.reply).done {
@@ -215,8 +249,31 @@ where
 }
 
 /// Runs `f` on every shard concurrently and returns the results in shard
-/// order. Fails with the first error if any shard's call fails; see
-/// [`submit_to`] for the possible errors.
+/// order.
+///
+/// `f` is called once on each shard, the current one included, and the
+/// futures it returns run at the same time, each on its own shard. Use it to
+/// set something up everywhere, such as binding a listener per shard, or to
+/// gather something from everywhere.
+///
+/// ```no_run
+/// use starfish::{shard_id, submit_to_all};
+///
+/// # async fn example() -> starfish::Result<()> {
+/// let ids = submit_to_all(|| async { shard_id() }).await?;
+/// println!("{} shards answered", ids.len());
+/// # Ok(())
+/// # }
+/// ```
+///
+/// `f` must be `Fn`, `Send` and `Sync`, since every shard calls it; its
+/// result must be `Send`. The futures need not be.
+///
+/// # Errors
+///
+/// The first failure, in shard order: see [`submit_to`] for what can fail.
+/// The other shards' results are discarded, though `f` has run there. To
+/// learn what happened on each shard, use [`submit_to_each`].
 pub async fn submit_to_all<F, Fut, T>(f: F) -> Result<Vec<T>>
 where
     F: Fn() -> Fut + Send + Sync + 'static,

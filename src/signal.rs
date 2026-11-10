@@ -32,14 +32,26 @@ use std::task::{Poll, Waker};
 
 use crate::runtime::wake_quietly;
 
-/// One more than the highest signal number.
+/// One more than the highest signal number, so that a signal's number can
+/// index an array directly. Linux numbers signals from 1 to 64.
 const SLOTS: usize = 65;
 
-/// How often each signal has arrived, by signal number.
+/// How often each signal has arrived since the process started, indexed by
+/// signal number.
+///
+/// The signal handler adds to these, which is all a handler may safely do
+/// with shared data. Everything else compares a count with the value it last
+/// saw: a listener has a signal to report when the count has moved on.
 static COUNTS: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
-/// The eventfd the handler writes to, once there is one.
+/// The eventfd the handler writes to, to wake the relay thread, or -1
+/// before there is one. It is created once and never closed, so the handler
+/// can use it without any coordination.
 static NOTIFY: AtomicI32 = AtomicI32::new(-1);
 
+/// What the listeners and the relay thread share, behind a mutex.
+///
+/// The signal handler never touches this: taking a lock in a signal handler
+/// could deadlock against the very code it interrupted.
 struct Registry {
     /// The relay thread and its eventfd exist.
     started: bool,
@@ -50,7 +62,8 @@ struct Registry {
     next_listener: u64,
 }
 
-/// One signal's state.
+/// One signal's state: how many listeners it has, and what the process did
+/// with it before the first of them arrived.
 #[derive(Clone, Copy)]
 struct Slot {
     /// How many [`Signals`] listen for it.
@@ -60,6 +73,8 @@ struct Slot {
     previous: Option<libc::sigaction>,
 }
 
+/// The one registry of the process. Signals are a process-wide resource,
+/// so this is too: it is shared by every shard and every runtime.
 static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
     started: false,
     slots: [Slot {
@@ -70,11 +85,15 @@ static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
     next_listener: 0,
 });
 
+/// Locks the registry, recovering it if a thread panicked while holding
+/// the lock. Nothing panics while holding it.
 fn registry() -> MutexGuard<'static, Registry> {
     // Nothing panics while holding this lock.
     REGISTRY.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// How often `signal` has arrived so far. Zero for a number that is not a
+/// signal.
 fn count(signal: c_int) -> u64 {
     usize::try_from(signal)
         .ok()
@@ -82,9 +101,14 @@ fn count(signal: c_int) -> u64 {
         .map_or(0, |count| count.load(Ordering::SeqCst))
 }
 
-/// Runs on whichever thread the kernel picks, interrupting it. It keeps to
-/// what is safe in a signal handler: atomics and `write(2)`. Everything
-/// else happens on the relay thread.
+/// The signal handler. Runs on whichever thread the kernel picks,
+/// interrupting whatever that thread was doing.
+///
+/// It keeps to what is safe in that position: it adds one to the signal's
+/// count and writes to the eventfd, both of which are single atomic or
+/// system-call operations, and it saves and restores `errno` so that the code
+/// it interrupted does not see the write's result. It takes no lock and
+/// allocates nothing. Waking the listeners is left to the relay thread.
 extern "C" fn on_signal(signal: c_int) {
     // SAFETY: `__errno_location` returns this thread's errno slot.
     let errno = unsafe { *libc::__errno_location() };
@@ -104,8 +128,16 @@ extern "C" fn on_signal(signal: c_int) {
     unsafe { *libc::__errno_location() = errno };
 }
 
-/// Wakes the listeners whenever the handler has run. The handler cannot do
-/// this itself: waking a task takes locks and may allocate.
+/// The relay thread: sleeps in a read on the eventfd, and each time the
+/// handler writes to it, wakes every waiting listener.
+///
+/// A handler cannot wake tasks itself, since that takes locks and may
+/// allocate. This thread is the bridge from the handler's world to the
+/// runtime's. Listeners that are woken check the counts for themselves, so
+/// waking all of them for any signal is correct, and there are never many.
+///
+/// It runs for the rest of the process's life. A read that fails for any
+/// reason but an interruption ends it.
 fn relay(fd: c_int) {
     loop {
         let mut arrivals: u64 = 0;
@@ -123,7 +155,15 @@ fn relay(fd: c_int) {
     }
 }
 
-/// Creates the eventfd and the relay thread, once per process.
+/// Creates the eventfd and the relay thread, the first time anything
+/// listens. Later calls do nothing.
+///
+/// The eventfd's number is published for the handler only after the thread
+/// exists, so the handler never writes to something nobody reads.
+///
+/// # Errors
+///
+/// The kernel's error if the eventfd or the thread cannot be created.
 fn start(registry: &mut Registry) -> io::Result<()> {
     if registry.started {
         return Ok(());
@@ -148,14 +188,29 @@ fn start(registry: &mut Registry) -> io::Result<()> {
     Ok(())
 }
 
+/// An `InvalidInput` error with the given message.
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
-/// Routes `signal` to our handler, if it is not already.
+/// Adds a listener for `signal`, installing the handler if it is the first.
+///
+/// When the handler is installed, the action the process had for the signal
+/// until then is saved, to be restored by [`uninstall`] when the last
+/// listener goes.
+///
+/// # Errors
+///
+/// `InvalidInput` for a number that is not a signal, or for one of the
+/// signals that report a fault in the program itself. Otherwise the kernel's
+/// error, which is what `SIGKILL` and `SIGSTOP` get, since they cannot be
+/// caught.
 fn install(registry: &mut Registry, signal: c_int) -> io::Result<()> {
     // The kernel raises these for a fault in the program itself and runs
     // the faulting instruction again when the handler returns.
+    /// The signals the kernel raises for a fault in the program itself. When a
+    /// handler for one of these returns, the faulting instruction runs again and
+    /// faults again, forever: they cannot be turned into events.
     const FAULTS: [c_int; 4] = [libc::SIGSEGV, libc::SIGBUS, libc::SIGFPE, libc::SIGILL];
     if FAULTS.contains(&signal) {
         return Err(invalid("cannot listen for a signal that reports a program fault"));
@@ -205,8 +260,34 @@ fn uninstall(registry: &mut Registry, signal: c_int) {
 
 /// A listener for a set of signals.
 ///
+/// While it exists, the signals it names are delivered to it instead of doing
+/// what they would otherwise do to the process (ending it, for most).
+/// [`next`](Self::next) waits for one and says which.
+///
 /// It reports signals that arrive from the moment it is created, including
-/// those that arrive while nobody is waiting in [`next`](Self::next).
+/// those that arrive while nobody is waiting in `next`. Signals of one kind
+/// that arrive faster than they are collected are reported once, not once
+/// each: a signal says "this happened", not how many times.
+///
+/// Any number of listeners may exist, on any shards, for the same or
+/// different signals; each sees every signal it listens for. When the last
+/// listener for a signal is dropped, the signal goes back to what the process
+/// did with it before.
+///
+/// ```no_run
+/// use starfish::signal::Signals;
+///
+/// # async fn example() -> std::io::Result<()> {
+/// let mut signals = Signals::new(&[libc::SIGHUP, libc::SIGTERM])?;
+/// loop {
+///     match signals.next().await {
+///         libc::SIGHUP => println!("reload"),
+///         _ => break,
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
 pub struct Signals {
     id: u64,
     /// Each signal listened for, with the arrival count already reported.
@@ -245,8 +326,15 @@ impl Signals {
         Ok(Signals { id, seen })
     }
 
-    /// Waits for one of the signals and returns its number. If several
-    /// have arrived, they are returned one per call.
+    /// Waits for one of the signals and returns its number.
+    ///
+    /// If one has already arrived since the listener was created or since it was
+    /// last reported, this returns at once. If several different signals have
+    /// arrived, they are returned one per call, in the order they were given to
+    /// [`new`](Self::new), not the order they arrived in.
+    ///
+    /// Dropping the future loses nothing: a signal that arrives meanwhile is
+    /// reported by the next call.
     pub async fn next(&mut self) -> i32 {
         poll_fn(|cx| {
             let waker = cx.waker().clone();
@@ -271,6 +359,9 @@ impl Signals {
 }
 
 impl Drop for Signals {
+    /// Stops listening: forgets this listener's waker and takes it off each of
+    /// its signals. A signal that is left with no listener goes back to what the
+    /// process did with it before anyone listened.
     fn drop(&mut self) {
         let mut registry = registry();
         let waker = registry.listeners.remove(&self.id);

@@ -13,30 +13,43 @@ use std::io;
 use std::sync::Once;
 use std::time::Duration;
 
-/// Deepest stack recorded.
+/// Deepest stack recorded. Frames beyond this are left out; the innermost
+/// ones, which say where the shard was stuck, come first and are kept.
 const MAX_FRAMES: usize = 48;
 
 thread_local! {
-    /// Odd while the shard is running tasks; changes with every slice.
+    /// Which time slice the shard is in. Odd while the shard is running tasks,
+    /// even between slices, and different for every slice, so the timer can tell
+    /// "still in the same slice as last time" from "in a new one".
     static SLICE: Cell<u64> = const { Cell::new(0) };
-    /// The value of `SLICE` at the previous tick.
+    /// The value of `SLICE` when the timer last fired. If it is unchanged at
+    /// the next tick, the same slice has been running for a whole period.
     static SEEN: Cell<u64> = const { Cell::new(0) };
-    /// The stack recorded for the current slice, and how deep it is.
+    /// The stack recorded for the current slice. Written by the signal handler
+    /// and read by the shard afterwards, both on the same thread.
     static FRAMES: Cell<[*mut c_void; MAX_FRAMES]> =
         const { Cell::new([std::ptr::null_mut(); MAX_FRAMES]) };
+    /// How many frames of `FRAMES` are valid. Zero means no stack has been
+    /// recorded for the current slice, which is also what stops the handler from
+    /// recording a second one.
     static DEPTH: Cell<c_int> = const { Cell::new(0) };
 }
 
+/// The signal the stall timers use: a real-time signal, which no ordinary
+/// program gives a meaning to. The same one for every shard; each timer aims
+/// it at its own thread.
 fn signal() -> c_int {
     libc::SIGRTMIN().saturating_add(5)
 }
 
-/// Marks the start of a slice.
+/// Marks the start of a time slice, by making the slice counter odd. Called
+/// by the event loop just before it runs a group's tasks.
 pub(crate) fn slice_begin() {
     let _ = SLICE.try_with(|slice| slice.set(slice.get().wrapping_add(1) | 1));
 }
 
-/// Marks the end of a slice.
+/// Marks the end of a time slice, by making the slice counter even. A tick
+/// that arrives between slices finds an even value and does nothing.
 pub(crate) fn slice_end() {
     let _ = SLICE.try_with(|slice| slice.set(slice.get().wrapping_add(1) & !1));
 }
@@ -100,14 +113,26 @@ pub(crate) fn take_backtrace() -> Vec<String> {
     }
 }
 
-/// The per-thread timer; stopped on drop.
+/// One shard's periodic timer, which interrupts the shard's thread so that
+/// a stall can be caught while it is happening. Stopped on drop.
 pub(crate) struct StallTimer {
     timer: libc::timer_t,
 }
 
 impl StallTimer {
     /// Starts interrupting the current thread every `period`.
+    ///
+    /// The first call in the process installs the signal handler and, before
+    /// that, makes one throwaway call to `backtrace`, which loads the unwinder
+    /// library. Loading a library takes locks and allocates, neither of which is
+    /// allowed inside a signal handler, so it has to have happened already by
+    /// the time the handler first runs.
+    ///
+    /// # Errors
+    ///
+    /// The kernel's error if the timer cannot be created or armed.
     pub(crate) fn start(period: Duration) -> io::Result<StallTimer> {
+        /// Guards the one-time installation of the signal handler.
         static INSTALL: Once = Once::new();
         INSTALL.call_once(|| {
             // SAFETY: installs a handler that keeps to async-signal-safe
@@ -153,6 +178,7 @@ impl StallTimer {
 }
 
 impl Drop for StallTimer {
+    /// Deletes the timer, so the thread is no longer interrupted.
     fn drop(&mut self) {
         // SAFETY: the timer was created in `start` and is deleted once.
         unsafe {

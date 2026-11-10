@@ -25,6 +25,11 @@ use crate::spsc::{self, Consumer, Producer};
 use crate::sync::{SendError, TrySendError};
 
 /// One end's request to be woken by the other.
+///
+/// It is a flag saying "I am waiting" and a slot holding the waker to call.
+/// The flag is what the other end checks after every change it makes, and it
+/// is a single atomic read when nobody waits, so the common case, where
+/// neither end ever waits, costs almost nothing.
 #[derive(Default)]
 struct Parked {
     waiting: AtomicBool,
@@ -59,6 +64,9 @@ impl Parked {
     }
 }
 
+/// What the two ends of a [`shared_channel`] have in common besides the
+/// queue itself: each end's request to be woken, and whether each end still
+/// exists.
 #[derive(Default)]
 struct Shared {
     receiver: Parked,
@@ -118,6 +126,10 @@ pub fn shared_channel<T: Send>(capacity: usize) -> (SharedSender<T>, SharedRecei
 }
 
 /// The sending end of a [`shared_channel`].
+///
+/// It can be moved to another shard, and is used by one task at a time; the
+/// methods that send take `&mut self`. Dropping it tells the receiver that no
+/// more values will come, once it has taken those already queued.
 pub struct SharedSender<T> {
     queue: Producer<T>,
     shared: Arc<Shared>,
@@ -171,11 +183,19 @@ impl<T> SharedSender<T> {
         }
     }
 
-    /// Whether the receiver has been dropped.
+    /// Whether the receiver has been dropped, in which case nothing sent from
+    /// now on can arrive. A producer doing expensive work can check this and
+    /// stop.
     pub fn is_closed(&self) -> bool {
         self.shared.receiver_gone.load(Ordering::SeqCst)
     }
 
+    /// One attempt to send, for [`send`](Self::send): tries, and if the queue
+    /// is full, announces that it waits and tries once more.
+    ///
+    /// The second try is what makes the wait safe. Without it, the receiver could
+    /// make room between the first try and the announcement, see nobody waiting,
+    /// and never wake this end.
     fn poll_send(&mut self, value: T, cx: &mut Context<'_>) -> std::result::Result<(), TrySendError<T>> {
         match self.try_send(value) {
             Err(TrySendError::Full(value)) => {
@@ -189,14 +209,20 @@ impl<T> SharedSender<T> {
 }
 
 impl<T> Drop for SharedSender<T> {
+    /// Marks the sender gone and wakes the receiver, so that a receiver
+    /// waiting on an empty queue learns that nothing more will come.
     fn drop(&mut self) {
         self.shared.sender_gone.store(true, Ordering::SeqCst);
         self.shared.receiver.unpark();
     }
 }
 
-/// The receiving end of a [`shared_channel`]. Dropping it makes sends
-/// fail.
+/// The receiving end of a [`shared_channel`].
+///
+/// It can be moved to another shard, and is used by one task at a time.
+/// Dropping it makes every later send fail, and wakes a sender that is
+/// waiting for room. Values still queued at that point are dropped with the
+/// queue.
 pub struct SharedReceiver<T> {
     queue: Consumer<T>,
     shared: Arc<Shared>,
@@ -212,14 +238,21 @@ impl<T> SharedReceiver<T> {
         poll_fn(|cx| self.poll_recv(cx)).await
     }
 
-    /// Takes the next value if one is queued. `None` only says that none
-    /// is queued right now.
+    /// Takes the next value if one is queued. `None` only says that none is
+    /// queued right now, not that none will come; [`recv`](Self::recv) tells the
+    /// two apart.
     pub fn try_recv(&mut self) -> Option<T> {
         let value = self.queue.pop()?;
         self.shared.sender.unpark();
         Some(value)
     }
 
+    /// One attempt to receive, for [`recv`](Self::recv): looks, and if the
+    /// queue is empty, announces that it waits and looks once more.
+    ///
+    /// Whether the sender is gone is read between the announcement and the second
+    /// look, in that order, so that a value queued just before the sender left is
+    /// still found rather than the stream being reported as ended.
     fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
         if let Some(value) = self.try_recv() {
             return Poll::Ready(Some(value));
@@ -237,13 +270,16 @@ impl<T> SharedReceiver<T> {
 }
 
 impl<T> Drop for SharedReceiver<T> {
+    /// Marks the receiver gone and wakes the sender, so that a sender waiting
+    /// for room learns that there will never be any.
     fn drop(&mut self) {
         self.shared.receiver_gone.store(true, Ordering::SeqCst);
         self.shared.sender.unpark();
     }
 }
 
-/// One sender's own queue towards the receiver, as the sender sees it.
+/// One sender's own queue towards the receiver, as the sender sees it: its
+/// request to be woken when there is room, and whether it still exists.
 #[derive(Default)]
 struct LaneShared {
     /// The sender, waiting for room in its queue.
@@ -251,14 +287,17 @@ struct LaneShared {
     sender_gone: AtomicBool,
 }
 
-/// The receiver's end of one sender's queue.
+/// The receiver's end of one sender's queue: the queue to take from, and
+/// the shared state through which that sender is woken.
 struct Lane<T> {
     queue: Consumer<T>,
     shared: Arc<LaneShared>,
 }
 
 /// What all the senders and the receiver of a [`shared_mpsc`] have in
-/// common.
+/// common: the receiver's request to be woken, whether it still exists, how
+/// many senders exist, and the queues of senders made since the receiver
+/// last looked.
 struct Hub<T> {
     receiver: Parked,
     receiver_gone: AtomicBool,
@@ -272,7 +311,11 @@ struct Hub<T> {
 }
 
 impl<T> Hub<T> {
-    /// Gives a new sender a queue of its own and tells the receiver.
+    /// Gives a new sender a queue of its own and leaves the receiving end of
+    /// that queue where the receiver will find it.
+    ///
+    /// Making a sender is the only operation that takes the lock. Sending and
+    /// receiving never do.
     fn add_sender(self: &Arc<Self>) -> SharedMpscSender<T> {
         let (producer, consumer) = spsc::channel(self.capacity);
         let shared = Arc::new(LaneShared::default());
@@ -346,8 +389,11 @@ pub fn shared_mpsc<T: Send>(capacity: usize) -> (SharedMpscSender<T>, SharedMpsc
     (sender, receiver)
 }
 
-/// A sending end of a [`shared_mpsc`]. Each one is used by one task at a
-/// time; clone it for every further producer.
+/// A sending end of a [`shared_mpsc`].
+///
+/// Each one has its own queue to the receiver and is used by one task at a
+/// time; clone it for every further producer, on this shard or another.
+/// Dropping the last one ends the receiver's stream.
 pub struct SharedMpscSender<T> {
     queue: Producer<T>,
     lane: Arc<LaneShared>,
@@ -410,7 +456,8 @@ impl<T> SharedMpscSender<T> {
         }
     }
 
-    /// Whether the receiver has been dropped.
+    /// Whether the receiver has been dropped, in which case nothing sent from
+    /// now on can arrive.
     pub fn is_closed(&self) -> bool {
         self.hub.receiver_gone.load(Ordering::SeqCst)
     }
@@ -428,6 +475,9 @@ impl<T> Clone for SharedMpscSender<T> {
 }
 
 impl<T> Drop for SharedMpscSender<T> {
+    /// Marks this sender gone, takes it off the count of senders and wakes the
+    /// receiver, which ends its stream when the count reaches zero and the queues
+    /// are empty.
     fn drop(&mut self) {
         self.lane.sender_gone.store(true, Ordering::SeqCst);
         self.hub.senders.fetch_sub(1, Ordering::SeqCst);
@@ -435,7 +485,11 @@ impl<T> Drop for SharedMpscSender<T> {
     }
 }
 
-/// The receiving end of a [`shared_mpsc`]. Dropping it makes sends fail.
+/// The receiving end of a [`shared_mpsc`].
+///
+/// It collects from every sender's queue in turn. It can be moved to another
+/// shard and is used by one task at a time. Dropping it makes every later
+/// send fail and wakes every sender that is waiting for room.
 pub struct SharedMpscReceiver<T> {
     hub: Arc<Hub<T>>,
     /// The queues of the senders known so far.
@@ -454,8 +508,12 @@ impl<T> SharedMpscReceiver<T> {
         poll_fn(|cx| self.poll_recv(cx)).await
     }
 
-    /// Takes the next value if one is queued. `None` only says that none
-    /// is queued right now.
+    /// Takes the next value if any sender has one queued. `None` only says
+    /// that none is queued right now.
+    ///
+    /// The queues are looked at in turn, starting after the one that was served
+    /// last, so that a busy sender cannot keep the others from being heard. A
+    /// queue whose sender is gone and which has been emptied is forgotten.
     pub fn try_recv(&mut self) -> Option<T> {
         self.collect_new_lanes();
         let count = self.lanes.len();
@@ -484,7 +542,8 @@ impl<T> SharedMpscReceiver<T> {
         None
     }
 
-    /// Takes over the queues of senders made since the last look.
+    /// Takes over the queues of senders made since the last look. Costs one
+    /// atomic read when there are none, which is nearly always.
     fn collect_new_lanes(&mut self) {
         if self.hub.has_new_lanes.swap(false, Ordering::SeqCst) {
             let mut new_lanes = self.hub.new_lanes.lock().unwrap_or_else(PoisonError::into_inner);
@@ -492,6 +551,12 @@ impl<T> SharedMpscReceiver<T> {
         }
     }
 
+    /// One attempt to receive, for [`recv`](Self::recv): looks at every queue,
+    /// and if all are empty, announces that it waits and looks once more.
+    ///
+    /// The number of senders is read between the announcement and the second
+    /// look. Once that number is zero no value can be queued and no sender can be
+    /// made, so finding nothing after reading zero means the stream has ended.
     fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
         if let Some(value) = self.try_recv() {
             return Poll::Ready(Some(value));
@@ -509,6 +574,9 @@ impl<T> SharedMpscReceiver<T> {
 }
 
 impl<T> Drop for SharedMpscReceiver<T> {
+    /// Marks the receiver gone and wakes every sender, including those whose
+    /// queues it had not yet taken over, so that none waits for room that will
+    /// never come.
     fn drop(&mut self) {
         self.hub.receiver_gone.store(true, Ordering::SeqCst);
         // Senders waiting for room have to learn that none will come.

@@ -15,7 +15,11 @@ use std::time::Duration;
 use crate::error::Result;
 use crate::runtime::current;
 
-/// Counters kept by one shard's event loop.
+/// One shard's running totals, from which [`ShardStats`] is made.
+///
+/// Plain cells: only the shard's own thread touches them, and they are
+/// updated from the event loop, where an atomic operation per update would
+/// cost something for nothing.
 #[derive(Default)]
 pub(crate) struct Counters {
     pub(crate) loops: Cell<u64>,
@@ -30,15 +34,31 @@ pub(crate) struct Counters {
     pub(crate) longest_stall_nanos: Cell<u64>,
 }
 
+/// Adds to a counter, stopping at the largest value instead of wrapping.
+/// A counter that has run for long enough to overflow should read as "very
+/// large", not as a small number again.
 pub(crate) fn add(counter: &Cell<u64>, amount: u64) {
     counter.set(counter.get().saturating_add(amount));
 }
 
+/// A duration as whole nanoseconds, or the largest `u64` if it is longer
+/// than that can hold (which takes more than five centuries).
 pub(crate) fn nanos(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
-/// The event loop of one shard.
+/// What one shard's event loop has done since the runtime started.
+///
+/// A snapshot, taken by [`shard`] on the shard it describes. The counters only
+/// ever grow, so two snapshots subtract to give what happened in between.
+///
+/// The three durations account for the shard's time: `busy` running tasks,
+/// `idle` asleep in the kernel, and `spinning` looking for work without
+/// sleeping. What is left of the wall clock is the event loop's own work,
+/// which is small on a healthy shard.
+///
+/// The structure may gain fields in later versions; read its fields, but do
+/// not construct it or match on all of them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ShardStats {
@@ -71,7 +91,14 @@ pub struct ShardStats {
     pub longest_stall: Duration,
 }
 
-/// One scheduling group on one shard.
+/// How one scheduling group has fared on one shard.
+///
+/// One of these per group that has had a task run on the shard, from
+/// [`groups`]. Comparing `cpu_time` between groups shows whether the CPU is
+/// being divided as their shares say; `runnable` shows whether a group has a
+/// backlog.
+///
+/// The structure may gain fields in later versions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct GroupStats {
@@ -89,7 +116,16 @@ pub struct GroupStats {
     pub runnable: usize,
 }
 
-/// One device's queue on one shard.
+/// The state of one storage device's request queue on one shard.
+///
+/// One of these per device the shard has read or written, from [`devices`]. A
+/// device is identified by the number of the filesystem it holds. `queued`
+/// counts requests held back by the shard's I/O scheduler, where scheduling
+/// groups' I/O shares apply; `in_flight` counts those handed to the kernel. A
+/// `total_queue_time` that grows quickly means the device is being asked for
+/// more than it, or its configured capacity, allows.
+///
+/// The structure may gain fields in later versions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DeviceStats {
@@ -111,6 +147,13 @@ pub struct DeviceStats {
 }
 
 /// The current shard's event loop counters.
+///
+/// Reads the shard's own counters, with no message to anyone, so it is cheap
+/// enough to call often. For every shard at once, see [`all_shards`].
+///
+/// # Errors
+///
+/// [`Error::NoRuntime`](crate::Error::NoRuntime) outside a runtime.
 pub fn shard() -> Result<ShardStats> {
     let shard = current()?;
     let counters = &shard.stats;
@@ -131,12 +174,25 @@ pub fn shard() -> Result<ShardStats> {
 }
 
 /// The event loop counters of every shard, in shard order.
+///
+/// Each shard reads its own counters when asked, so the snapshots are taken
+/// at slightly different moments, a call between shards apart.
+///
+/// # Errors
+///
+/// Those of [`submit_to_all`](crate::submit_to_all).
 pub async fn all_shards() -> Result<Vec<ShardStats>> {
     crate::submit_to_all(|| async { shard() }).await?.into_iter().collect()
 }
 
-/// Every scheduling group that has run on the current shard, in creation
-/// order.
+/// Every scheduling group that has run on the current shard, in the order
+/// the groups were created.
+///
+/// A group that exists but has never had a task on this shard is left out.
+///
+/// # Errors
+///
+/// [`Error::NoRuntime`](crate::Error::NoRuntime) outside a runtime.
 pub fn groups() -> Result<Vec<GroupStats>> {
     let shard = current()?;
     Ok(shard
@@ -145,7 +201,15 @@ pub fn groups() -> Result<Vec<GroupStats>> {
         .unwrap_or_default())
 }
 
-/// Every device the current shard has done file I/O on.
+/// Every storage device the current shard has done file I/O on.
+///
+/// A device appears once a `File` or `DmaFile` on it has been read, written or
+/// synced from this shard. Other shards keep their own queues for the same
+/// device and report them separately.
+///
+/// # Errors
+///
+/// [`Error::NoRuntime`](crate::Error::NoRuntime) outside a runtime.
 pub fn devices() -> Result<Vec<DeviceStats>> {
     let shard = current()?;
     Ok(shard
@@ -156,6 +220,15 @@ pub fn devices() -> Result<Vec<DeviceStats>> {
 
 /// What the runtime tells [`Runtime::on_stall`](crate::Runtime::on_stall)
 /// about a task that did not yield.
+///
+/// A stall is one time slice that lasted longer than
+/// [`Runtime::stall_threshold`](crate::Runtime::stall_threshold): for that
+/// long, one task kept the shard and every other task, timer and I/O
+/// completion on it waited. The report says where and for how long, and, if
+/// backtraces are switched on and the stall was caught in the act, what the
+/// shard was executing.
+///
+/// The structure may gain fields in later versions.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct StallReport {

@@ -18,13 +18,24 @@ use std::time::Duration;
 use crate::error::{Error, Result};
 use crate::runtime::{discard_panic, panic_message, wake_quietly};
 
-/// Most threads the pool runs at once; further jobs wait for one.
+/// Most threads the pool runs at once; further jobs wait for one to be
+/// free. A bound, so that a burst of blocking work cannot start threads
+/// without limit.
 const MAX_THREADS: usize = 256;
-/// How long a thread waits for another job before it exits.
+/// How long a thread waits for another job before it exits. Long enough
+/// that steady blocking work reuses its threads, short enough that a burst
+/// does not leave idle threads behind for good.
 const IDLE: Duration = Duration::from_secs(10);
 
+/// A piece of blocking work, with everything it needs to deliver its own
+/// result. The pool knows nothing about what a job returns.
 type Job = Box<dyn FnOnce() + Send>;
 
+/// The state of the pool: the jobs waiting for a thread, and how many
+/// threads there are.
+///
+/// It is shared by the whole process, behind a mutex that is held only to
+/// push or pop a job and adjust the counts, never while a job runs.
 struct Pool {
     jobs: VecDeque<Job>,
     /// Threads that exist.
@@ -33,18 +44,29 @@ struct Pool {
     idle: usize,
 }
 
+/// The one pool of the process. It starts empty and threadless; threads
+/// are started when work arrives.
 static POOL: Mutex<Pool> = Mutex::new(Pool {
     jobs: VecDeque::new(),
     threads: 0,
     idle: 0,
 });
+/// Signalled when a job is queued, to wake one waiting thread.
 static JOB_READY: Condvar = Condvar::new();
 
+/// Locks the pool, recovering it if a thread panicked while holding the
+/// lock. Jobs run outside the lock, so that cannot leave it inconsistent.
 fn pool() -> MutexGuard<'static, Pool> {
     // Jobs run outside the lock, so nothing panics while holding it.
     POOL.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// What a pool thread does: take jobs and run them, one after another,
+/// until none has come for [`IDLE`], then exit.
+///
+/// The lock is released while a job runs. A thread that times out checks the
+/// queue once more under the lock before it leaves, so a job queued at that
+/// moment is not left without a thread.
 fn worker() {
     let mut pool = pool();
     loop {
@@ -67,7 +89,18 @@ fn worker() {
     }
 }
 
-/// Queues a job, starting a thread for it if none is free.
+/// Queues a job, and starts a thread for it if no idle thread is free to
+/// take it and the pool is not at its limit.
+///
+/// Jobs already queued have first claim on the idle threads, which is why a
+/// new thread is started whenever there are not more idle threads than
+/// waiting jobs.
+///
+/// # Errors
+///
+/// [`Error::Io`] if a thread was needed and could not be started while the
+/// pool had none at all, since the job would then never run. If other threads
+/// exist, the job stays queued for one of them.
 fn submit(job: Job) -> Result<()> {
     let mut pool = pool();
     // Jobs already queued have a claim on the idle threads.
@@ -95,12 +128,18 @@ fn submit(job: Job) -> Result<()> {
     Ok(())
 }
 
+/// Where a blocking job leaves its result for the task that asked for it.
+///
+/// Shared between the pool thread and the task's shard, behind a mutex held
+/// only to store or take the result and the waker.
 struct Slot<T> {
     /// `Some(Err(message))` if the work panicked.
     outcome: Option<std::result::Result<T, Option<String>>>,
     waker: Option<Waker>,
 }
 
+/// Locks a result slot, recovering it if poisoned. Nothing panics while
+/// holding the lock.
 fn lock<T>(slot: &Mutex<Slot<T>>) -> MutexGuard<'_, Slot<T>> {
     // Nothing panics while holding this lock.
     slot.lock().unwrap_or_else(PoisonError::into_inner)
