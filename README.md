@@ -37,12 +37,13 @@ fn main() -> starfish::Result<()> {
 }
 ```
 
-[docs/guide.md](docs/guide.md) is a tour of the whole library with
-examples; `cargo doc --open` shows it together with the API reference.
+[docs/guide.md](docs/guide.md) covers every feature: what it is for, how
+to use it, and its caveats (limits, surprises, and what is easy to get
+wrong). `cargo doc --open` shows it together with the API reference.
 
 ## Examples
 
-There are 41 programs in `examples/`. Run one with
+There are 42 programs in `examples/`. Run one with
 `cargo run --release --example <name>`. Those marked *server* run until
 Ctrl-C; the others do their work and exit.
 
@@ -81,6 +82,7 @@ Ctrl-C; the others do their work and exit.
 | | `line_count` | Reading a file from start to end |
 | | `direct_io` | Aligned block I/O with `DmaFile` |
 | | `log_writer` | Many tasks appending to one file through a channel |
+| | `atomic_update` | Replacing a file safely: write, sync, rename |
 | | `iotune` | Measuring a device for `Runtime::io_properties` |
 | Scheduling | `scheduling_groups` | Dividing a shard's CPU four to one |
 | Diagnostics | `shard_stats` | Event-loop counters of every shard |
@@ -108,7 +110,9 @@ The servers listen on 127.0.0.1, ports 7000 to 7005.
 - **Scheduling groups:** classes of work with separate CPU and I/O shares.
   Preemption is cooperative (`maybe_yield`), and the check is two memory
   reads.
-- **Disk:** `fs::File` (page cache) and `fs::DmaFile` (direct I/O). Every
+- **Disk:** `fs::File` (page cache) and `fs::DmaFile` (direct I/O), with
+  sizes, truncation, preallocation and syncing, plus directories, renaming
+  and listing. Dropping a file closes it without blocking the shard. Every
   device has an I/O queue per shard that orders waiting requests by group
   shares. Declare a device's capacity (`Runtime::io_properties`, measured
   with `iotune::measure`) and all shards together stay within it.

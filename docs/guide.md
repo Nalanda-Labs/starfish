@@ -1,24 +1,41 @@
-A tour of the library, with examples.
+A tour of the library: every feature, how to use it, and its caveats.
 
 This guide goes through everything starfish offers, in the order a server
-usually needs it. The API reference has the details of each item; the
-examples here are compiled with the documentation, so they match the code.
+usually needs it. Each section says what the feature is for, shows it in
+use, and ends with its caveats: the limits, the surprises and the things
+that are easy to get wrong. The API reference has the details of each
+item; the examples here are compiled with the documentation, so they match
+the code.
 
 - [The model](#the-model)
 - [Starting a runtime](#starting-a-runtime)
 - [Tasks](#tasks)
+- [Time](#time)
+- [Yielding](#yielding)
 - [Working across shards](#working-across-shards)
-- [Coordinating tasks on a shard](#coordinating-tasks-on-a-shard)
+- [Services with an instance per shard](#services-with-an-instance-per-shard)
+- [Backpressure between shards](#backpressure-between-shards)
+- [Streaming between shards](#streaming-between-shards)
+- [Semaphores](#semaphores)
+- [Channels on a shard](#channels-on-a-shard)
+- [Gates](#gates)
 - [Buffers](#buffers)
-- [Network](#network)
+- [TCP](#tcp)
+- [Buffered reading and writing](#buffered-reading-and-writing)
+- [UDP](#udp)
 - [Files](#files)
+- [Direct I/O](#direct-io)
+- [Directories and file management](#directories-and-file-management)
 - [Registered buffers and zero-copy sends](#registered-buffers-and-zero-copy-sends)
 - [Scheduling groups](#scheduling-groups)
-- [Device capacity](#device-capacity)
+- [The disk I/O scheduler and device capacity](#the-disk-io-scheduler-and-device-capacity)
 - [Memory](#memory)
+- [Signals](#signals)
 - [Shutting down](#shutting-down)
-- [Diagnostics](#diagnostics)
-- [Errors, panics and cancellation](#errors-panics-and-cancellation)
+- [Statistics](#statistics)
+- [Stall detection](#stall-detection)
+- [Errors and panics](#errors-and-panics)
+- [Cancellation](#cancellation)
 - [What is not there](#what-is-not-there)
 
 # The model
@@ -39,16 +56,25 @@ The usual design is therefore to split the data by shard, for example by
 hashing a key, and to give every shard a full copy of the service that
 works on its part ([`Sharded`](crate::Sharded)).
 
-Tasks are never interrupted. A task runs until it awaits something that is
-not ready, so one that computes for a long time holds up everything else on
-its shard. See [`maybe_yield`](crate::maybe_yield) below.
+**Caveats**
+
+- Tasks are never interrupted. One that computes for long without awaiting
+  holds up every other task, every timer and all I/O on its shard. See
+  [Yielding](#yielding).
+- Nothing on a shard may block: no `std::thread::sleep`, no blocking file
+  or socket calls, no waiting on a `std::sync::Mutex` that another thread
+  holds for long. Blocking work belongs on a thread of its own; the
+  `blocking` example shows how.
+- Work does not move between shards. If one shard has more to do than the
+  others, they do not help; spreading the load evenly is the
+  application's job.
+- Holding a `RefCell` borrow across an `.await` lets another task on the
+  shard find it borrowed and panic. Borrow, use, release, then await.
 
 # Starting a runtime
 
 [`Runtime::run`](crate::Runtime::run) turns the calling thread into shard
 0, starts the others, runs one future on shard 0 and returns its output.
-When that future completes, every task still running on any shard is
-dropped and the threads are joined.
 
 ```rust,no_run
 use starfish::Runtime;
@@ -68,17 +94,42 @@ fn main() -> starfish::Result<()> {
 | `pin_threads` | on | Pin each shard to its own CPU |
 | `ring_entries` | 1024 | Submission queue size of each shard's io_uring |
 | `task_quota` | 500 µs | Length of a time slice |
+| `submit_limit` | 1024 | Calls one shard may have in progress on another |
 | `io_depth` | 64 | Requests per device a shard keeps in the kernel |
 | `io_properties` | none | Measured capacity of a storage device |
 | `io_latency_goal` | 1.5 × `task_quota` | Work queued inside such a device |
-| `submit_limit` | 1024 | Calls one shard may have in progress on another |
 | `fixed_buffers` | none | Per-shard pool of registered buffers |
 | `memory_limit` | none | Heap size at which a shard asks for memory back |
 | `stall_threshold` | 25 ms | Slice length that counts as a stall |
 | `stall_backtraces` | off | Record the stack of a stalled shard |
 | `on_stall` | none | Function called after every stall |
 
-Linux 6.0 or later on x86-64 is required.
+**Caveats**
+
+- Linux 6.0 or later on x86-64 only.
+- io_uring must be available to the process. Some container runtimes block
+  it with their default seccomp profile, and it can be switched off
+  system-wide (`kernel.io_uring_disabled`). `run` then fails with
+  [`Error::Io`](crate::Error::Io) before anything starts.
+- When the future given to `run` completes, every task still running on
+  any shard is dropped where it stands, without a chance to finish. An
+  orderly stop has to be arranged; see [Shutting down](#shutting-down).
+- `run` cannot be called from inside a runtime
+  ([`Error::AlreadyRunning`](crate::Error::AlreadyRunning)). Several
+  runtimes can run one after another, or on different threads.
+- The calling thread is pinned for the duration of `run` and gets its
+  original CPU affinity back afterwards.
+- Shards are pinned to the CPUs the process is allowed to use, in order.
+  Asking for more shards than there are CPUs puts several shards on one
+  CPU, which defeats the design.
+- If a shard's io_uring fails while running, the whole runtime stops and
+  `run` returns the error.
+- Outside a runtime, functions that need one return
+  [`Error::NoRuntime`](crate::Error::NoRuntime), and I/O futures resolve
+  to an error instead of doing anything.
+- More operations in flight on a shard than `ring_entries` is normal; the
+  queue is flushed to the kernel as it fills. Only if the kernel refuses
+  for long does an operation fail, with `WouldBlock`.
 
 # Tasks
 
@@ -90,7 +141,7 @@ the call returns, which cancels its I/O and releases what it holds.
 
 ```rust,no_run
 use std::time::Duration;
-use starfish::{sleep, spawn, timeout, Error};
+use starfish::{sleep, spawn, Error};
 
 async fn tasks() -> starfish::Result<()> {
     let sum = spawn(async { 1 + 1 });
@@ -98,19 +149,81 @@ async fn tasks() -> starfish::Result<()> {
 
     let sleeper = spawn(sleep(Duration::from_secs(60)));
     sleeper.abort();
+    assert!(sleeper.is_finished());
     assert!(matches!(sleeper.await, Err(Error::Canceled)));
-
-    // `timeout` drops the future it was given when the time runs out.
-    let late = timeout(Duration::from_millis(10), sleep(Duration::from_secs(1))).await;
-    assert!(late.is_err());
     Ok(())
 }
 ```
 
+**Caveats**
+
+- A `JoinHandle` cannot leave its shard, and neither can a task. To get a
+  result to another shard, return it from a
+  [`submit_to`](crate::submit_to) closure.
+- `abort` runs the destructors of everything the task owned inside the
+  `abort` call, on the caller's time. Aborting a task that owns a great
+  deal is itself a long computation.
+- A task that aborts itself, through its own handle, keeps running until
+  it next yields, and is dropped then.
+- A task that has finished is not affected by `abort`; its output can
+  still be collected.
+- A task that awaits its own handle waits forever.
+- Detached tasks (handle dropped) that are still running when the runtime
+  stops are dropped without notice. Nobody is told whether they finished.
+- Outside a runtime, `spawn` drops the future and returns a handle that
+  resolves to [`Error::NoRuntime`](crate::Error::NoRuntime).
+- A task costs one allocation, which holds the future and later its
+  output; a large future makes a large task.
+
+# Time
+
+[`sleep`](crate::sleep) completes after a duration.
+[`timeout`](crate::timeout) gives a future a limited time and drops it
+when the time runs out.
+
+```rust,no_run
+use std::time::{Duration, Instant};
+use starfish::{sleep, timeout};
+
+async fn time() {
+    sleep(Duration::from_millis(10)).await;
+
+    let late = timeout(Duration::from_millis(10), sleep(Duration::from_secs(1))).await;
+    assert!(late.is_err());
+
+    // A periodic tick that does not drift: sleep until the next multiple
+    // of the period, not for a fixed time after the work.
+    let period = Duration::from_millis(100);
+    let start = Instant::now();
+    for tick in 1..=5u32 {
+        sleep((start + period * tick).saturating_duration_since(Instant::now())).await;
+        // ... periodic work ...
+    }
+}
+```
+
+**Caveats**
+
+- A timer fires when its shard next goes round its event loop after the
+  deadline, never before. While a task hogs the shard, timers are late by
+  as long as it does.
+- There is no interval type; the loop above is the way to tick.
+- `timeout` stops the wait by dropping the future. What that means for
+  the operation inside is described under [Cancellation](#cancellation):
+  in short, a timed-out read or write may still have happened.
+- A [`Sleep`](crate::Sleep) belongs to the shard that first polled it.
+- A duration too long to add to the current time sleeps forever.
+- Outside a runtime, `sleep` still ends on time, but by asking to be
+  polled again and again, which keeps a CPU busy.
+
+# Yielding
+
 A loop that may run for long should give way to other tasks.
-[`maybe_yield`](crate::maybe_yield) does so only when the time slice is
-used up, and checking costs two memory reads, so it can go inside the loop.
-[`yield_now`](crate::yield_now) yields unconditionally.
+[`maybe_yield`](crate::maybe_yield) does so only when the time slice
+([`task_quota`](crate::Runtime::task_quota)) is used up, and checking costs
+two memory reads, so it can go inside the loop.
+[`yield_now`](crate::yield_now) yields unconditionally, and
+[`need_preempt`](crate::need_preempt) is the bare check.
 
 ```rust,no_run
 async fn checksum(data: &[u8]) -> u64 {
@@ -123,13 +236,65 @@ async fn checksum(data: &[u8]) -> u64 {
 }
 ```
 
+In the `yielding` example, a task that wants to run every millisecond
+waits 200 ms next to a computation that never yields, and 2 ms next to one
+that calls `maybe_yield`.
+
+**Caveats**
+
+- The time slice is a target, not a guarantee. The runtime cannot take
+  the CPU away; it can only tell a task that asks.
+- `yield_now` in a tight loop wastes most of the time on going round the
+  event loop. Prefer `maybe_yield`.
+- A task that yields goes to the back of its scheduling group's queue.
+- Code that cannot await (a long sort, a compression call, a library that
+  takes its time) cannot yield either. Cut the work into pieces or move
+  it to a thread.
+
 # Working across shards
 
 [`submit_to`](crate::submit_to) runs a closure on another shard and returns
 its result. The closure and the result cross threads and must be `Send`.
 The future the closure creates stays on the target shard and may use that
 shard's `Rc`s and sockets. [`submit_to_all`](crate::submit_to_all) does the
-same on every shard at once.
+same on every shard at once and returns the results in shard order.
+
+```rust,no_run
+use starfish::{shard_count, shard_id, submit_to, submit_to_all};
+
+async fn shards() -> starfish::Result<()> {
+    let last = shard_count()? - 1;
+    let ran_on = submit_to(last, || async { shard_id() }).await??;
+    assert_eq!(ran_on, last);
+
+    let ids = submit_to_all(|| async { shard_id() }).await?;
+    assert_eq!(ids.len(), shard_count()?);
+    Ok(())
+}
+```
+
+**Caveats**
+
+- A call costs far more than a local function call: an allocation for the
+  closure, a task on the other shard, and a wake-up through the kernel
+  when that shard is asleep. Batch small pieces of work, or use a
+  [`shared_channel`](crate::sync::shared_channel) for a stream.
+- Dropping the returned future stops the wait, not the call. The closure
+  still runs to the end on the other shard; only its result is discarded.
+- A call to the shard it is made on runs in place, as an ordinary
+  function call. One consequence: if it panics, the panic is the calling
+  task's own, not an [`Error::Panicked`](crate::Error::Panicked) result.
+- Calls run as separate tasks on the other shard and may finish in any
+  order.
+- [`Error::Canceled`](crate::Error::Canceled) means the other shard shut
+  down before running or finishing the call.
+- `submit_to_all` returns the first error and discards the other results,
+  though the closure has run on the shards that succeeded.
+- The closure runs in the caller's scheduling group.
+- The number of calls in progress is limited; see
+  [Backpressure between shards](#backpressure-between-shards).
+
+# Services with an instance per shard
 
 [`Sharded`](crate::Sharded) keeps one instance of a service on every shard.
 The handle is a small `Copy` value that can be sent anywhere; the instances
@@ -137,13 +302,9 @@ never leave their shards.
 
 ```rust,no_run
 use std::cell::Cell;
-use starfish::{shard_count, shard_id, submit_to, Sharded};
+use starfish::{shard_count, Sharded};
 
-async fn shards() -> starfish::Result<()> {
-    let last = shard_count()? - 1;
-    let ran_on = submit_to(last, || async { shard_id() }).await??;
-    assert_eq!(ran_on, last);
-
+async fn counters() -> starfish::Result<()> {
     // One counter per shard. `Cell` is enough: nothing is shared.
     let hits = Sharded::start(|_shard| Cell::new(0u64)).await?;
     hits.local()?.set(5);
@@ -156,24 +317,49 @@ async fn shards() -> starfish::Result<()> {
 }
 ```
 
-Each pair of shards has its own lock-free queue. A call to another shard
-still costs far more than a local function call, and a wake-up through the
-kernel when that shard is asleep, so batch small pieces of work.
+**Caveats**
 
-## When a shard falls behind
+- The factory is an ordinary function, not a future: an instance cannot
+  await anything while it is being built. Build it empty, then set it up
+  with `invoke_on_all`.
+- The instance type needs no `Send`, but the factory and the closures
+  given to `invoke_on` do, since they travel to the other shards.
+- `stop` removes the instances; it does not call anything on them. An
+  instance that must finish work first needs a method for that, called
+  through `invoke_on_all` before `stop`.
+- An instance is dropped when the last `Rc` to it goes. A task that keeps
+  the `Rc` from [`local`](crate::Sharded::local) past `stop` keeps its
+  instance alive.
+- After `stop`, the handle's methods return
+  [`Error::ServiceStopped`](crate::Error::ServiceStopped).
+- If the factory panics on one shard, the service is removed from the
+  others and `start` returns [`Error::Panicked`](crate::Error::Panicked).
+- Services not stopped by the time the runtime ends are dropped with it.
+
+# Backpressure between shards
 
 A shard may have only so many calls in progress on one other shard:
 [`submit_limit`](crate::Runtime::submit_limit), 1024 by default. Past
 that, `submit_to` waits for an earlier call to finish before it sends. An
 overloaded shard therefore slows its callers down, instead of collecting
-an ever longer list of calls to run. A call keeps its place until the
-other shard has finished it, even if the caller gave up waiting.
+an ever longer list of calls to run.
 
-One consequence: calls that wait for further calls in the same direction
-can block each other when the limit is reached. Keep chains of calls from
-doubling back to where they came from.
+**Caveats**
 
-## A stream of values
+- A call keeps its place until the other shard has finished it, even if
+  the caller gave up waiting. Abandoning slow calls does not make room.
+- Calls that wait for further calls in the same direction can block each
+  other. If every place from shard A to shard B is taken by calls that
+  each wait for a nested call from A to B, none can proceed, and nothing
+  reports it. Keep chains of calls from doubling back, or raise the limit.
+- The limit is per ordered pair of shards. With many shards, one shard
+  can still receive that many calls from each of the others at once.
+- It covers everything built on `submit_to`: `submit_to_all` and the
+  calls of a `Sharded` service.
+- The limit counts calls, whatever they cost. A few very expensive calls
+  can overload a shard well below it.
+
+# Streaming between shards
 
 For many values going the same way, one `submit_to` each is wasteful.
 [`shared_channel`](crate::sync::shared_channel) is a bounded queue with
@@ -205,65 +391,142 @@ async fn stream() -> starfish::Result<u64> {
 }
 ```
 
-# Coordinating tasks on a shard
+**Caveats**
 
-The [`sync`](crate::sync) module has three tools. All are local to a shard
-and none takes a lock.
+- One sender and one receiver. Neither end can be cloned; for several
+  producers, give each its own channel.
+- The capacity is rounded up to a power of two, and is at least 2.
+- A value queued just as the receiver is dropped is dropped unseen, with
+  no error to the sender. A successful `send` means "queued", not
+  "received".
+- Values still queued when both ends are gone are dropped on whichever
+  thread lets go last, which is why they must be `Send`.
+- There is no way to close a channel except dropping an end.
 
-- [`Semaphore`](crate::sync::Semaphore) limits how much runs at once.
-  Permits are handed out strictly in the order they were asked for, so a
-  large request is never starved by small ones.
-- [`channel`](crate::sync::channel) is a bounded queue from many senders to
-  one receiver. A full queue makes senders wait, which slows producers to
-  the pace of the consumer.
-- [`Gate`](crate::sync::Gate) counts work in progress. Closing it turns new
-  work away and waits for the rest.
+# Semaphores
+
+A [`Semaphore`](crate::sync::Semaphore) limits how much runs at once on a
+shard. Permits can stand for anything countable: connections, requests,
+bytes of memory.
 
 ```rust,no_run
 use starfish::spawn;
-use starfish::sync::{channel, Gate, Semaphore};
+use starfish::sync::Semaphore;
 
-async fn coordination() -> starfish::Result<()> {
+async fn limited() -> starfish::Result<()> {
     // At most 100 jobs at a time.
     let limit = Semaphore::new(100);
-    let permit = limit.acquire(1).await?;
-    spawn(async move {
-        let _permit = permit;
-        // ... the job ...
-    });
-
-    let (sender, mut receiver) = channel(16);
-    spawn(async move {
-        for number in 0..100 {
-            if sender.send(number).await.is_err() {
-                break; // the receiver is gone
-            }
-        }
-    });
-    // Ends when every sender has been dropped.
-    while let Some(number) = receiver.recv().await {
-        println!("{number}");
+    loop {
+        let permit = limit.acquire(1).await?;
+        spawn(async move {
+            let _permit = permit; // given back when the job ends
+            // ... the job ...
+        });
     }
+}
+```
 
-    let gate = Gate::new();
-    let guard = gate.enter()?;
+**Caveats**
+
+- Permits are handed out strictly in the order they were asked for. A
+  large request at the head of the queue holds up smaller ones behind it
+  even when there are permits enough for them. That is the price of large
+  requests never being starved. If it hurts, use separate semaphores for
+  the two kinds of work.
+- [`try_acquire`](crate::sync::Semaphore::try_acquire) fails whenever
+  anyone is waiting, even if permits are free, for the same reason.
+- A request for more permits than the semaphore will ever hold waits
+  until the semaphore is closed. Nothing detects it.
+- A semaphore belongs to its shard and is not `Send`. It limits that
+  shard only: a limit of 100 on each of 8 shards allows 800 in all.
+- [`forget`](crate::sync::Permit::forget) removes permits for good;
+  [`add_permits`](crate::sync::Semaphore::add_permits) can add more than
+  the semaphore started with. The count is whatever these make it.
+- After [`close`](crate::sync::Semaphore::close), permits already handed
+  out stay valid and are returned harmlessly.
+
+# Channels on a shard
+
+[`channel`](crate::sync::channel) is a bounded queue from many senders to
+one receiver, all on one shard. A full queue makes senders wait, which
+slows producers to the pace of the consumer.
+
+```rust,no_run
+use starfish::spawn;
+use starfish::sync::channel;
+
+async fn pipeline() {
+    let (sender, mut receiver) = channel(16);
+    for worker in 0..4 {
+        let sender = sender.clone();
+        spawn(async move {
+            for step in 0..100 {
+                if sender.send((worker, step)).await.is_err() {
+                    break; // the receiver is gone
+                }
+            }
+        });
+    }
+    // The loop below ends when every sender has been dropped, so the
+    // original must go too.
+    drop(sender);
+    while let Some((worker, step)) = receiver.recv().await {
+        println!("worker {worker} reached step {step}");
+    }
+}
+```
+
+**Caveats**
+
+- The receiver's loop only ends when *every* sender is gone, including
+  the original one that the clones were made from. Forgetting to drop it
+  is the usual reason a consumer never finishes.
+- One receiver. For several consumers, hand work out to one channel each.
+- There is no unbounded channel, on purpose: a queue without a bound hides
+  overload until memory runs out. A capacity of 0 is treated as 1.
+- [`try_send`](crate::sync::Sender::try_send) reports the queue as full
+  while other senders are waiting, even at a moment when it has room, so
+  that it cannot jump the queue.
+- Dropping the receiver drops the values still queued, and every waiting
+  and later send fails, handing its value back.
+- Both ends belong to their shard. Between shards, use
+  [`shared_channel`](crate::sync::shared_channel).
+
+# Gates
+
+A [`Gate`](crate::sync::Gate) counts work in progress. Closing it turns new
+work away and waits for the rest. It is the tool for stopping cleanly.
+
+```rust,no_run
+use starfish::spawn;
+use starfish::sync::Gate;
+
+async fn serve(gate: Gate) -> starfish::Result<()> {
+    let guard = gate.enter()?; // fails once the gate is closed
     spawn(async move {
         let _guard = guard;
         // ... one request ...
     });
-    // No new requests from here on; wait for those in flight.
+
+    // On shutdown: no new requests, and wait for those in flight.
     gate.close().await;
     Ok(())
 }
 ```
 
-Waiting in any of them can be given up, by dropping the future, by
-[`timeout`](crate::timeout) or by aborting the task, without losing a
-permit, a value or a place for others.
+**Caveats**
 
-To coordinate across shards, keep one of these per shard in a
-[`Sharded`](crate::Sharded) service, or use a
-[`shared_channel`](crate::sync::shared_channel).
+- The gate is closed by the call to `close`, not by awaiting what it
+  returns. `gate.close();` alone closes the gate and waits for nothing;
+  the compiler warns about the unused future.
+- A task that awaits `close` while holding a guard of the same gate waits
+  for itself, forever. Nothing detects it.
+- `close` waits as long as the work takes. Put a
+  [`timeout`](crate::timeout) around it if a stuck request must not hold
+  up shutdown.
+- A closed gate stays closed. For a restart, make a new one.
+- Entering is the caller's job. Work that never entered is not waited for.
+- A gate belongs to its shard; a server needs one per shard.
 
 # Buffers
 
@@ -281,10 +544,28 @@ Anything that implements [`IoBuf`](crate::buf::IoBuf) can be written:
 `Vec<u8>`, `Box<[u8]>`, `String`, `&'static [u8]`, `&'static str`,
 [`AlignedBuf`](crate::fs::AlignedBuf) and [`FixedBuf`](crate::buf::FixedBuf).
 Reads need an [`IoBufMut`](crate::buf::IoBufMut): `Vec<u8>`, `AlignedBuf` or
-`FixedBuf`. A read fills the buffer from its start, up to its *capacity*,
-and sets its length to what was read.
+`FixedBuf`.
 
-# Network
+**Caveats**
+
+- A read fills the buffer from its start, up to its *capacity*, and sets
+  its length to what was read. Whatever the buffer held is replaced; a
+  read never appends.
+- A `Vec` with no capacity reads nothing, and the `Ok(0)` that results
+  looks exactly like the end of the stream. `Vec::new()` and a `Vec` left
+  behind by `std::mem::take` have no capacity. Use
+  `Vec::with_capacity(n)`.
+- A `Vec` may have more capacity than was asked for, and a read uses all
+  of it.
+- If the future of an I/O call is dropped, the buffer does not come back.
+  The runtime keeps it until the kernel is finished and then frees it.
+- One call transfers at most 4 GiB.
+- Writes take the buffer by value too, even though they only read it. To
+  send the same bytes many times, use a `&'static` slice or clone.
+- Implementing `IoBuf` for a type of your own is `unsafe`: the memory
+  must not move when the value is moved.
+
+# TCP
 
 [`TcpListener::bind`](crate::net::TcpListener::bind) sets `SO_REUSEPORT`,
 so every shard can bind its own listener to the same address and the kernel
@@ -318,10 +599,49 @@ async fn echo_server() -> std::io::Result<()> {
 }
 ```
 
+[`TcpStream`](crate::net::TcpStream) has `connect`, `read`, `write`,
+`write_all`, `shutdown`, `set_nodelay` and the two address getters. A
+socket is not tied to the shard that created it: each call goes to the
+io_uring of the shard it is made on, so a connection can be moved to
+another shard inside a [`submit_to`](crate::submit_to) closure.
+
+**Caveats**
+
+- `SO_REUSEPORT` is always set and cannot be turned off. Any process of
+  the same user can bind the same port and will receive a share of the
+  connections, and a second copy of a server starts without complaint.
+- The kernel assigns each connection to a listener by hashing its
+  addresses, once. A few busy, long-lived connections can load one shard
+  far more than the others, and nothing moves them.
+- With one listener per shard, a shard that stops accepting (a stall, a
+  full connection limit) leaves its share of new connections waiting in
+  its own queue; the other shards do not take them.
+- The accept queue is 1024 connections long, fixed.
+- `write` may send only part of the buffer. `write_all` sends everything,
+  in as many steps as it takes, so two tasks calling `write_all` on one
+  stream at the same time can interleave their data. Give each stream one
+  writer.
+- `read` returning `Ok(0)` means the peer closed its sending side, or the
+  buffer has no capacity (see [Buffers](#buffers)).
+- There is no built-in time limit on anything. A peer that goes silent
+  holds its task and its connection forever unless the read is wrapped in
+  [`timeout`](crate::timeout), and after a timeout the connection should
+  be closed (see [Cancellation](#cancellation)).
+- Dropping `accept` just as a connection arrives closes that connection.
+- Addresses are `SocketAddr`s. There is no name resolution.
+- Writing to a connection the peer has closed returns an error
+  (`EPIPE`); the process does not get `SIGPIPE`.
+- `shutdown` and dropping a socket are immediate system calls, not
+  awaited operations.
+- Networking uses the kernel's stack. There is no TLS.
+
+# Buffered reading and writing
+
 For protocols made of lines or of pieces of known length,
 [`BufReader`](crate::net::BufReader) and [`BufWriter`](crate::net::BufWriter)
-put a buffer in front of a stream. They borrow, own or share the stream,
-so one task can read while another writes.
+put a buffer in front of a stream. They borrow, own or share the stream
+(`&TcpStream`, `TcpStream`, `Rc<TcpStream>`), so one task can read while
+another writes.
 
 ```rust,no_run
 use starfish::net::{BufReader, BufWriter, TcpStream};
@@ -340,43 +660,153 @@ async fn shout_lines(stream: TcpStream) -> std::io::Result<()> {
 }
 ```
 
-[`TcpStream`](crate::net::TcpStream) also has `connect`, `write` (which may
-send only part of the buffer), `shutdown`, `set_nodelay` and the two
-address getters. [`UdpSocket`](crate::net::UdpSocket) has `send_to` and
-`recv_from`, and `send` and `recv` once it is connected to a peer.
+The reader has `next_line`, `read_line`, `read_until`, `read_exact`,
+`read`, and `fill_buf` with `consume` underneath.
 
-A socket is not tied to the shard that created it. Each call goes to the
-io_uring of the shard it is made on, so a connection can be moved to
-another shard inside a [`submit_to`](crate::submit_to) closure.
+**Caveats**
+
+- Without [`limit`](crate::net::BufReader::limit), a peer that never
+  sends a line ending makes the reader collect data until memory runs
+  out. Set a limit on anything that faces a network.
+- Dropping a `BufWriter` does **not** flush it. Whatever is still in the
+  buffer is lost, silently. Flush before the writer goes, and before
+  waiting for a reply.
+- A read that is dropped while it waits for the network may lose the
+  bytes that were arriving at that moment. After a `timeout` on a
+  buffered read the position in the stream is unknown: close the
+  connection.
+- If a write fails or is dropped part-way, some of the buffer may have
+  been sent and the rest is lost. The connection is of no further use.
+- `into_inner` discards what the reader has received but not handed out.
+  Read on through the same reader instead of switching back to the
+  stream.
+- A line that is not valid UTF-8 is an error from `read_line` and
+  `next_line`, and is consumed. Use `read_until` for bytes.
+- These work on TCP streams only, not on files.
+
+# UDP
+
+[`UdpSocket`](crate::net::UdpSocket) sends and receives datagrams:
+`send_to` and `recv_from` with addresses, or `send` and `recv` after
+`connect` has fixed the peer. Like the listener, it binds with
+`SO_REUSEPORT`, so every shard can have a socket on the same port.
+
+```rust,no_run
+use std::net::SocketAddr;
+use starfish::net::UdpSocket;
+
+async fn udp_echo() -> std::io::Result<()> {
+    let socket = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 7002)))?;
+    let mut buf = Vec::with_capacity(64 * 1024);
+    loop {
+        let (result, filled) = socket.recv_from(buf).await;
+        let (_, from) = result?;
+        let (result, sent) = socket.send_to(filled, from).await;
+        result?;
+        buf = sent;
+    }
+}
+```
+
+**Caveats**
+
+- A datagram longer than the buffer's capacity is cut to fit, and the
+  rest is discarded without any sign. Size the buffer for the largest
+  datagram the protocol allows.
+- Nothing tells a sender that nobody is listening. Guard every receive
+  that expects an answer with a [`timeout`](crate::timeout).
+- With a socket per shard, the kernel picks the socket by the sender's
+  address, so one peer's datagrams keep arriving on the same shard, and a
+  peer that sends a great deal loads one shard.
+- `connect` on a UDP socket only sets the peer; nothing is exchanged, and
+  datagrams from anyone else are discarded by the kernel from then on.
+- As with TCP, `SO_REUSEPORT` cannot be turned off.
 
 # Files
 
-Files have no cursor: every read and write names its offset.
-
-- [`File`](crate::fs::File) goes through the kernel's page cache.
-- [`DmaFile`](crate::fs::DmaFile) opens with `O_DIRECT` and bypasses it,
-  for programs that keep their own cache. Buffers, offsets and lengths
-  must be aligned as the device demands; the file reports the
-  requirements and [`alloc`](crate::fs::DmaFile::alloc) returns a buffer
-  that meets them.
+Files have no cursor: every read and write names its offset, so
+concurrent operations on one file do not disturb each other.
+[`File`](crate::fs::File) goes through the kernel's page cache.
 
 ```rust,no_run
-use starfish::fs::{DmaFile, File};
+use starfish::fs::File;
 
 async fn files() -> std::io::Result<()> {
     let file = File::create("/tmp/greeting").await?;
     let (result, _) = file.write_all_at("hello", 0).await;
     result?;
-    file.sync_all().await?;
+    file.sync_data().await?;
+    assert_eq!(file.size().await?, 5);
+
     let (result, buf) = file.read_at(Vec::with_capacity(64), 0).await;
     assert_eq!(result?, 5);
     assert_eq!(buf, b"hello");
 
+    file.set_len(2).await?; // now "he"
+    file.allocate(0, 1 << 20).await?; // reserve 1 MiB; the file grows
+    file.close().await
+}
+```
+
+| Call | Does |
+|---|---|
+| `open`, `create`, `open_with` | Open for reading; create or truncate; raw `open(2)` flags |
+| `read_at`, `write_at`, `write_all_at` | Transfer data at an offset |
+| `sync_all`, `sync_data` | Flush to the device, with or without all metadata |
+| `size`, `set_len`, `allocate` | Ask, set and reserve the length |
+| `close` | Close and report the outcome |
+
+**Caveats**
+
+- `File::open` opens for reading only, and `File::create` truncates an
+  existing file. For anything else (append, read-write without
+  truncating, exclusive creation) pass the flags to `open_with`.
+- Data is not safe until a sync returns. A successful write has only
+  reached the page cache.
+- `read_at` returning fewer bytes than the buffer holds means the end of
+  the file was reached; `Ok(0)` means the offset is at or past the end
+  (or the buffer has no capacity; see [Buffers](#buffers)).
+- `write_at` may write only part of the buffer; `write_all_at` writes all
+  of it. Writes past the end leave a gap that reads back as zeros.
+- Reads of data that is not in the page cache, and writes that have to
+  wait for the cache to flush, cannot be completed by the kernel without
+  blocking, and it hands them to worker threads of its own. Page-cache
+  I/O is therefore asynchronous for the shard but not especially cheap.
+  For predictable storage performance use [direct I/O](#direct-io).
+- `size` asks the kernel every time. It is not a field.
+- `set_len` uses an io_uring operation that kernels before 6.9 lack. On
+  those it falls back to the ordinary system call, which blocks the shard
+  for its (normally short) duration.
+- Dropping a file closes it through the shard's io_uring without waiting
+  and without reporting failure. Filesystems that only find out at close
+  that data could not be stored (network filesystems above all) can only
+  tell you through [`close`](crate::fs::File::close).
+- `allocate` fails on filesystems that cannot reserve space.
+
+# Direct I/O
+
+[`DmaFile`](crate::fs::DmaFile) opens with `O_DIRECT` and bypasses the page
+cache, for programs that keep their own cache. Reads and writes go
+straight to the device and never wait behind the kernel's caching.
+Buffers, offsets and lengths must be aligned as the device demands; the
+file reports the requirements and [`alloc`](crate::fs::DmaFile::alloc)
+returns a buffer that meets them.
+
+```rust,no_run
+use starfish::fs::DmaFile;
+
+async fn direct() -> std::io::Result<()> {
     let file = DmaFile::create("/var/data/segment").await?;
+    // Space reserved in advance keeps writes from waiting on the
+    // filesystem.
+    file.allocate(0, 64 << 20).await?;
+
     let mut block = file.alloc(4096)?;
     block.fill_padded(b"record"); // zero-padded to whole blocks
     let (result, block) = file.write_at(block, 0).await;
     result?;
+    file.sync_data().await?;
+
     let (result, block) = file.read_at(block, 0).await;
     result?;
     assert!(block.starts_with(b"record"));
@@ -384,12 +814,91 @@ async fn files() -> std::io::Result<()> {
 }
 ```
 
-`File::open_with` and `DmaFile::open_with` take raw `open(2)` flags.
-[`remove_file`](crate::fs::remove_file) deletes a file.
+`DmaFile` has the same management calls as `File`: `sync_all`,
+`sync_data`, `size`, `set_len`, `allocate` and `close`.
 
-Reads, writes and syncs on both types go through the shard's I/O
-scheduler, described under [Scheduling groups](#scheduling-groups) and
-[Device capacity](#device-capacity).
+**Caveats**
+
+- The filesystem must support `O_DIRECT`. Where it does not, opening
+  fails with `EINVAL`. `tmpfs` gained support only in recent kernels, so
+  `/tmp` is often the wrong place to try this.
+- Every write is a whole number of blocks, so a file written this way has
+  a length that is a multiple of the block size. To give it its true
+  length, write the last block padded and then call
+  [`set_len`](crate::fs::DmaFile::set_len).
+- A buffer whose memory, offset or length breaks the alignment rules is
+  refused with `InvalidInput` before the kernel sees it. An ordinary
+  `Vec<u8>` is almost never aligned; use `alloc`, an `AlignedBuf` or a
+  `FixedBuf`.
+- A read takes as many whole blocks as fit in the buffer's capacity; a
+  capacity below one block reads nothing.
+- Alignment is asked of the kernel when the file is opened, which needs
+  Linux 6.1. Before that, 4096 bytes is assumed for both memory and
+  offsets, which is right for most devices but not all.
+- Direct I/O skips the page cache, not the device's own write cache.
+  Data is safe only after `sync_data` or `sync_all`.
+- Writing to space that has not been allocated makes the filesystem
+  allocate on the spot, which can block inside the kernel. Preallocate
+  with `allocate`.
+- Nothing is cached for you. Reading the same block twice goes to the
+  device twice.
+- Mixing direct and page-cache access to the same file works but is slow
+  and easy to get wrong. Pick one per file.
+
+# Directories and file management
+
+Free functions in [`fs`](crate::fs) cover the rest:
+[`create_dir`](crate::fs::create_dir),
+[`create_dir_all`](crate::fs::create_dir_all),
+[`remove_dir`](crate::fs::remove_dir),
+[`remove_file`](crate::fs::remove_file), [`rename`](crate::fs::rename) and
+[`read_dir`](crate::fs::read_dir).
+
+```rust,no_run
+use starfish::fs::{create_dir_all, read_dir, rename, File};
+
+/// Replaces a file's contents so that a crash leaves either the old
+/// version or the new one, never a mixture.
+async fn replace(dir: &str, name: &str, contents: Vec<u8>) -> std::io::Result<()> {
+    create_dir_all(dir).await?;
+    let temporary = format!("{dir}/{name}.tmp");
+    let file = File::create(&temporary).await?;
+    let (result, _) = file.write_all_at(contents, 0).await;
+    result?;
+    file.sync_data().await?;
+    file.close().await?;
+    rename(&temporary, format!("{dir}/{name}")).await?;
+
+    for entry in read_dir(dir).await? {
+        println!("{}", entry.path().display());
+    }
+    Ok(())
+}
+```
+
+**Caveats**
+
+- `read_dir` is the one call that is not done through io_uring, because
+  the kernel offers no way. It starts a helper thread for each call and
+  returns the whole listing at once. That is fine for finding one's files
+  at start-up, and wrong for a hot path or for directories with millions
+  of entries.
+- The order of a listing is whatever the filesystem returns. Sort it if
+  the order matters.
+- `rename` replaces the target if it exists, and both names must be on
+  the same filesystem. It is atomic for readers, but it only survives a
+  crash once the directory itself has been synced; the `atomic_update`
+  example shows how.
+- `create_dir_all` and `read_dir` are sequences of steps, not atomic:
+  another process changing the same directories at the same time can
+  make them fail or return a listing that was never true at one instant.
+- `remove_dir` removes only an empty directory. There is no recursive
+  removal.
+- New directories get mode `0777` less the process's umask.
+- Relative paths are relative to the process's current directory, which
+  all shards share.
+- There is no call for a file's metadata by path, for links, or for
+  permissions.
 
 # Registered buffers and zero-copy sends
 
@@ -397,15 +906,10 @@ With [`Runtime::fixed_buffers`](crate::Runtime::fixed_buffers), every shard
 gets a pool of buffers that are registered with its io_uring. The kernel
 maps and pins them once instead of on every request. A
 [`FixedBuf`](crate::buf::FixedBuf) from the pool works with every read and
-write call.
+write call, on sockets and on files, including direct I/O.
 
 [`TcpStream::send_zc`](crate::net::TcpStream::send_zc) transmits from such
-a buffer without copying it. The call returns when the data is queued, but
-the buffer goes back to the pool only when the peer has acknowledged the
-data. A sender that outruns its peer runs out of buffers and waits in
-[`FixedBuf::acquire`](crate::buf::FixedBuf::acquire), which is the
-backpressure. Zero-copy pays off from roughly 10 KiB per send; below that,
-`write` is faster.
+a buffer without copying it.
 
 ```rust,no_run
 use starfish::buf::FixedBuf;
@@ -419,8 +923,31 @@ async fn send_block(stream: &TcpStream, block: &[u8]) -> starfish::Result<usize>
 }
 ```
 
-A `FixedBuf` cannot leave its shard. Registered memory is pinned and counts
-against the process's locked-memory limit where the kernel enforces one.
+**Caveats**
+
+- `send_zc` returns when the data is queued, but the buffer goes back to
+  the pool only when the peer has acknowledged the data. A peer that
+  reads slowly, or has silently gone away, holds buffers for as long as
+  TCP takes to notice. With a small pool, one bad connection can leave
+  every sender on the shard waiting in `acquire`. Size the pool for the
+  number of connections, and put a `timeout` on `acquire`.
+- `send_zc` may accept only part of the buffer. It returns how much, and
+  the buffer is gone either way: the rest has to be sent again from
+  another buffer.
+- Zero-copy pays off from roughly 10 KiB per send. For small messages the
+  bookkeeping costs more than the copy it saves; use `write`.
+- Registered memory is pinned and counts against the process's
+  locked-memory limit (`ulimit -l`) on kernels that enforce one. Too
+  large a pool makes `run` fail at start.
+- The pool is fixed when the runtime starts: at most 65,535 buffers per
+  shard, all of one size, rounded up to whole pages.
+- A `FixedBuf` cannot leave its shard.
+- A buffer taken from the pool holds whatever its last user left in it.
+  Set the length and fill it before sending; do not send bytes you did
+  not write.
+- [`acquire`](crate::buf::FixedBuf::acquire) fails with
+  [`Error::NoFixedBuffers`](crate::Error::NoFixedBuffers) if the runtime
+  was started without a pool.
 
 # Scheduling groups
 
@@ -451,16 +978,38 @@ async fn compact() -> starfish::Result<()> {
 }
 ```
 
-Shares only matter under contention: a group alone on a shard gets all of
-it. And CPU shares only work if tasks yield, since a task that never awaits
-keeps the CPU whatever its group.
+In the `scheduling_groups` example, groups with 800 and 200 shares that
+both want the whole CPU get 799 ms and 200 ms of a second.
 
-# Device capacity
+**Caveats**
 
-By default a shard limits each device only by
+- Groups cannot be deleted. Each one created stays for the life of the
+  runtime, so create a handful at start-up, never one per request or per
+  connection.
+- Shares only matter under contention. A group alone on a shard gets all
+  of it, whatever its shares.
+- CPU shares only work if tasks yield. A task that never awaits keeps the
+  CPU whatever its group, and its group is charged for it afterwards.
+- CPU time is divided per shard. A group busy on one shard and idle on
+  another is not compensated across them.
+- I/O shares apply to file reads, writes and syncs waiting for a device.
+  They have no effect on the network.
+- Shares are clamped to 1 to 10,000. There is no way to stop a group
+  altogether; one share is as low as it goes.
+- A group gives priority, not a limit. To cap what a class of work may
+  use when nothing else wants the capacity, use a
+  [`Semaphore`](crate::sync::Semaphore).
+- Two groups may have the same name; the name is only a label for
+  statistics.
+
+# The disk I/O scheduler and device capacity
+
+Reads, writes and syncs on [`File`](crate::fs::File) and
+[`DmaFile`](crate::fs::DmaFile) pass through a scheduler that each shard
+keeps per device. By default a shard limits each device only by
 [`io_depth`](crate::Runtime::io_depth), the number of its requests in the
-kernel. If more is sent than the device can do, the surplus queues up
-inside the kernel and the device, where group shares have no say.
+kernel at once. If more is sent than the device can do, the surplus queues
+up inside the kernel and the device, where group shares have no say.
 
 To avoid that, measure the device once with
 [`iotune::measure`](crate::iotune::measure) and pass the result to
@@ -486,15 +1035,42 @@ fn main() -> starfish::Result<()> {
 }
 ```
 
-`examples/iotune.rs` is the first half as a program. A device is identified
-by the filesystem the path is on.
+`examples/iotune.rs` is the first half as a program.
+
+**Caveats**
+
+- Without `io_properties`, the limit is `io_depth` *per shard*. With 24
+  shards and the default of 64, a device may be sent 1536 requests at
+  once, far more than most can serve promptly.
+- A device is identified by the filesystem a path is on. Two filesystems
+  on one physical disk are treated as two devices and each gets the full
+  capacity; a filesystem spanning several disks is treated as one.
+- The path given to `io_properties` must exist when the runtime starts,
+  or `run` fails. Files on other filesystems are not affected by it.
+- The figures describe the device as it was when measured: idle, at that
+  fill level, through that filesystem. A device that is nearly full, or
+  shared with other processes, sustains less, and the scheduler will
+  then send it too much.
+- `measure` needs a filesystem with `O_DIRECT`, a gigabyte of free space
+  by default, and an otherwise idle machine. It loads the device as hard
+  as it can; do not run it next to a live service.
+- Only data requests are scheduled. Opening, closing, renaming and
+  the other management calls go straight to the kernel.
+- A request that has been handed to the kernel can no longer be
+  overtaken. A higher-priority request waits behind what is already
+  inside the device, about as long as
+  [`io_latency_goal`](crate::Runtime::io_latency_goal) with configured
+  capacity, and as long as `io_depth` requests take without.
+- Dropping the future of a request that is still waiting in the scheduler
+  withdraws it cleanly. Once it is in the kernel, see
+  [Cancellation](#cancellation).
 
 # Memory
 
 [`ShardAlloc`](crate::alloc::ShardAlloc) is an optional global allocator
 that gives every shard its own heap, with no locks on the fast path. Memory
 freed on a different shard than it was allocated on finds its way back to
-its owner. Threads that are not shards use the system allocator.
+its owner.
 
 ```rust,no_run
 #[global_allocator]
@@ -504,8 +1080,7 @@ static GLOBAL: starfish::alloc::ShardAlloc = starfish::alloc::ShardAlloc;
 With it installed, [`Runtime::memory_limit`](crate::Runtime::memory_limit)
 sets a size per shard above which the runtime asks the application to give
 memory back, by calling the functions registered with
-[`alloc::on_pressure`](crate::alloc::on_pressure) on that shard. The limit
-is a request, not a cap: allocations beyond it still succeed.
+[`alloc::on_pressure`](crate::alloc::on_pressure) on that shard.
 
 ```rust,no_run
 use std::cell::RefCell;
@@ -517,6 +1092,77 @@ fn evict_under_pressure(cache: Rc<RefCell<HashMap<u64, Vec<u8>>>>) -> starfish::
 }
 ```
 
+**Caveats**
+
+- The limit is a request, not a cap. Allocations beyond it still succeed,
+  and a shard whose application frees nothing just stays over it.
+- The limit is looked at between tasks. A single task that allocates a
+  great deal without awaiting goes over it by all of that.
+- A pressure function runs on the shard, between tasks, and holds the
+  shard up while it runs. Keep it quick.
+- If a call leaves the heap over the limit, the next call comes only
+  after some turns of the event loop, so a function with nothing to give
+  is not called continuously.
+- Pressure functions cannot be removed, and belong to the shard they
+  were registered on.
+- The limit and [`alloc::stats`](crate::alloc::stats) do nothing unless
+  `ShardAlloc` is the program's global allocator.
+- Only shard threads use the per-shard heaps. Every other thread, and a
+  shard thread before and after `run`, uses the system allocator.
+- Memory freed on another shard is not reusable at once: it is handed
+  back when its owner next goes round its event loop.
+- Each heap has about 32 GiB of address space. Past that, a shard's
+  allocations fall back to the system allocator.
+- The allocator reserves a large range of address space (not memory) at
+  first use. Tools that limit address space (`ulimit -v`, some
+  sanitizers) make it settle for less, and with none available it uses
+  the system allocator throughout.
+- A heap is kept when its runtime stops and reused by a later runtime;
+  its memory is not all returned to the system in between.
+
+# Signals
+
+[`signal::termination`](crate::signal::termination) waits for the process
+to be asked to stop, by Ctrl-C (`SIGINT`) or `SIGTERM`.
+[`Signals`](crate::signal::Signals) listens for any set of signals and
+keeps reporting them.
+
+```rust,no_run
+use starfish::signal::Signals;
+
+async fn control() -> std::io::Result<()> {
+    let mut signals = Signals::new(&[libc::SIGHUP, libc::SIGTERM])?;
+    loop {
+        match signals.next().await {
+            libc::SIGHUP => println!("reloading configuration"),
+            _ => return Ok(()),
+        }
+    }
+}
+```
+
+**Caveats**
+
+- Listening for a signal replaces what the process would otherwise do on
+  receiving it, for the rest of the process's life. After anything has
+  listened for `SIGINT`, Ctrl-C no longer ends the program by itself, not
+  even once the listener is gone. A program that listens must act on what
+  it hears.
+- Signal handlers are process-wide. If another library installs its own
+  handler for the same signal, whichever was installed last wins and the
+  other stops hearing it.
+- Deliveries of one signal that arrive faster than they are collected are
+  merged into one, as the kernel itself does. Signals are not a counter.
+- A listener hears only signals that arrive after it was created.
+- The first listener starts one helper thread (`starfish-signals`) that
+  lives for the rest of the process.
+- Signals that report a fault in the program (`SIGSEGV`, `SIGBUS`,
+  `SIGFPE`, `SIGILL`) are refused, as are `SIGKILL` and `SIGSTOP`, which
+  no program can catch.
+- The stall detector's backtraces use the real-time signal
+  `SIGRTMIN + 5`; do not listen for that one.
+- Signal numbers come from the `libc` crate, as in the example.
+
 # Shutting down
 
 When the future given to `run` completes, all remaining tasks are dropped
@@ -524,9 +1170,10 @@ where they stand. For an orderly stop, three pieces work together:
 
 1. [`signal::termination`](crate::signal::termination) tells the main task
    that the process was asked to stop.
-2. [`JoinHandle::abort`](crate::JoinHandle::abort) stops the accept loops.
+2. [`JoinHandle::abort`](crate::JoinHandle::abort) stops the accept loops,
+   which closes the listeners.
 3. A [`Gate`](crate::sync::Gate) that every request entered waits for the
-   requests in flight, usually under a [`timeout`](crate::timeout).
+   requests in flight, under a [`timeout`](crate::timeout).
 
 ```rust,no_run
 use std::time::Duration;
@@ -547,18 +1194,32 @@ async fn serve_until_stopped(acceptor: JoinHandle<()>, serving: Gate) -> starfis
 
 `examples/echo.rs` does this on every shard through a `Sharded` service.
 
-Listening for a signal replaces what the process would do on receiving it,
-for good: after the first `termination` call, Ctrl-C no longer ends the
-program by itself. [`Signals`](crate::signal::Signals) listens for any set
-of signals and keeps reporting them, for instance to give up on a slow
-shutdown at the second Ctrl-C.
+**Caveats**
 
-# Diagnostics
+- None of this happens by itself. A program that simply returns from its
+  main future cuts every connection off in mid-request.
+- The steps have to run on every shard; each shard has its own listener,
+  its own gate and its own tasks.
+- A connection that is idle, waiting for a request that never comes,
+  keeps its guard and holds the gate open until the timeout. Either time
+  out idle reads, or abort the connection tasks on shutdown.
+- A second Ctrl-C does nothing unless the program listens for it. To let
+  an impatient operator force the exit, keep a
+  [`Signals`](crate::signal::Signals) and return at the second signal.
+- At the very end the runtime cancels every operation still in the
+  kernel and waits until the kernel has let go of all buffers, so that
+  none is freed while in use. That is normally immediate.
+- Data written to a socket just before returning may not have been sent
+  yet. Closing a connection properly means `shutdown` and reading until
+  the peer closes too.
 
-[`stats`](crate::stats) describes the current shard: its event loop, its
-scheduling groups and its device queues. [`alloc::stats`](crate::alloc::stats)
-describes its heap. To see all shards, collect them with
-[`submit_to_all`](crate::submit_to_all).
+# Statistics
+
+[`stats`](crate::stats) describes the current shard: its event loop
+([`shard`](crate::stats::shard)), its scheduling groups
+([`groups`](crate::stats::groups)) and its device queues
+([`devices`](crate::stats::devices)).
+[`alloc::stats`](crate::alloc::stats) describes its heap.
 
 ```rust,no_run
 fn report() -> starfish::Result<()> {
@@ -579,6 +1240,23 @@ fn report() -> starfish::Result<()> {
     Ok(())
 }
 ```
+
+**Caveats**
+
+- Every figure is for the shard the call is made on. To see the whole
+  runtime, collect them with [`submit_to_all`](crate::submit_to_all), as
+  the `shard_stats` example does.
+- Counters run from the start of the runtime and are never reset. For a
+  rate, take two readings and subtract.
+- `busy` is time spent running tasks and `idle` is time asleep. Time the
+  event loop spends on its own work is in neither, so the two do not add
+  up to the wall clock.
+- A group appears in `groups` only on shards where it has run, and a
+  device in `devices` only on shards that have used it.
+- There is no built-in exporter. Formatting and publishing the numbers
+  is the application's job.
+
+# Stall detection
 
 A *stall* is a time slice that ran past
 [`stall_threshold`](crate::Runtime::stall_threshold): some task did not
@@ -604,29 +1282,95 @@ fn main() -> starfish::Result<()> {
 }
 ```
 
-# Errors, panics and cancellation
+**Caveats**
+
+- A stall is noticed after it is over, from how long the slice took. A
+  shard that never comes back is never reported.
+- Backtraces are raw: one line per frame with the module, an offset and
+  an address, and a function name only where the dynamic symbol table
+  has one. For names, link with `-rdynamic` or translate the addresses
+  with `addr2line`.
+- With backtraces on, every shard thread is interrupted by a signal
+  (`SIGRTMIN + 5`) once per threshold, all the time. That is cheap but
+  not free, and it installs a process-wide handler.
+- A stall is caught in the act only once it has lasted between one and
+  two thresholds. Shorter stalls are counted but come without a stack.
+- The stack is of the moment the timer fired, somewhere inside the
+  stall. It shows what was running then, which is usually but not
+  always the whole story.
+- The handler given to `on_stall` is a plain function, so it cannot
+  capture anything. It runs on the shard's thread, between tasks: keep
+  it short, and do not block in it.
+- Time the thread spent descheduled by the operating system counts too.
+  On an overcommitted machine, stalls are reported that no task caused.
+
+# Errors and panics
 
 Runtime calls return [`Error`](crate::Error); I/O calls return
 `std::io::Error`. Each converts into the other, so `?` works both ways.
 
 The library itself does not panic. A panic in a task is caught: the task
-ends, whoever awaits its handle gets [`Error::Panicked`](crate::Error::Panicked),
-and the shard carries on. The same holds for a closure sent to another
-shard. This relies on unwinding and does not apply under `panic = "abort"`.
+ends, whoever awaits its handle gets
+[`Error::Panicked`](crate::Error::Panicked), and the shard carries on. The
+same holds for a closure sent to another shard.
 
-Dropping a future cancels what it was waiting for. For I/O, the runtime
-asks the kernel to cancel the operation and keeps the buffer until the
-kernel has let go of it. Cancellation is not instant in the kernel: a write
-that was dropped may still have happened, in part or in full.
+**Caveats**
+
+- This relies on unwinding. Under `panic = "abort"` a panic anywhere ends
+  the process.
+- The panic's message is not kept. It goes to the panic hook (by default,
+  standard error) and the awaiting task only learns that there was a
+  panic.
+- A panic leaves the task's shared state as it was at that instant. Data
+  in an `Rc<RefCell<..>>` that the task was half-way through changing
+  stays half changed, for the other tasks to find.
+- A panic in the future given to `run` ends the runtime, and `run`
+  returns `Error::Panicked`.
+- A panic in a `Drop` during another panic's unwinding aborts the
+  process, as everywhere in Rust.
+- `Error` is `#[non_exhaustive]`: a `match` on it needs a wildcard arm.
+
+# Cancellation
+
+Dropping a future cancels what it was waiting for. That is how
+[`timeout`](crate::timeout) and [`abort`](crate::JoinHandle::abort) work,
+and it applies to everything in the library.
+
+For waiting on the library's own things (a permit, a channel, a gate, a
+timer, a place among cross-shard calls), cancelling is exact: nothing is
+lost and nobody else is disturbed.
+
+For I/O it is not exact, because the kernel is involved. The runtime asks
+the kernel to cancel the operation and keeps the buffer until the kernel
+has let go of it.
+
+**Caveats**
+
+- A cancelled operation may have happened anyway. The kernel may have
+  completed a write, or part of it, before the cancellation arrived. A
+  cancelled read may have taken bytes out of the socket that are now
+  lost with the buffer.
+- So after a timeout on a socket read or write, the state of the stream
+  is unknown and the connection should be closed. After a timeout on a
+  file write, the range may hold the old data, the new data or a
+  mixture.
+- The buffer of a cancelled operation does not come back.
+- Cancelling a cross-shard call stops the wait, not the call.
+- Operations that create a file descriptor (`accept`, opening a file)
+  are safe to cancel: a descriptor that arrives after the cancellation
+  is closed.
 
 # What is not there
 
 - Networking uses the kernel's stack. There is no userspace TCP.
 - No TLS, no HTTP, no DNS resolution: addresses are `SocketAddr`s.
 - No Unix-domain sockets.
-- File support covers data: open, read, write, sync, remove. There are no
-  calls for directories, renaming, truncating, preallocating or file
-  metadata.
+- No buffered or streaming interface for files, and no metadata, links
+  or permissions calls.
 - A [`shared_channel`](crate::sync::shared_channel) has one sender and one
   receiver. There is no cross-shard channel with several senders.
+- No general way to run blocking code; the `blocking` example shows how
+  to do it with a thread.
+- No work stealing or load balancing between shards.
+- No interval timer and no `select` over several futures.
 - Only Linux on x86-64.
