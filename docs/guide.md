@@ -1614,8 +1614,13 @@ async fn control() -> std::io::Result<()> {
   that listens must act on what it hears. When the last listener for a
   signal is dropped, the signal goes back to what it did before.
 - [`termination`](crate::signal::termination) stops listening when it
-  returns. So during the shutdown that follows, a second Ctrl-C ends the
-  program at once, without any code for it.
+  returns. So during the shutdown that follows, a second Ctrl-C or
+  `SIGTERM` does what it would have done had the program never listened,
+  which normally is to end it at once, without any code for it.
+- "What it did before" is not always "end the program". A shell that
+  starts a program in the background, or `nohup`, starts it with some
+  signals ignored, `SIGINT` among them. While the program listens it
+  receives them all the same; once it stops, they are ignored again.
 - Signal handlers are process-wide. If another library installs its own
   handler for the same signal, whichever was installed last wins and the
   other stops hearing it.
@@ -1672,8 +1677,9 @@ async fn serve_until_stopped(acceptor: JoinHandle<()>, serving: Gate) -> starfis
   keeps its guard and holds the gate open until the timeout. Either time
   out idle reads, or abort the connection tasks on shutdown.
 - After [`termination`](crate::signal::termination) has returned, a
-  second Ctrl-C ends the program at once, as for any program: nothing
-  listens any more. To decide yourself what a second signal does, keep a
+  second Ctrl-C normally ends the program at once, as for any program:
+  nothing listens any more. (Not if the program was started with the
+  signal ignored; see [Signals](#signals).) To decide yourself what a second signal does, keep a
   [`Signals`](crate::signal::Signals) and [`select`](crate::select)
   between the shutdown and the next signal, as the `kvdb` example does.
 - At the very end the runtime cancels every operation still in the
