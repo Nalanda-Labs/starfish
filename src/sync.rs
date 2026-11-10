@@ -32,13 +32,23 @@ pub use crate::shared_channel::{
     shared_channel, shared_mpsc, SharedMpscReceiver, SharedMpscSender, SharedReceiver, SharedSender,
 };
 
-/// A task waiting for permits.
+/// A task waiting for permits: how many it asked for, and how to wake it.
+///
+/// The waker is taken out when the task is woken, so that it is woken once.
+/// If the task then finds it still cannot have its permits, it puts a waker
+/// back.
 struct Waiter {
     need: usize,
     /// Taken when the task is woken, put back if it has to wait again.
     waker: Option<Waker>,
 }
 
+/// The inside of a [`Semaphore`]: the permits not handed out, whether it is
+/// closed, and the tasks waiting, in the order they started waiting.
+///
+/// Waiters are numbered as they arrive and kept in a map ordered by that
+/// number, so the oldest is always the first entry, and any one of them can
+/// be found and removed when its task gives up.
 struct SemaphoreState {
     available: usize,
     closed: bool,
@@ -48,8 +58,12 @@ struct SemaphoreState {
 }
 
 impl SemaphoreState {
-    /// The waker of the task that has waited longest, if what is available
-    /// now covers its request and it has not been woken already.
+    /// The waker of the task that has waited longest, if what is available now
+    /// covers its request and it has not been woken already.
+    ///
+    /// Only the head of the queue is ever considered. That is what makes the
+    /// semaphore fair: a later request is not served while an earlier one waits,
+    /// even if there are permits enough for the later one.
     fn next_ready(&mut self) -> Option<Waker> {
         let mut first = self.waiters.first_entry()?;
         let waiter = first.get_mut();
@@ -60,13 +74,20 @@ impl SemaphoreState {
         }
     }
 
-    /// Takes a waiter out of the queue, returning its waker to be dropped.
+    /// Takes a waiter out of the queue and returns its waker, for the caller
+    /// to drop once the semaphore is no longer borrowed. Does nothing for a task
+    /// that never had to wait.
     fn withdraw(&mut self, waiter: Option<u64>) -> Option<Waker> {
         self.waiters.remove(&waiter?)?.waker
     }
 }
 
 /// Returns permits and wakes the next task they are enough for.
+///
+/// Used when a [`Permit`] is dropped and by
+/// [`Semaphore::add_permits`]. The waker is called after the semaphore's
+/// state has been released, because waking runs code that may come straight
+/// back to this semaphore.
 fn release(state: &Local<SemaphoreState>, permits: usize) {
     let waker = state
         .with(|state| {
@@ -110,6 +131,11 @@ pub struct Semaphore {
 
 impl Semaphore {
     /// A semaphore holding `permits` permits.
+    ///
+    /// That number is how much may be in use at once, in whatever unit the
+    /// caller chooses: tasks, connections, bytes. It is not fixed for good:
+    /// [`add_permits`](Self::add_permits) raises it and
+    /// [`Permit::forget`] lowers it.
     pub fn new(permits: usize) -> Semaphore {
         Semaphore {
             state: Rc::new(Local::new(SemaphoreState {
@@ -122,11 +148,17 @@ impl Semaphore {
     }
 
     /// How many permits are free right now.
+    ///
+    /// A snapshot, for reporting and for tests. Do not check this and then
+    /// acquire: another task may take the permits in between, and with tasks
+    /// waiting, free permits are already spoken for. Use
+    /// [`try_acquire`](Self::try_acquire) for "take them if they are there".
     pub fn available(&self) -> usize {
         self.state.with(|state| state.available).unwrap_or(0)
     }
 
-    /// Whether [`close`](Self::close) has been called.
+    /// Whether [`close`](Self::close) has been called. A closed semaphore
+    /// hands out no more permits.
     pub fn is_closed(&self) -> bool {
         self.state.with(|state| state.closed).unwrap_or(true)
     }
@@ -171,7 +203,11 @@ impl Semaphore {
         }
     }
 
-    /// Adds permits to the semaphore, beyond those it was created with.
+    /// Adds permits to the semaphore, beyond those it was created with, and
+    /// wakes the longest-waiting task if they are enough for it.
+    ///
+    /// With [`Permit::forget`] this makes the semaphore a counter that one part
+    /// of a program fills and another drains, as a rate limiter does.
     pub fn add_permits(&self, permits: usize) {
         release(&self.state, permits);
     }
@@ -192,7 +228,12 @@ impl Semaphore {
     }
 }
 
-/// Permits taken from a [`Semaphore`]. Dropping it gives them back.
+/// Permits taken from a [`Semaphore`]. Dropping it gives them back, and
+/// wakes whoever is next in line.
+///
+/// Hold it for as long as the thing it stands for is in use, typically by
+/// moving it into the task that does the work. Bind it to a name: `let _ =`
+/// drops it on the spot.
 #[must_use = "the permits are given back as soon as this is dropped"]
 pub struct Permit {
     state: Rc<Local<SemaphoreState>>,
@@ -200,19 +241,24 @@ pub struct Permit {
 }
 
 impl Permit {
-    /// How many permits this holds.
+    /// How many permits this holds, as asked for when it was acquired.
     pub fn count(&self) -> usize {
         self.permits
     }
 
-    /// Keeps the permits for good: the semaphore permanently holds that
-    /// many fewer.
+    /// Keeps the permits for good: they are never returned, and the semaphore
+    /// permanently holds that many fewer.
+    ///
+    /// This is how a semaphore is used as a budget that only something else
+    /// refills, with [`Semaphore::add_permits`].
     pub fn forget(mut self) {
         self.permits = 0;
     }
 }
 
 impl Drop for Permit {
+    /// Gives the permits back to the semaphore and wakes the next waiter they
+    /// suffice for.
     fn drop(&mut self) {
         if self.permits > 0 {
             release(&self.state, self.permits);
@@ -220,7 +266,12 @@ impl Drop for Permit {
     }
 }
 
-/// Future returned by [`Semaphore::acquire`].
+/// Future returned by [`Semaphore::acquire`]: completes with a [`Permit`]
+/// once the permits are free and every earlier request has been served, or
+/// with [`Error::Closed`] if the semaphore is closed first.
+///
+/// Dropping it before it completes gives up the place in the queue. If it
+/// was at the head, the turn passes to the next task.
 #[must_use = "no permits are taken unless this is awaited"]
 pub struct Acquire {
     state: Rc<Local<SemaphoreState>>,
@@ -230,7 +281,8 @@ pub struct Acquire {
 }
 
 /// What one poll of [`Acquire`] found. The wakers are handed out of the
-/// semaphore to be dropped or woken once it is no longer borrowed.
+/// semaphore to be dropped or woken once it is no longer borrowed, since
+/// both are calls into code from outside the runtime.
 enum Acquired {
     Taken {
         replaced: Option<Waker>,
@@ -246,8 +298,15 @@ enum Acquired {
 }
 
 impl Future for Acquire {
+    /// The permits, or [`Error::Closed`].
     type Output = Result<Permit>;
 
+    /// Takes the permits if this task is at the head of the queue (or there is
+    /// no queue) and enough are free; otherwise joins or stays in the queue.
+    ///
+    /// When the permits are taken and some remain, the next task in line is
+    /// woken if they are enough for it, so that one release can serve several
+    /// waiters in order.
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut waker = Some(cx.waker().clone());
         let waiter = self.waiter;
@@ -314,6 +373,9 @@ impl Future for Acquire {
 }
 
 impl Drop for Acquire {
+    /// Leaves the queue. If this task was at its head, perhaps already woken
+    /// for permits it will now never take, the task behind it is woken in its
+    /// place, so that the permits are not left unused.
     fn drop(&mut self) {
         let Some(waiter) = self.waiter.take() else { return };
         // If this task was at the head of the queue, perhaps already woken,
@@ -330,6 +392,8 @@ impl Drop for Acquire {
     }
 }
 
+/// The inside of a [`Gate`]: how many guards are alive, whether the gate is
+/// closed, and the tasks waiting for it to empty.
 struct GateState {
     /// Guards alive.
     active: usize,
@@ -368,6 +432,7 @@ pub struct Gate {
 }
 
 impl Default for Gate {
+    /// An open gate with nothing inside, as [`Gate::new`].
     fn default() -> Self {
         Gate::new()
     }
@@ -375,6 +440,9 @@ impl Default for Gate {
 
 impl Gate {
     /// An open gate with nothing inside.
+    ///
+    /// Make one per shard for each kind of work whose completion shutdown has to
+    /// wait for.
     pub fn new() -> Gate {
         Gate {
             state: Rc::new(Local::new(GateState {
@@ -411,12 +479,15 @@ impl Gate {
         }
     }
 
-    /// How many guards are alive.
+    /// How many guards are alive: how much work is inside the gate now. After
+    /// a [`close`](Self::close) that timed out, this is how much was left
+    /// unfinished.
     pub fn active(&self) -> usize {
         self.state.with(|state| state.active).unwrap_or(0)
     }
 
-    /// Whether [`close`](Self::close) has been called.
+    /// Whether [`close`](Self::close) has been called. A closed gate lets
+    /// nothing more in, and stays closed.
     pub fn is_closed(&self) -> bool {
         self.state.with(|state| state.closed).unwrap_or(true)
     }
@@ -439,13 +510,20 @@ impl Gate {
     }
 }
 
-/// Keeps a [`Gate`] from finishing its [`close`](Gate::close).
+/// Keeps a [`Gate`] from finishing its [`close`](Gate::close): one piece
+/// of work in progress.
+///
+/// Move it into the task that does the work, so that it is dropped when the
+/// work ends, however it ends: by returning, by an error, by a panic or by
+/// being aborted.
 #[must_use = "the gate is left as soon as this is dropped"]
 pub struct GateGuard {
     state: Rc<Local<GateState>>,
 }
 
 impl Drop for GateGuard {
+    /// Leaves the gate. If this was the last guard and the gate is closed,
+    /// every task waiting in [`Gate::close`] is woken.
     fn drop(&mut self) {
         let closers = self.state.with(|state| {
             state.active = state.active.saturating_sub(1);
@@ -461,7 +539,9 @@ impl Drop for GateGuard {
     }
 }
 
-/// Future returned by [`Gate::close`].
+/// Future returned by [`Gate::close`]: completes when every guard has been
+/// dropped. The gate was closed by the call that made this future, whether
+/// or not it is ever awaited.
 #[must_use = "the gate is closed already, but only awaiting this waits for the work inside it"]
 pub struct GateClose {
     state: Rc<Local<GateState>>,
@@ -470,8 +550,11 @@ pub struct GateClose {
 }
 
 impl Future for GateClose {
+    /// Nothing: completing is the news.
     type Output = ();
 
+    /// Completes if the gate is empty; otherwise leaves this task's waker for
+    /// the last guard to call.
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let mut waker = Some(cx.waker().clone());
         let closer = self.closer;
@@ -509,6 +592,7 @@ impl Future for GateClose {
 }
 
 impl Drop for GateClose {
+    /// Takes this task off the gate's list of closers. The gate stays closed.
     fn drop(&mut self) {
         let Some(closer) = self.closer.take() else { return };
         let waker = self.state.with(|state| state.closers.remove(&closer));
@@ -516,6 +600,9 @@ impl Drop for GateClose {
     }
 }
 
+/// The inside of a [`channel`]: the queued values, the receiver's waker if
+/// it is waiting, how many senders exist, and whether the receiver has closed
+/// the channel.
 struct ChannelState<T> {
     items: VecDeque<T>,
     /// The receiving task, if it is waiting for a value.
@@ -526,6 +613,12 @@ struct ChannelState<T> {
     closed: bool,
 }
 
+/// A channel as its two sides share it: the queue, and a semaphore with
+/// one permit for every free place in the queue.
+///
+/// The semaphore is what makes senders wait in order when the queue is full:
+/// a sender takes a permit for each value and the receiver gives it back on
+/// taking the value out.
 struct Channel<T> {
     state: Local<ChannelState<T>>,
     /// One permit for every free place in the queue. Senders take one per
@@ -573,6 +666,9 @@ pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
 }
 
 /// The sending side of a [`channel`]. Clone it to send from several tasks.
+///
+/// The receiver's stream ends when every sender, the original and all its
+/// clones, has been dropped. A sender is cheap to clone and to drop.
 pub struct Sender<T> {
     channel: Rc<Channel<T>>,
 }
@@ -610,12 +706,17 @@ impl<T> Sender<T> {
         }
     }
 
-    /// Whether the receiver has closed the channel or been dropped.
+    /// Whether the receiver has closed the channel or been dropped, in which
+    /// case nothing sent from now on can arrive.
     pub fn is_closed(&self) -> bool {
         self.channel.slots.is_closed()
     }
 
-    /// Puts a value into the place `slot` stands for.
+    /// Puts a value into the place `slot` stands for and wakes the receiver.
+    ///
+    /// The slot's permit is kept, not returned: it now stands for the queued
+    /// value, and the receiver returns it when it takes the value. If the queue
+    /// cannot be reached the value comes back and the slot is freed.
     fn push(&self, value: T, slot: Permit) -> std::result::Result<(), T> {
         let mut value = Some(value);
         let receiver = self.channel.state.with(|state| {
@@ -640,6 +741,8 @@ impl<T> Sender<T> {
 }
 
 impl<T> Clone for Sender<T> {
+    /// Makes another sender for the same channel, and counts it, so that the
+    /// receiver's stream only ends when this one is gone too.
     fn clone(&self) -> Self {
         self.channel
             .state
@@ -651,6 +754,8 @@ impl<T> Clone for Sender<T> {
 }
 
 impl<T> Drop for Sender<T> {
+    /// Takes this sender off the count. With the last sender gone, a waiting
+    /// receiver is woken to be told that nothing more will come.
     fn drop(&mut self) {
         // With the last sender gone, a waiting receiver has to be told that
         // nothing more will come.
@@ -668,8 +773,11 @@ impl<T> Drop for Sender<T> {
     }
 }
 
-/// The receiving side of a [`channel`]. Dropping it closes the channel and
-/// drops the values still queued.
+/// The receiving side of a [`channel`]. There is one, and it is used by
+/// one task at a time.
+///
+/// Dropping it closes the channel: every waiting and later send fails, and
+/// the values still queued are dropped.
 pub struct Receiver<T> {
     channel: Rc<Channel<T>>,
 }
@@ -684,8 +792,9 @@ impl<T> Receiver<T> {
         poll_fn(|cx| self.poll_recv(cx)).await
     }
 
-    /// Takes the next value if one is queued. `None` only says that none
-    /// is queued right now.
+    /// Takes the next value if one is queued. `None` only says that none is
+    /// queued right now, not that none will come; [`recv`](Self::recv) tells the
+    /// two apart. Taking a value makes room for a waiting sender.
     pub fn try_recv(&mut self) -> Option<T> {
         let value = self.channel.state.with(|state| state.items.pop_front()).flatten();
         if value.is_some() {
@@ -694,23 +803,30 @@ impl<T> Receiver<T> {
         value
     }
 
-    /// How many values are queued.
+    /// How many values are queued, waiting to be received.
     pub fn len(&self) -> usize {
         self.channel.state.with(|state| state.items.len()).unwrap_or(0)
     }
 
-    /// Whether the queue is empty.
+    /// Whether the queue is empty. Senders may still exist.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Stops senders from queueing more: every waiting and future send
-    /// fails. Values already queued can still be received.
+    /// Stops senders from queueing more: every waiting and future send fails
+    /// and hands its value back. Values already queued can still be received,
+    /// after which [`recv`](Self::recv) returns `None`.
+    ///
+    /// Use it to drain a channel on shutdown without losing what was already
+    /// accepted.
     pub fn close(&mut self) {
         self.channel.state.with(|state| state.closed = true);
         self.channel.slots.close();
     }
 
+    /// One look at the queue, for [`recv`](Self::recv): a value if there is
+    /// one, the end of the stream if there are no senders left or the channel is
+    /// closed, and otherwise this task's waker is left for the next sender.
     fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
         let mut waker = Some(cx.waker().clone());
         let outcome = self.channel.state.with(|state| {
@@ -740,6 +856,9 @@ impl<T> Receiver<T> {
 }
 
 impl<T> Drop for Receiver<T> {
+    /// Closes the channel and drops the values still queued. They are dropped
+    /// here, by the receiver, not left until the last sender goes, because nobody
+    /// can ever receive them.
     fn drop(&mut self) {
         self.close();
         // Nobody can receive these any more. They are dropped here, not
@@ -751,6 +870,9 @@ impl<T> Drop for Receiver<T> {
     }
 }
 
+/// The inside of a [`oneshot`] channel: the value if it has been sent and
+/// not yet collected, the receiver's waker if it is waiting, and whether each
+/// end still exists.
 struct OneshotState<T> {
     value: Option<T>,
     /// The receiving task, if it is waiting.
@@ -792,6 +914,9 @@ pub fn oneshot<T>() -> (OneshotSender<T>, OneshotReceiver<T>) {
 }
 
 /// The sending end of a [`oneshot`] channel.
+///
+/// It is used once: [`send`](Self::send) consumes it. Dropping it without
+/// sending tells the receiver that no value will come.
 pub struct OneshotSender<T> {
     state: Rc<Local<OneshotState<T>>>,
 }
@@ -817,14 +942,18 @@ impl<T> OneshotSender<T> {
         }
     }
 
-    /// Whether the receiver has been dropped, so that sending is
-    /// pointless. Useful for giving up on expensive work early.
+    /// Whether the receiver has been dropped, so that sending is pointless.
+    /// A task doing expensive work for the answer can check this and give up
+    /// early.
     pub fn is_closed(&self) -> bool {
         self.state.with(|state| state.receiver_gone).unwrap_or(true)
     }
 }
 
 impl<T> Drop for OneshotSender<T> {
+    /// Marks the sender gone and wakes the receiver. After a successful
+    /// [`send`](OneshotSender::send) the receiver finds the value; otherwise it
+    /// learns that none will come.
     fn drop(&mut self) {
         let receiver = self.state.with(|state| {
             state.sender_gone = true;
@@ -847,16 +976,19 @@ pub struct OneshotReceiver<T> {
 }
 
 impl<T> OneshotReceiver<T> {
-    /// Takes the value if it has been sent. `None` only says that it is
-    /// not there right now.
+    /// Takes the value if it has been sent. `None` only says that it is not
+    /// there right now; awaiting the receiver tells "not yet" from "never".
     pub fn try_recv(&mut self) -> Option<T> {
         self.state.with(|state| state.value.take()).flatten()
     }
 }
 
 impl<T> Future for OneshotReceiver<T> {
+    /// The value, or `None` if the sender was dropped without sending.
     type Output = Option<T>;
 
+    /// Completes with the value if it has arrived, or with `None` if the
+    /// sender is gone; otherwise leaves this task's waker for the sender.
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
         let mut waker = Some(cx.waker().clone());
         let outcome = self.state.with(|state| {
@@ -882,6 +1014,9 @@ impl<T> Future for OneshotReceiver<T> {
 }
 
 impl<T> Drop for OneshotReceiver<T> {
+    /// Marks the receiver gone, so that the sender's
+    /// [`send`](OneshotSender::send) hands its value back, and drops a value that
+    /// was sent but never collected.
     fn drop(&mut self) {
         // The value and the waker are dropped here, outside the borrow.
         let leftover = self.state.with(|state| {
@@ -892,11 +1027,14 @@ impl<T> Drop for OneshotReceiver<T> {
     }
 }
 
-/// Error from [`Sender::send`]: the channel is closed. Holds the value that
-/// was not sent.
+/// Error from [`Sender::send`] and the cross-shard senders: the channel is
+/// closed. Holds the value that was not sent, as its only field, so that it
+/// is not lost: `error.0` gives it back.
 pub struct SendError<T>(pub T);
 
-/// Error from [`Sender::try_send`]. Holds the value that was not sent.
+/// Error from [`Sender::try_send`] and the cross-shard senders: why a
+/// value could not be queued right now. Either way the value is inside, to be
+/// kept or tried again.
 pub enum TrySendError<T> {
     /// The queue is full, or other senders are waiting for room.
     Full(T),
@@ -905,7 +1043,7 @@ pub enum TrySendError<T> {
 }
 
 impl<T> TrySendError<T> {
-    /// The value that was not sent.
+    /// The value that was not sent, whichever the reason.
     pub fn into_inner(self) -> T {
         match self {
             TrySendError::Full(value) | TrySendError::Closed(value) => value,
@@ -914,12 +1052,15 @@ impl<T> TrySendError<T> {
 }
 
 impl<T> fmt::Debug for SendError<T> {
+    /// Prints `SendError(..)`, without the value, so that the error can be
+    /// printed whatever the value's type.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("SendError(..)")
     }
 }
 
 impl<T> fmt::Display for SendError<T> {
+    /// Writes "channel is closed".
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("channel is closed")
     }
@@ -928,6 +1069,7 @@ impl<T> fmt::Display for SendError<T> {
 impl<T> std::error::Error for SendError<T> {}
 
 impl<T> fmt::Debug for TrySendError<T> {
+    /// Prints `Full(..)` or `Closed(..)`, without the value.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             TrySendError::Full(_) => "Full(..)",
@@ -937,6 +1079,7 @@ impl<T> fmt::Debug for TrySendError<T> {
 }
 
 impl<T> fmt::Display for TrySendError<T> {
+    /// Writes "channel is full" or "channel is closed".
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             TrySendError::Full(_) => "channel is full",

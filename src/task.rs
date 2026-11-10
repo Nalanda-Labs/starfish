@@ -34,17 +34,30 @@ use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use crate::error::{Error, Result};
 use crate::runtime::{discard_panic, panic_message, try_current, wake_quietly, Message, ShardShared};
 
-/// The future has not finished.
+/// State of a task whose future has not finished: it may still be polled.
 const RUNNING: u8 = 0;
-/// The future finished and its output is stored in the task.
+/// State of a task whose future has returned, with its output stored in
+/// the task, waiting to be collected by the handle or discarded.
 const DONE: u8 = 1;
-/// The future finished and the output has been taken or discarded.
+/// State of a task whose future has returned and whose output is gone:
+/// collected by the handle, or discarded because nobody wanted it.
 const TAKEN: u8 = 2;
-/// The future panicked.
+/// State of a task whose future panicked. The future has been destroyed
+/// and there is no output.
 const PANICKED: u8 = 3;
-/// The future was dropped before it finished.
+/// State of a task whose future was destroyed before it finished, by an
+/// abort or because the runtime shut down.
 const CANCELED: u8 = 4;
 
+/// The part of a task that does not depend on the type of its future.
+///
+/// It comes first in the allocation, so a pointer to it is a pointer to the
+/// whole task, and code that does not know the future's type, such as wakers
+/// and run queues, can work with any task through it.
+///
+/// The reference count, the queued flag, the shard, the key, the group and
+/// the table of operations may be read from any thread. Everything else
+/// belongs to the shard that spawned the task.
 struct Header {
     refs: AtomicUsize,
     /// Set while the task sits in a run queue or a message queue, so that
@@ -70,7 +83,10 @@ struct Header {
     vtable: &'static VTable,
 }
 
-/// The operations that depend on the future's type.
+/// The operations that depend on the future's type, as function pointers:
+/// a hand-made virtual table. Each task's header points to the one for its
+/// future type, which is how code holding only a header runs the right
+/// `poll`, destructors and deallocation.
 struct VTable {
     poll: unsafe fn(NonNull<Header>, &mut Context<'_>) -> Poll<()>,
     drop_future: unsafe fn(NonNull<Header>),
@@ -78,8 +94,12 @@ struct VTable {
     dealloc: unsafe fn(NonNull<Header>),
 }
 
-/// The allocation. `repr(C)` puts the header first, so a pointer to the
-/// header is a pointer to the task.
+/// The allocation: the header, the future and room for the future's
+/// output. `repr(C)` puts the header first, so a pointer to the header is a
+/// pointer to the task.
+///
+/// One allocation holds all three, which is why spawning a task costs one
+/// allocation and no more.
 #[repr(C)]
 struct RawTask<F: Future> {
     header: Header,
@@ -90,6 +110,7 @@ struct RawTask<F: Future> {
 }
 
 impl<F: Future> RawTask<F> {
+    /// The table of operations for tasks whose future is `F`.
     const VTABLE: VTable = VTable {
         poll: Self::poll,
         drop_future: Self::drop_future,
@@ -118,6 +139,11 @@ impl<F: Future> RawTask<F> {
         }
     }
 
+    /// Destroys the future in place, catching a panic from its destructor.
+    ///
+    /// Called exactly once per task, when the future completes, panics or is
+    /// cancelled, always on the owning shard. After it, the task holds no value
+    /// of a type that is not `Send`, apart from a possible output.
     unsafe fn drop_future(ptr: NonNull<Header>) {
         let raw = ptr.cast::<RawTask<F>>().as_ptr();
         let dropped = catch_unwind(AssertUnwindSafe(|| {
@@ -128,16 +154,23 @@ impl<F: Future> RawTask<F> {
         }
     }
 
+    /// Destroys an output that nobody collected. The state must say the output
+    /// is there.
     unsafe fn drop_output(ptr: NonNull<Header>) {
         let raw = ptr.cast::<RawTask<F>>().as_ptr();
         (*raw).output.get().cast::<F::Output>().drop_in_place();
     }
 
+    /// Moves the output out of the task, for the join handle. The state must
+    /// say the output is there, and the caller marks it as taken.
     unsafe fn take_output(ptr: NonNull<Header>) -> F::Output {
         let raw = ptr.cast::<RawTask<F>>().as_ptr();
         (*raw).output.get().cast::<F::Output>().read()
     }
 
+    /// Frees the task's memory, once the last reference is gone. By then the
+    /// future and the output have been destroyed, so only the header's own
+    /// fields are left to drop.
     unsafe fn dealloc(ptr: NonNull<Header>) {
         // Frees the header's own fields; `future` and `output` are inert
         // wrappers whose contents were destroyed by the owning shard.
@@ -146,6 +179,10 @@ impl<F: Future> RawTask<F> {
 }
 
 /// A counted reference to a task.
+///
+/// The shard's task table, its run queue, the join handle and every waker
+/// each hold one. The task is freed when the last is dropped, which may
+/// happen on any thread.
 pub(crate) struct Task(NonNull<Header>);
 
 // SAFETY: see the module documentation. Through a `Task`, foreign threads
@@ -156,6 +193,7 @@ unsafe impl Send for Task {}
 unsafe impl Sync for Task {}
 
 impl Clone for Task {
+    /// Another reference to the same task.
     fn clone(&self) -> Task {
         acquire(self.header());
         Task(self.0)
@@ -163,6 +201,7 @@ impl Clone for Task {
 }
 
 impl Drop for Task {
+    /// Lets go of one reference, and frees the task if it was the last.
     fn drop(&mut self) {
         if self.header().refs.fetch_sub(1, Ordering::Release) == 1 {
             fence(Ordering::Acquire);
@@ -173,6 +212,11 @@ impl Drop for Task {
     }
 }
 
+/// Adds one to a task's reference count.
+///
+/// A count large enough to overflow could only come from leaking references
+/// in a loop, and overflowing it would free a task still in use, so the
+/// process is aborted first, as `Arc` does.
 fn acquire(header: &Header) {
     // A count this high can only come from leaking references in a loop.
     // Overflowing it would free a task that is still in use, so stop the
@@ -183,7 +227,12 @@ fn acquire(header: &Header) {
 }
 
 impl Task {
-    /// Allocates a task that is about to be put on a run queue.
+    /// Allocates a task for `future`, in the state of having just been put on
+    /// a run queue.
+    ///
+    /// `key` is its place in the shard's task table, `group` the scheduling group
+    /// it runs in, and `detached` says that nobody will ask for its output, so
+    /// the output is to be dropped as soon as it exists.
     pub(crate) fn new<F: Future + 'static>(
         shard: Arc<ShardShared>,
         key: usize,
@@ -212,20 +261,25 @@ impl Task {
         Task(Box::into_non_null(raw).cast())
     }
 
+    /// The task's header. The reference this `Task` holds keeps it alive.
     fn header(&self) -> &Header {
         // SAFETY: the reference this `Task` holds keeps the allocation
         // alive.
         unsafe { self.0.as_ref() }
     }
 
+    /// The task's place in its shard's task table.
     pub(crate) fn key(&self) -> usize {
         self.header().key
     }
 
+    /// The scheduling group whose run queue the task goes on.
     pub(crate) fn group(&self) -> usize {
         self.header().group
     }
 
+    /// Whether two references are to the same task. Used to tell a task from a
+    /// later one that was given the same place in the table.
     pub(crate) fn same(&self, other: &Task) -> bool {
         self.0 == other.0
     }
@@ -298,7 +352,9 @@ impl Task {
         }
     }
 
-    /// SAFETY: owning thread only.
+    /// Drops the task's output if it is there, catching a panic from its
+    /// destructor. Used for tasks whose handle was dropped before they
+    /// finished.
     unsafe fn discard_output(&self) {
         let header = self.header();
         if header.state.get() == DONE {
@@ -310,14 +366,18 @@ impl Task {
         }
     }
 
+    /// Wakes the task that awaits this one's handle, if there is one.
     fn wake_joiner(&self) {
         if let Some(waker) = self.header().join_waker.take() {
             wake_quietly(waker);
         }
     }
 
-    /// Makes the task runnable: onto its shard's run queue if called
-    /// there, otherwise mailed to that shard.
+    /// Makes the task runnable: onto its shard's run queue if called there,
+    /// otherwise sent to that shard as a message.
+    ///
+    /// A task that is already queued is left alone, so any number of wake-ups
+    /// before it next runs cost one run.
     fn schedule(self) {
         if self.header().queued.swap(true, Ordering::AcqRel) {
             return;
@@ -359,27 +419,38 @@ impl Task {
 
 // A waker is a `Task` reference in disguise: its data pointer is the
 // header pointer, and it owns one count.
+/// The operations of a task's waker. A waker is a reference to the task in
+/// another form: its data pointer is the header pointer, and it owns one
+/// count of the reference count.
 static WAKER_VTABLE: RawWakerVTable =
     RawWakerVTable::new(waker_clone, waker_wake, waker_wake_by_ref, waker_drop);
 
+/// Clones a waker: one more reference to the task.
 unsafe fn waker_clone(data: *const ()) -> RawWaker {
     acquire(&*data.cast::<Header>());
     RawWaker::new(data, &WAKER_VTABLE)
 }
 
+/// Wakes by value: makes the task runnable, using up the waker's
+/// reference.
 unsafe fn waker_wake(data: *const ()) {
     Task(NonNull::new_unchecked(data.cast_mut().cast())).schedule();
 }
 
+/// Wakes by reference: makes the task runnable and leaves the waker
+/// usable.
 unsafe fn waker_wake_by_ref(data: *const ()) {
     acquire(&*data.cast::<Header>());
     waker_wake(data);
 }
 
+/// Drops a waker: one reference fewer.
 unsafe fn waker_drop(data: *const ()) {
     drop(Task(NonNull::new_unchecked(data.cast_mut().cast())));
 }
 
+/// What a [`JoinHandle`] refers to: a task, with the function that takes
+/// its output out, or nothing, because the task was never started.
 enum Joined<T> {
     Task {
         task: Task,
@@ -405,6 +476,8 @@ pub struct JoinHandle<T> {
 impl<T> Unpin for JoinHandle<T> {}
 
 impl<T> JoinHandle<T> {
+    /// A handle for a task that could not be started; it resolves to `error`
+    /// on its first poll.
     fn failed(error: Error) -> JoinHandle<T> {
         JoinHandle {
             inner: Joined::Failed(Some(error)),
@@ -442,6 +515,9 @@ impl<T> JoinHandle<T> {
 
     /// Whether the task has ended: its future returned, panicked or was
     /// dropped. Awaiting the handle then completes without waiting.
+    ///
+    /// A snapshot. A task that has not finished may do so at any await of the
+    /// caller's.
     pub fn is_finished(&self) -> bool {
         match &self.inner {
             Joined::Task { task, .. } => task.header().state.get() != RUNNING,
@@ -451,8 +527,11 @@ impl<T> JoinHandle<T> {
 }
 
 impl<T> Future for JoinHandle<T> {
+    /// The task's output, or why there is none.
     type Output = Result<T>;
 
+    /// Completes with the task's outcome once it has ended; until then, leaves
+    /// this task's waker to be called when it does.
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<T>> {
         let (task, take) = match &mut self.inner {
             Joined::Task { task, take } => (&*task, *take),
@@ -483,6 +562,8 @@ impl<T> Future for JoinHandle<T> {
 }
 
 impl<T> Drop for JoinHandle<T> {
+    /// Detaches the task: it keeps running, and its output is dropped when it
+    /// arrives, or now if it is already there.
     fn drop(&mut self) {
         let Joined::Task { task, .. } = &self.inner else { return };
         let header = task.header();
@@ -513,6 +594,11 @@ where
 }
 
 /// Spawns into `group`, or into the caller's group if `None`.
+///
+/// The common path of [`spawn`] and
+/// [`SchedulingGroup::spawn`](crate::SchedulingGroup::spawn). Outside a
+/// runtime, or for a group that does not exist, the future is dropped and
+/// the handle resolves to the error.
 pub(crate) fn spawn_in<F>(group: Option<usize>, future: F) -> JoinHandle<F::Output>
 where
     F: Future + 'static,
@@ -539,13 +625,35 @@ where
 }
 
 /// Lets the other runnable tasks, I/O completions and timers of this shard
-/// run before continuing. Long computations should call this periodically.
+/// run before continuing.
+///
+/// The task goes to the back of its scheduling group's queue and is run
+/// again when its turn comes. Long computations should give way like this
+/// now and then, or every other task on the shard waits for them. In a loop,
+/// prefer [`maybe_yield`](crate::maybe_yield), which yields only when the
+/// time slice is used up and otherwise costs two memory reads.
+///
+/// ```no_run
+/// # async fn example(items: Vec<u64>) -> u64 {
+/// let mut total = 0;
+/// for chunk in items.chunks(1024) {
+///     total += chunk.iter().sum::<u64>();
+///     starfish::yield_now().await;
+/// }
+/// total
+/// # }
+/// ```
 pub fn yield_now() -> impl Future<Output = ()> {
+    /// The future behind [`yield_now`]: pending the first time it is polled,
+    /// ready the second. The flag records whether it has yielded yet.
     struct YieldNow(bool);
 
     impl Future for YieldNow {
+        /// Nothing: the point is the pause.
         type Output = ();
 
+        /// The first time, wakes its own task and reports pending, which sends the
+        /// task round the run queue once; after that, completes.
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
             if self.0 {
                 return Poll::Ready(());

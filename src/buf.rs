@@ -34,19 +34,22 @@ use crate::runtime::{try_current, wake_quietly};
 /// and that stays valid and unchanged when the value is moved, for as long
 /// as the value is alive and not mutated.
 pub unsafe trait IoBuf: Unpin + 'static {
-    /// Start of the buffer's memory.
+    /// Start of the buffer's memory. The kernel reads [`len`](Self::len) bytes
+    /// from here.
     fn as_ptr(&self) -> *const u8;
 
-    /// Number of initialised bytes.
+    /// Number of initialised bytes: how much a write sends.
     fn len(&self) -> usize;
 
-    /// Whether the buffer holds no initialised bytes.
+    /// Whether the buffer holds no initialised bytes. A write of such a buffer
+    /// sends nothing.
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// The buffer's slot in the shard's registered-buffer table, if it is
-    /// registered memory.
+    /// registered memory, in which case I/O uses the kernel's faster path for
+    /// such buffers. `None`, the default, for ordinary memory.
     fn fixed_index(&self) -> Option<u16> {
         None
     }
@@ -59,10 +62,12 @@ pub unsafe trait IoBuf: Unpin + 'static {
 /// In addition to the [`IoBuf`] contract, `as_mut_ptr` must return a
 /// pointer valid for writes of `capacity` bytes under the same conditions.
 pub unsafe trait IoBufMut: IoBuf {
-    /// Start of the buffer's memory.
+    /// Start of the buffer's memory, for writing. The kernel writes at most
+    /// [`capacity`](Self::capacity) bytes from here.
     fn as_mut_ptr(&mut self) -> *mut u8;
 
-    /// Number of bytes the buffer has room for.
+    /// Number of bytes the buffer has room for: how much a read may bring. A
+    /// buffer with no capacity cannot be read into.
     fn capacity(&self) -> usize;
 
     /// Declares the first `len` bytes initialised.
@@ -76,10 +81,12 @@ pub unsafe trait IoBufMut: IoBuf {
 
 // SAFETY: a Vec's heap allocation does not move with the Vec.
 unsafe impl IoBuf for Vec<u8> {
+    /// The start of the vector's heap allocation.
     fn as_ptr(&self) -> *const u8 {
         Vec::as_ptr(self)
     }
 
+    /// The vector's length.
     fn len(&self) -> usize {
         Vec::len(self)
     }
@@ -87,14 +94,18 @@ unsafe impl IoBuf for Vec<u8> {
 
 // SAFETY: as above; `Vec::as_mut_ptr` covers the whole capacity.
 unsafe impl IoBufMut for Vec<u8> {
+    /// The start of the vector's heap allocation, for writing.
     fn as_mut_ptr(&mut self) -> *mut u8 {
         Vec::as_mut_ptr(self)
     }
 
+    /// The vector's capacity, which may be more than was asked for when it
+    /// was made.
     fn capacity(&self) -> usize {
         Vec::capacity(self)
     }
 
+    /// Sets the vector's length to what a read brought.
     unsafe fn set_len(&mut self, len: usize) {
         Vec::set_len(self, len);
     }
@@ -102,10 +113,12 @@ unsafe impl IoBufMut for Vec<u8> {
 
 // SAFETY: a boxed slice's allocation does not move with the Box.
 unsafe impl IoBuf for Box<[u8]> {
+    /// The start of the boxed slice.
     fn as_ptr(&self) -> *const u8 {
         <[u8]>::as_ptr(self)
     }
 
+    /// The slice's length.
     fn len(&self) -> usize {
         <[u8]>::len(self)
     }
@@ -113,10 +126,12 @@ unsafe impl IoBuf for Box<[u8]> {
 
 // SAFETY: a String's heap allocation does not move with the String.
 unsafe impl IoBuf for String {
+    /// The start of the string's bytes.
     fn as_ptr(&self) -> *const u8 {
         str::as_ptr(self)
     }
 
+    /// The string's length in bytes.
     fn len(&self) -> usize {
         str::len(self)
     }
@@ -124,10 +139,12 @@ unsafe impl IoBuf for String {
 
 // SAFETY: static memory never moves or goes away.
 unsafe impl IoBuf for &'static [u8] {
+    /// The start of the static slice.
     fn as_ptr(&self) -> *const u8 {
         <[u8]>::as_ptr(self)
     }
 
+    /// The slice's length.
     fn len(&self) -> usize {
         <[u8]>::len(self)
     }
@@ -135,10 +152,12 @@ unsafe impl IoBuf for &'static [u8] {
 
 // SAFETY: static memory never moves or goes away.
 unsafe impl IoBuf for &'static str {
+    /// The start of the static string's bytes.
     fn as_ptr(&self) -> *const u8 {
         str::as_ptr(self)
     }
 
+    /// The string's length in bytes.
     fn len(&self) -> usize {
         str::len(self)
     }
@@ -146,10 +165,12 @@ unsafe impl IoBuf for &'static str {
 
 // SAFETY: the buffer's allocation does not move with the handle.
 unsafe impl IoBuf for AlignedBuf {
+    /// The start of the aligned allocation.
     fn as_ptr(&self) -> *const u8 {
         self.raw_ptr()
     }
 
+    /// The buffer's length.
     fn len(&self) -> usize {
         AlignedBuf::len(self)
     }
@@ -157,14 +178,17 @@ unsafe impl IoBuf for AlignedBuf {
 
 // SAFETY: as above; the allocation spans the whole capacity.
 unsafe impl IoBufMut for AlignedBuf {
+    /// The start of the aligned allocation, for writing.
     fn as_mut_ptr(&mut self) -> *mut u8 {
         self.raw_ptr()
     }
 
+    /// The buffer's capacity, a whole number of blocks.
     fn capacity(&self) -> usize {
         AlignedBuf::capacity(self)
     }
 
+    /// Sets the buffer's length to what a read brought.
     unsafe fn set_len(&mut self, len: usize) {
         AlignedBuf::set_len(self, len);
     }
@@ -172,6 +196,11 @@ unsafe impl IoBufMut for AlignedBuf {
 
 /// The memory behind one shard's registered buffers: `count` buffers of
 /// `size` bytes in one page-aligned allocation.
+///
+/// It is allocated once, when the runtime starts, and registered with the
+/// shard's io_uring, which maps and pins it. It must therefore outlive the
+/// ring; the shard keeps it for as long as the reactor exists, and every
+/// [`FixedBuf`] holds a reference too.
 pub(crate) struct Region {
     ptr: NonNull<u8>,
     layout: Layout,
@@ -183,6 +212,8 @@ pub(crate) struct Region {
 // thread that starts the runtime and moved to its shard before use.
 unsafe impl Send for Region {}
 
+/// Alignment of the region and of each buffer in it: one page. That is
+/// what registration wants, and it also satisfies direct I/O.
 const REGION_ALIGN: usize = 4096;
 
 impl Region {
@@ -207,7 +238,9 @@ impl Region {
         }
     }
 
-    /// One entry per buffer, in index order, for registration.
+    /// One entry per buffer, in index order, in the form the kernel takes for
+    /// registration. A buffer's index in this list is its index in the kernel's
+    /// table, which is what a fixed read or write names.
     pub(crate) fn iovecs(&self) -> Vec<libc::iovec> {
         (0..self.count)
             .map(|index| libc::iovec {
@@ -217,6 +250,8 @@ impl Region {
             .collect()
     }
 
+    /// The address of buffer `index`. An index past the end is taken as the
+    /// last buffer, so the result always lies inside the region.
     fn buffer(&self, index: u16) -> *mut u8 {
         let offset = usize::from(index.min(self.count.saturating_sub(1))).wrapping_mul(self.size);
         // SAFETY: the index is clamped to the buffers the region holds, so
@@ -226,13 +261,19 @@ impl Region {
 }
 
 impl Drop for Region {
+    /// Frees the region's memory. By now the ring it was registered with is
+    /// closed and no buffer refers to it.
     fn drop(&mut self) {
         // SAFETY: allocated in `new` with this layout.
         unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
     }
 }
 
-/// One shard's registered buffers.
+/// One shard's registered buffers: which are free, and which tasks are
+/// waiting for one.
+///
+/// Waiting tasks are numbered as they arrive, so that the one that has
+/// waited longest gets the next buffer to come back.
 #[derive(Default)]
 pub(crate) struct FixedPool {
     region: Option<Rc<Region>>,
@@ -243,6 +284,8 @@ pub(crate) struct FixedPool {
 }
 
 impl FixedPool {
+    /// A pool over `region`, with every buffer free; or an empty pool, which
+    /// never has a buffer, if the runtime was started without one.
     pub(crate) fn new(region: Option<Region>) -> FixedPool {
         let free = region
             .as_ref()
@@ -256,6 +299,9 @@ impl FixedPool {
         }
     }
 
+    /// Takes a free buffer, if there is one. Buffers are handed out
+    /// lowest-index first, so a lightly used pool keeps touching the same
+    /// memory.
     fn take(&mut self) -> Option<FixedBuf> {
         let region = self.region.as_ref()?;
         let index = self.free.pop()?;
@@ -266,8 +312,11 @@ impl FixedPool {
         })
     }
 
-    /// Puts a buffer back and returns the waker of the task that has
-    /// waited longest, for the caller to wake.
+    /// Puts a buffer back and returns the waker of the task that has waited
+    /// longest, for the caller to wake once the pool is no longer borrowed.
+    ///
+    /// A buffer from some other pool, which can only be one from a runtime that
+    /// has since stopped, is ignored.
     fn release(&mut self, region: &Rc<Region>, index: u16) -> Option<Waker> {
         let ours = self.region.as_ref().is_some_and(|own| Rc::ptr_eq(own, region));
         if !ours {
@@ -291,8 +340,12 @@ pub struct FixedBuf {
 }
 
 impl FixedBuf {
-    /// Takes a buffer from the current shard's pool, or `None` if all are
-    /// in use, no pool was configured, or the caller is not on a shard.
+    /// Takes a buffer from the current shard's pool, or `None` if all are in
+    /// use, no pool was configured, or the caller is not on a shard.
+    ///
+    /// It does not wait and does not join the queue of waiting tasks, so with
+    /// tasks waiting in [`acquire`](Self::acquire) it can take a buffer ahead of
+    /// them.
     pub fn try_acquire() -> Option<FixedBuf> {
         try_current()?.fixed.with(FixedPool::take).flatten()
     }
@@ -309,7 +362,7 @@ impl FixedBuf {
         Acquire { waiter: None }
     }
 
-    /// Number of bytes in the buffer.
+    /// Number of bytes in the buffer: how much a write of it sends.
     pub fn len(&self) -> usize {
         self.len
     }
@@ -333,8 +386,9 @@ impl FixedBuf {
         self.len = len.min(self.region.size);
     }
 
-    /// Replaces the contents with a copy of `data`, as much as fits.
-    /// Returns how many bytes were copied.
+    /// Replaces the contents with a copy of `data`, as much as fits, and sets
+    /// the length to match. Returns how many bytes were copied, which is less
+    /// than `data.len()` if the buffer is smaller.
     pub fn fill_from(&mut self, data: &[u8]) -> usize {
         self.len = data.len().min(self.region.size);
         if let Some(source) = data.get(..self.len) {
@@ -345,8 +399,10 @@ impl FixedBuf {
 }
 
 impl Deref for FixedBuf {
+    /// A fixed buffer reads as a slice of its bytes.
     type Target = [u8];
 
+    /// The buffer's bytes, up to its length.
     fn deref(&self) -> &[u8] {
         // SAFETY: the buffer lies inside the region, which the `Rc` keeps
         // alive; `len` is within its size and the memory is initialised
@@ -356,6 +412,9 @@ impl Deref for FixedBuf {
 }
 
 impl DerefMut for FixedBuf {
+    /// The buffer's bytes, up to its length, for changing in place. To write
+    /// beyond the current length, raise it first with
+    /// [`set_len`](FixedBuf::set_len).
     fn deref_mut(&mut self) -> &mut [u8] {
         // SAFETY: as in `deref`; each index is handed out to one `FixedBuf`
         // at a time, so access is exclusive.
@@ -364,6 +423,8 @@ impl DerefMut for FixedBuf {
 }
 
 impl Drop for FixedBuf {
+    /// Returns the buffer to its pool and wakes the task that has waited
+    /// longest for one. Outside a shard there is no pool to return it to.
     fn drop(&mut self) {
         let Some(shard) = try_current() else { return };
         let waker = shard
@@ -378,14 +439,17 @@ impl Drop for FixedBuf {
 
 // SAFETY: the buffer's memory belongs to the region, which does not move.
 unsafe impl IoBuf for FixedBuf {
+    /// The start of the buffer's registered memory.
     fn as_ptr(&self) -> *const u8 {
         self.region.buffer(self.index)
     }
 
+    /// The buffer's length.
     fn len(&self) -> usize {
         self.len
     }
 
+    /// The buffer's index in the kernel's table of registered buffers.
     fn fixed_index(&self) -> Option<u16> {
         Some(self.index)
     }
@@ -393,20 +457,26 @@ unsafe impl IoBuf for FixedBuf {
 
 // SAFETY: as above; the buffer spans `region.size` bytes.
 unsafe impl IoBufMut for FixedBuf {
+    /// The start of the buffer's registered memory, for writing.
     fn as_mut_ptr(&mut self) -> *mut u8 {
         self.region.buffer(self.index)
     }
 
+    /// The buffer's capacity: the pool's buffer size.
     fn capacity(&self) -> usize {
         self.region.size
     }
 
+    /// Sets the buffer's length to what a read brought.
     unsafe fn set_len(&mut self, len: usize) {
         FixedBuf::set_len(self, len);
     }
 }
 
-/// Future returned by [`FixedBuf::acquire`].
+/// Future returned by [`FixedBuf::acquire`]: completes with a buffer as
+/// soon as one is free and it is this task's turn.
+///
+/// Dropping it gives up the place in the queue.
 #[must_use = "no buffer is taken unless this is awaited"]
 pub struct Acquire {
     /// This task's place in the queue, once it had to wait.
@@ -414,8 +484,11 @@ pub struct Acquire {
 }
 
 impl Future for Acquire {
+    /// The buffer, or why there will never be one.
     type Output = Result<FixedBuf>;
 
+    /// Takes a buffer if one is free; otherwise joins the queue of waiting
+    /// tasks, keeping its place if it is already in it.
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let Some(shard) = try_current() else {
             return Poll::Ready(Err(Error::NoRuntime));
@@ -459,6 +532,7 @@ impl Future for Acquire {
 }
 
 impl Drop for Acquire {
+    /// Leaves the queue of tasks waiting for a buffer.
     fn drop(&mut self) {
         let (Some(waiter), Some(shard)) = (self.waiter, try_current()) else {
             return;
