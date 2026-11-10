@@ -267,6 +267,9 @@ that calls `maybe_yield`.
 
 [`select`](crate::select) waits for whichever of two futures finishes
 first: a message or a timer, a connection or the order to stop.
+[`select3`](crate::select3) takes three, and
+[`select_all`](crate::select_all) any number of the same kind, such as
+connection attempts to several servers, returning which one finished.
 
 ```rust,no_run
 use std::time::Duration;
@@ -369,7 +372,9 @@ async fn resolve(name: String) -> starfish::Result<Vec<SocketAddr>> {
 its result. The closure and the result cross threads and must be `Send`.
 The future the closure creates stays on the target shard and may use that
 shard's `Rc`s and sockets. [`submit_to_all`](crate::submit_to_all) does the
-same on every shard at once and returns the results in shard order.
+same on every shard at once and returns the results in shard order, or the
+first failure. [`submit_to_each`](crate::submit_to_each) returns every
+shard's outcome, for when it matters which calls took place.
 
 ```rust,no_run
 use starfish::{shard_count, shard_id, submit_to, submit_to_all};
@@ -451,6 +456,13 @@ one machine:
 [`Sharded`](crate::Sharded) keeps one instance of a service on every shard.
 The handle is a small `Copy` value that can be sent anywhere; the instances
 never leave their shards.
+
+[`start`](crate::Sharded::start) builds each instance with a plain
+function. When building has to wait, to open a file or recover data, use
+[`start_with`](crate::Sharded::start_with), whose factory is a future, or
+[`try_start_with`](crate::Sharded::try_start_with) if it can fail.
+[`stop_with`](crate::Sharded::stop_with) runs a future against every
+instance before removing it, for flushing and closing.
 
 ```rust,no_run
 use std::cell::Cell;
@@ -855,7 +867,11 @@ async fn echo_server() -> std::io::Result<()> {
 ```
 
 [`TcpStream`](crate::net::TcpStream) has `connect`, `read`, `write`,
-`write_all`, `shutdown`, `set_nodelay` and the two address getters. A
+`write_all`, `shutdown`, `set_nodelay` and the two address getters.
+[`lookup_host`](crate::net::lookup_host) turns a host name into addresses
+to connect to. [`TcpListener::bind_with`](crate::net::TcpListener::bind_with)
+takes [`BindOptions`](crate::net::BindOptions): whether the port may be
+shared, and how many connections may wait to be accepted. A
 socket is not tied to the shard that created it: each call goes to the
 io_uring of the shard it is made on, so a connection can be moved to
 another shard inside a [`submit_to`](crate::submit_to) closure.
@@ -1127,6 +1143,25 @@ async fn files() -> std::io::Result<()> {
 | `size`, `set_len`, `allocate` | Ask, set and reserve the length |
 | `close` | Close and report the outcome |
 
+[`OpenOptions`](crate::fs::OpenOptions) covers every way of opening:
+
+```rust,no_run
+use starfish::fs::OpenOptions;
+
+async fn open() -> std::io::Result<()> {
+    // Read and write an existing file, without emptying it.
+    let table = OpenOptions::new().read(true).write(true).open("/var/data/table").await?;
+    // Create a file that must not exist yet.
+    let lock = OpenOptions::new().write(true).create_new(true).open("/var/data/LOCK").await?;
+    // Add to the end of a log, creating it if need be.
+    let log = OpenOptions::new().append(true).create(true).open("/var/log/events").await?;
+    // The same options open a file for direct I/O.
+    let segment = OpenOptions::new().read(true).write(true).open_direct("/var/data/segment").await?;
+    drop((table, lock, log, segment));
+    Ok(())
+}
+```
+
 **Caveats**
 
 - `File::open` opens for reading only, and `File::create` truncates an
@@ -1298,12 +1333,14 @@ Free functions in [`fs`](crate::fs) cover the rest:
 [`create_dir`](crate::fs::create_dir),
 [`create_dir_all`](crate::fs::create_dir_all),
 [`remove_dir`](crate::fs::remove_dir),
+[`remove_dir_all`](crate::fs::remove_dir_all),
 [`remove_file`](crate::fs::remove_file), [`rename`](crate::fs::rename),
 [`read_dir`](crate::fs::read_dir), [`metadata`](crate::fs::metadata) and
-[`sync_dir`](crate::fs::sync_dir).
+[`sync_dir`](crate::fs::sync_dir), which makes a change to a directory
+durable.
 
 ```rust,no_run
-use starfish::fs::{create_dir_all, read_dir, rename, File};
+use starfish::fs::{create_dir_all, read_dir, rename, sync_dir, File};
 
 /// Replaces a file's contents so that a crash leaves either the old
 /// version or the new one, never a mixture.
@@ -1316,6 +1353,8 @@ async fn replace(dir: &str, name: &str, contents: Vec<u8>) -> std::io::Result<()
     file.sync_data().await?;
     file.close().await?;
     rename(&temporary, format!("{dir}/{name}")).await?;
+    // The rename itself is durable once the directory is synced.
+    sync_dir(dir).await?;
 
     for entry in read_dir(dir).await? {
         println!("{}", entry.path().display());
@@ -1361,7 +1400,8 @@ maps and pins them once instead of on every request. A
 write call, on sockets and on files, including direct I/O.
 
 [`TcpStream::send_zc`](crate::net::TcpStream::send_zc) transmits from such
-a buffer without copying it.
+a buffer without copying it, as much of it as the kernel takes at once;
+[`send_all_zc`](crate::net::TcpStream::send_all_zc) transmits all of it.
 
 ```rust,no_run
 use starfish::buf::FixedBuf;
@@ -1370,8 +1410,9 @@ use starfish::net::TcpStream;
 // In a runtime started with `Runtime::new().fixed_buffers(256, 64 * 1024)`.
 async fn send_block(stream: &TcpStream, block: &[u8]) -> starfish::Result<usize> {
     let mut buf = FixedBuf::acquire().await?;
-    buf.fill_from(block);
-    Ok(stream.send_zc(buf).await?)
+    let length = buf.fill_from(block);
+    stream.send_all_zc(buf).await?;
+    Ok(length)
 }
 ```
 
@@ -1539,7 +1580,8 @@ static GLOBAL: starfish::alloc::ShardAlloc = starfish::alloc::ShardAlloc;
 With it installed, [`Runtime::memory_limit`](crate::Runtime::memory_limit)
 sets a size per shard above which the runtime asks the application to give
 memory back, by calling the functions registered with
-[`alloc::on_pressure`](crate::alloc::on_pressure) on that shard.
+[`alloc::on_pressure`](crate::alloc::on_pressure) on that shard. A
+function can be taken out again with the hook that `on_pressure` returns.
 
 ```rust,no_run
 use std::cell::RefCell;
@@ -1590,7 +1632,8 @@ fn evict_under_pressure(cache: Rc<RefCell<HashMap<u64, Vec<u8>>>>) -> starfish::
 [`signal::termination`](crate::signal::termination) waits for the process
 to be asked to stop, by Ctrl-C (`SIGINT`) or `SIGTERM`.
 [`Signals`](crate::signal::Signals) listens for any set of signals and
-keeps reporting them.
+keeps reporting them. A signal is taken over only while something listens
+for it; afterwards it does again what it did before.
 
 ```rust,no_run
 use starfish::signal::Signals;
@@ -1695,7 +1738,9 @@ async fn serve_until_stopped(acceptor: JoinHandle<()>, serving: Gate) -> starfis
 ([`shard`](crate::stats::shard)), its scheduling groups
 ([`groups`](crate::stats::groups)) and its device queues
 ([`devices`](crate::stats::devices)).
-[`alloc::stats`](crate::alloc::stats) describes its heap.
+[`alloc::stats`](crate::alloc::stats) describes its heap, and
+[`stats::all_shards`](crate::stats::all_shards) gathers the event-loop
+counters of every shard in one call.
 
 ```rust,no_run
 fn report() -> starfish::Result<()> {
@@ -1749,7 +1794,8 @@ A *stall* is a time slice that ran past
 [`stall_threshold`](crate::Runtime::stall_threshold): some task did not
 yield and held up its shard. Stalls are always counted. To find the
 culprit, turn on [`stall_backtraces`](crate::Runtime::stall_backtraces) and
-print the report:
+print the report. The handler is a closure, so it can also count stalls or
+pass them to a logging thread:
 
 ```rust,no_run
 use starfish::Runtime;
@@ -1800,8 +1846,9 @@ Runtime calls return [`Error`](crate::Error); I/O calls return
 
 The library itself does not panic. A panic in a task is caught: the task
 ends, whoever awaits its handle gets
-[`Error::Panicked`](crate::Error::Panicked), and the shard carries on. The
-same holds for a closure sent to another shard.
+[`Error::Panicked`](crate::Error::Panicked) with the panic's message, and
+the shard carries on. The same holds for a closure run on another shard,
+on the caller's own shard, or on a blocking thread.
 
 **Caveats**
 
