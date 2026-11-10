@@ -1,4 +1,5 @@
-//! Files, read and written at explicit offsets.
+//! Files, read and written at explicit offsets, and the directories they
+//! live in.
 //!
 //! [`File`] goes through the kernel page cache. [`DmaFile`] bypasses it
 //! (`O_DIRECT`) and reads and writes whole blocks through an
@@ -15,12 +16,13 @@
 //! are served by [scheduling group](crate::SchedulingGroup) I/O shares.
 
 use std::alloc::{alloc_zeroed, dealloc, Layout};
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr};
 use std::io;
 use std::ops::{Deref, DerefMut};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::ffi::OsString;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 
 use io_uring::{opcode, types};
@@ -28,6 +30,7 @@ use io_uring::{opcode, types};
 use crate::buf::{IoBuf, IoBufMut};
 use crate::ioqueue::Direction;
 use crate::reactor::Op;
+use crate::runtime::try_current;
 
 /// The alignment [`AlignedBuf::new`] uses, and the one assumed for a file
 /// whose filesystem does not report its direct-I/O requirements. It
@@ -53,7 +56,61 @@ fn c_path(path: &Path) -> io::Result<CString> {
     CString::new(path.as_os_str().as_bytes()).map_err(|_| invalid("path contains a NUL byte"))
 }
 
-async fn open_fd(path: &Path, flags: i32, mode: u32) -> io::Result<OwnedFd> {
+/// An open file's descriptor.
+///
+/// Closing a file can block: on some filesystems it writes data out or
+/// waits for a server. So a dropped descriptor is closed through the
+/// shard's io_uring, with nobody waiting for the result, and only closed
+/// on the spot when there is no shard to do it.
+struct FileFd(RawFd);
+
+impl AsRawFd for FileFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0
+    }
+}
+
+impl Drop for FileFd {
+    fn drop(&mut self) {
+        let fd = self.0;
+        let queued = try_current()
+            .and_then(|shard| shard.reactor.with(|reactor| reactor.close_detached(fd)))
+            .unwrap_or(false);
+        if !queued {
+            // SAFETY: the descriptor is ours and nothing else closes it.
+            unsafe {
+                libc::close(fd);
+            }
+        }
+    }
+}
+
+/// Closes a file and reports what the kernel said about it.
+async fn close_fd(fd: FileFd) -> io::Result<()> {
+    let raw = fd.0;
+    // From here on the descriptor is closed by the operation below.
+    std::mem::forget(fd);
+    let sqe = opcode::Close::new(types::Fd(raw)).build();
+    // SAFETY: the entry carries no pointers.
+    let (result, ()) = unsafe { Op::new(sqe, ()) }.await;
+    match result {
+        Ok(_) => Ok(()),
+        // An error with no error number is the runtime's own: the request
+        // never reached the kernel, so the descriptor is still open.
+        Err(err) if err.raw_os_error().is_none() => {
+            // SAFETY: the descriptor is ours and nothing else closes it.
+            match unsafe { libc::close(raw) } {
+                0 => Ok(()),
+                _ => Err(io::Error::last_os_error()),
+            }
+        }
+        // The kernel closed the descriptor even though it reports an
+        // error, typically that data written earlier could not be stored.
+        Err(err) => Err(err),
+    }
+}
+
+async fn open_fd(path: &Path, flags: i32, mode: u32) -> io::Result<FileFd> {
     let path = c_path(path)?;
     let sqe = opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), path.as_ptr())
         .flags(flags | libc::O_CLOEXEC)
@@ -62,8 +119,7 @@ async fn open_fd(path: &Path, flags: i32, mode: u32) -> io::Result<OwnedFd> {
     // SAFETY: the pointer targets the CString's heap allocation.
     let (result, _path) = unsafe { Op::new(sqe, path) }.result_is_fd().await;
     let fd = RawFd::try_from(result?).map_err(|_| io::Error::other("invalid file descriptor"))?;
-    // SAFETY: the kernel returned a new fd that nothing else owns.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    Ok(FileFd(fd))
 }
 
 /// What the kernel says about an open file.
@@ -74,9 +130,11 @@ struct FileInfo {
     memory_alignment: usize,
     /// Required alignment of offsets and lengths for direct I/O.
     disk_alignment: usize,
+    /// Length of the file in bytes.
+    size: u64,
 }
 
-async fn stat_fd(fd: &OwnedFd) -> io::Result<FileInfo> {
+async fn stat_fd(fd: &FileFd) -> io::Result<FileInfo> {
     // A Vec gives a heap slot whose address survives being moved into the
     // operation; the kernel fills it in.
     let mut buf: Vec<libc::statx> = Vec::with_capacity(1);
@@ -111,13 +169,51 @@ async fn stat_fd(fd: &OwnedFd) -> io::Result<FileInfo> {
         device,
         memory_alignment: reported(stat.stx_dio_mem_align),
         disk_alignment: reported(stat.stx_dio_offset_align),
+        size: stat.stx_size,
     })
 }
 
-async fn fsync(fd: &OwnedFd, device: u64) -> io::Result<()> {
+async fn fsync(fd: &FileFd, device: u64) -> io::Result<()> {
     let sqe = opcode::Fsync::new(types::Fd(fd.as_raw_fd())).build();
     // SAFETY: the entry carries no pointers.
     let (result, ()) = unsafe { Op::new_disk(sqe, (), device, Direction::Write, 0) }.await;
+    result.map(|_| ())
+}
+
+async fn fdatasync(fd: &FileFd, device: u64) -> io::Result<()> {
+    let sqe = opcode::Fsync::new(types::Fd(fd.as_raw_fd()))
+        .flags(types::FsyncFlags::DATASYNC)
+        .build();
+    // SAFETY: the entry carries no pointers.
+    let (result, ()) = unsafe { Op::new_disk(sqe, (), device, Direction::Write, 0) }.await;
+    result.map(|_| ())
+}
+
+async fn set_len(fd: &FileFd, len: u64) -> io::Result<()> {
+    let raw = fd.as_raw_fd();
+    let sqe = opcode::Ftruncate::new(types::Fd(raw), len).build();
+    // SAFETY: the entry carries no pointers.
+    let (result, ()) = unsafe { Op::new(sqe, ()) }.await;
+    match result {
+        Ok(_) => Ok(()),
+        // Kernels before 6.9 do not know the operation. Fall back to the
+        // system call, which blocks the shard for its duration.
+        Err(err) if err.raw_os_error() == Some(libc::EINVAL) => {
+            let len = libc::off64_t::try_from(len).map_err(|_| invalid("length is too large"))?;
+            // SAFETY: plain system call on a descriptor we own.
+            match unsafe { libc::ftruncate64(raw, len) } {
+                0 => Ok(()),
+                _ => Err(io::Error::last_os_error()),
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn allocate(fd: &FileFd, offset: u64, len: u64) -> io::Result<()> {
+    let sqe = opcode::Fallocate::new(types::Fd(fd.as_raw_fd()), len).offset(offset).build();
+    // SAFETY: the entry carries no pointers.
+    let (result, ()) = unsafe { Op::new(sqe, ()) }.await;
     result.map(|_| ())
 }
 
@@ -125,7 +221,7 @@ async fn fsync(fd: &OwnedFd, device: u64) -> io::Result<()> {
 /// device the request goes through the I/O scheduler; without one it goes
 /// straight to the kernel.
 async fn read_into<B: IoBufMut>(
-    fd: &OwnedFd,
+    fd: &FileFd,
     device: Option<u64>,
     mut buf: B,
     len: u32,
@@ -161,7 +257,7 @@ async fn read_into<B: IoBufMut>(
 
 /// Writes `len` bytes of `buf`, starting `start` bytes in, at `offset`.
 async fn write_from<B: IoBuf>(
-    fd: &OwnedFd,
+    fd: &FileFd,
     device: Option<u64>,
     buf: B,
     start: usize,
@@ -199,10 +295,157 @@ pub async fn remove_file(path: impl AsRef<Path>) -> io::Result<()> {
     result.map(|_| ())
 }
 
+/// Deletes an empty directory.
+pub async fn remove_dir(path: impl AsRef<Path>) -> io::Result<()> {
+    let path = c_path(path.as_ref())?;
+    let sqe = opcode::UnlinkAt::new(types::Fd(libc::AT_FDCWD), path.as_ptr())
+        .flags(libc::AT_REMOVEDIR)
+        .build();
+    // SAFETY: the pointer targets the CString's heap allocation.
+    let (result, _path) = unsafe { Op::new(sqe, path) }.await;
+    result.map(|_| ())
+}
+
+/// Renames a file or directory, replacing `to` if it exists. Both names
+/// must be on the same filesystem.
+///
+/// The replacement is atomic: anyone opening `to` gets either the old
+/// file or the new one, complete. That makes "write a new file, sync it,
+/// rename it over the old one" the way to update a file safely. For the
+/// rename itself to survive a crash, sync the directory as well.
+pub async fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
+    let from = c_path(from.as_ref())?;
+    let to = c_path(to.as_ref())?;
+    let sqe = opcode::RenameAt::new(
+        types::Fd(libc::AT_FDCWD),
+        from.as_ptr(),
+        types::Fd(libc::AT_FDCWD),
+        to.as_ptr(),
+    )
+    .build();
+    // SAFETY: the pointers target the CStrings' heap allocations.
+    let (result, _paths) = unsafe { Op::new(sqe, (from, to)) }.await;
+    result.map(|_| ())
+}
+
+/// Creates a directory. Its parent must exist and it must not.
+pub async fn create_dir(path: impl AsRef<Path>) -> io::Result<()> {
+    let path = c_path(path.as_ref())?;
+    let sqe = opcode::MkDirAt::new(types::Fd(libc::AT_FDCWD), path.as_ptr())
+        .mode(0o777)
+        .build();
+    // SAFETY: the pointer targets the CString's heap allocation.
+    let (result, _path) = unsafe { Op::new(sqe, path) }.await;
+    result.map(|_| ())
+}
+
+/// Whether `path` names a directory, following symbolic links.
+async fn is_dir(path: &Path) -> io::Result<bool> {
+    let path = c_path(path)?;
+    let mut buf: Vec<libc::statx> = Vec::with_capacity(1);
+    let sqe = opcode::Statx::new(types::Fd(libc::AT_FDCWD), path.as_ptr(), buf.as_mut_ptr().cast())
+        .mask(libc::STATX_TYPE)
+        .build();
+    // SAFETY: the pointers target the heap allocations of the CString and
+    // the Vec, both owned by the op.
+    let (result, (_path, mut buf)) = unsafe { Op::new(sqe, (path, buf)) }.await;
+    result?;
+    // SAFETY: on success the kernel initialised the one element.
+    unsafe { buf.set_len(1) };
+    let mode = buf.first().map_or(0, |stat| u32::from(stat.stx_mode));
+    Ok(mode & libc::S_IFMT == libc::S_IFDIR)
+}
+
+/// Creates a directory and every missing directory above it. Succeeds if
+/// the directory is already there.
+pub async fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
+    let path = path.as_ref();
+    // Outermost first.
+    let mut missing: Vec<&Path> = path
+        .ancestors()
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+        .collect();
+    missing.reverse();
+    for directory in missing {
+        match create_dir(directory).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                // Something is there; it has to be a directory.
+                if !is_dir(directory).await? {
+                    return Err(err);
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+/// One name in a directory, as returned by [`read_dir`].
+#[derive(Clone, Debug)]
+pub struct DirEntry {
+    directory: PathBuf,
+    name: OsString,
+    file_type: Option<std::fs::FileType>,
+}
+
+impl DirEntry {
+    /// The entry's name, without the directory.
+    pub fn file_name(&self) -> &OsStr {
+        &self.name
+    }
+
+    /// The path given to [`read_dir`] followed by the entry's name.
+    pub fn path(&self) -> PathBuf {
+        self.directory.join(&self.name)
+    }
+
+    /// What kind of thing the entry is, without following a symbolic
+    /// link. `None` if the filesystem would not say.
+    pub fn file_type(&self) -> Option<std::fs::FileType> {
+        self.file_type
+    }
+
+    /// Whether the entry is a directory (not a link to one).
+    pub fn is_dir(&self) -> bool {
+        self.file_type.is_some_and(|kind| kind.is_dir())
+    }
+
+    /// Whether the entry is a regular file (not a link to one).
+    pub fn is_file(&self) -> bool {
+        self.file_type.is_some_and(|kind| kind.is_file())
+    }
+}
+
+/// Lists a directory. `.` and `..` are left out, and the order is whatever
+/// the filesystem returns.
+///
+/// The kernel has no asynchronous way to do this, so the listing is made
+/// on a helper thread, started for the purpose, while the task waits. That
+/// costs more than other file calls and the whole listing is held in
+/// memory: fine for finding one's files at start-up, not for a hot path or
+/// for directories with millions of entries.
+pub async fn read_dir(path: impl AsRef<Path>) -> io::Result<Vec<DirEntry>> {
+    let directory = path.as_ref().to_path_buf();
+    crate::blocking::run(move || {
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(&directory)? {
+            let entry = entry?;
+            entries.push(DirEntry {
+                directory: directory.clone(),
+                name: entry.file_name(),
+                file_type: entry.file_type().ok(),
+            });
+        }
+        Ok(entries)
+    })
+    .await?
+}
+
 /// An open file. There is no cursor: every read and write names its offset,
 /// so concurrent operations on one file do not interfere.
 pub struct File {
-    fd: OwnedFd,
+    fd: FileFd,
     device: u64,
 }
 
@@ -263,6 +506,41 @@ impl File {
     /// Flushes file data and metadata to the device.
     pub async fn sync_all(&self) -> io::Result<()> {
         fsync(&self.fd, self.device).await
+    }
+
+    /// Flushes file data to the device, and of the metadata only what is
+    /// needed to read the data back (the file's length, not its
+    /// timestamps). Often cheaper than [`sync_all`](Self::sync_all).
+    pub async fn sync_data(&self) -> io::Result<()> {
+        fdatasync(&self.fd, self.device).await
+    }
+
+    /// The file's length in bytes, asked of the kernel on every call.
+    pub async fn size(&self) -> io::Result<u64> {
+        Ok(stat_fd(&self.fd).await?.size)
+    }
+
+    /// Sets the file's length. Shortening discards the rest; lengthening
+    /// adds zeros, without allocating space for them.
+    pub async fn set_len(&self, len: u64) -> io::Result<()> {
+        set_len(&self.fd, len).await
+    }
+
+    /// Reserves disk space for `len` bytes from `offset`, growing the file
+    /// if the range ends beyond it. Writes into the range then cannot fail
+    /// for lack of space, and need not allocate.
+    pub async fn allocate(&self, offset: u64, len: u64) -> io::Result<()> {
+        allocate(&self.fd, offset, len).await
+    }
+
+    /// Closes the file and reports the outcome.
+    ///
+    /// Dropping a file closes it too, without waiting and without telling
+    /// whether it worked. Some filesystems, network ones above all, report
+    /// at close that earlier writes could not be stored; call this to find
+    /// out. The file is closed even if an error is returned.
+    pub async fn close(self) -> io::Result<()> {
+        close_fd(self.fd).await
     }
 }
 
@@ -409,7 +687,7 @@ impl Drop for AlignedBuf {
 /// a buffer that satisfies both. A call that breaks them fails with
 /// `InvalidInput` before reaching the kernel.
 pub struct DmaFile {
-    fd: OwnedFd,
+    fd: FileFd,
     device: u64,
     memory_alignment: usize,
     disk_alignment: usize,
@@ -522,5 +800,38 @@ impl DmaFile {
     /// Flushes file data and metadata to the device.
     pub async fn sync_all(&self) -> io::Result<()> {
         fsync(&self.fd, self.device).await
+    }
+
+    /// Flushes file data to the device, and of the metadata only what is
+    /// needed to read the data back. Direct I/O bypasses the page cache
+    /// but not the device's own write cache, so data is only safe after a
+    /// sync.
+    pub async fn sync_data(&self) -> io::Result<()> {
+        fdatasync(&self.fd, self.device).await
+    }
+
+    /// The file's length in bytes, asked of the kernel on every call.
+    pub async fn size(&self) -> io::Result<u64> {
+        Ok(stat_fd(&self.fd).await?.size)
+    }
+
+    /// Sets the file's length, which need not be a whole number of
+    /// blocks. Since writes are whole blocks, this is how a file gets a
+    /// length that is not: write the last block padded, then cut the file
+    /// to size.
+    pub async fn set_len(&self, len: u64) -> io::Result<()> {
+        set_len(&self.fd, len).await
+    }
+
+    /// Reserves disk space for `len` bytes from `offset`, growing the file
+    /// if the range ends beyond it. Writing into space that is already
+    /// allocated is what keeps direct I/O from waiting on the filesystem.
+    pub async fn allocate(&self, offset: u64, len: u64) -> io::Result<()> {
+        allocate(&self.fd, offset, len).await
+    }
+
+    /// Closes the file and reports the outcome; see [`File::close`].
+    pub async fn close(self) -> io::Result<()> {
+        close_fd(self.fd).await
     }
 }

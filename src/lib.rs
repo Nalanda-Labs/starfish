@@ -82,6 +82,7 @@
 #[doc = include_str!("../docs/guide.md")]
 pub mod guide {}
 
+mod blocking;
 mod error;
 mod ioqueue;
 mod reactor;

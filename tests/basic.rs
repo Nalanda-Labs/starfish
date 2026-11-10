@@ -1597,3 +1597,181 @@ fn buffered_reader_refuses_overlong_lines() {
         })
         .unwrap();
 }
+
+/// How many descriptors this process has open on `path`. Other tests run
+/// in the same process, so only the ones for our own file are counted.
+fn open_descriptors(path: &std::path::Path) -> usize {
+    std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+        .filter(|target| target == path)
+        .count()
+}
+
+#[test]
+fn files_have_sizes_and_directories() {
+    use starfish::fs::{create_dir, create_dir_all, read_dir, remove_dir, remove_file, rename};
+
+    let root = scratch("tree");
+    rt(2)
+        .run({
+            let root = root.clone();
+            move || async move {
+                // Directories, several levels at once, and again.
+                let deep = root.join("a/b/c");
+                create_dir_all(&deep).await.unwrap();
+                create_dir_all(&deep).await.unwrap();
+                let again = create_dir(&deep).await.unwrap_err();
+                assert_eq!(again.kind(), std::io::ErrorKind::AlreadyExists);
+                let orphan = create_dir(root.join("x/y")).await.unwrap_err();
+                assert_eq!(orphan.kind(), std::io::ErrorKind::NotFound);
+
+                // Length: grows with writes, and can be set either way.
+                let path = deep.join("data");
+                let file = File::create(&path).await.unwrap();
+                assert_eq!(file.size().await.unwrap(), 0);
+                let (result, _) = file.write_all_at(vec![7u8; 5000], 0).await;
+                result.unwrap();
+                assert_eq!(file.size().await.unwrap(), 5000);
+                file.set_len(100).await.unwrap();
+                assert_eq!(file.size().await.unwrap(), 100);
+                file.set_len(4096).await.unwrap();
+                let (result, buf) = file.read_at(Vec::with_capacity(8192), 0).await;
+                assert_eq!(result.unwrap(), 4096);
+                assert!(buf[..100].iter().all(|&byte| byte == 7));
+                assert!(buf[100..].iter().all(|&byte| byte == 0));
+
+                // Reserved space counts as length, and holds zeros.
+                file.allocate(0, 1 << 20).await.unwrap();
+                assert_eq!(file.size().await.unwrap(), 1 << 20);
+                file.sync_data().await.unwrap();
+                file.close().await.unwrap();
+
+                // A path with a file in the way cannot become a directory.
+                let blocked = create_dir_all(path.join("below")).await.unwrap_err();
+                assert_ne!(blocked.kind(), std::io::ErrorKind::NotFound);
+                assert!(create_dir_all(&path).await.is_err());
+
+                // Renaming replaces what is there.
+                let other = deep.join("other");
+                let (result, _) = File::create(&other).await.unwrap().write_all_at("old", 0).await;
+                result.unwrap();
+                rename(&path, &other).await.unwrap();
+                assert_eq!(File::open(&other).await.unwrap().size().await.unwrap(), 1 << 20);
+                assert!(File::open(&path).await.is_err());
+
+                // Listing, from another shard as well.
+                File::create(deep.join("second")).await.unwrap();
+                create_dir(deep.join("sub")).await.unwrap();
+                let listing = {
+                    let deep = deep.clone();
+                    submit_to(1, move || async move { read_dir(deep).await }).await.unwrap().unwrap()
+                };
+                let mut names: Vec<_> = listing
+                    .iter()
+                    .map(|entry| (entry.file_name().to_string_lossy().into_owned(), entry.is_dir(), entry.is_file()))
+                    .collect();
+                names.sort();
+                assert_eq!(
+                    names,
+                    [
+                        ("other".to_owned(), false, true),
+                        ("second".to_owned(), false, true),
+                        ("sub".to_owned(), true, false),
+                    ]
+                );
+                assert!(listing.iter().all(|entry| entry.path().starts_with(&deep)));
+                assert!(listing.iter().all(|entry| entry.file_type().is_some()));
+                let missing = read_dir(root.join("nowhere")).await.unwrap_err();
+                assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+
+                // Only an empty directory can be removed.
+                assert!(remove_dir(&deep).await.is_err());
+                for entry in listing {
+                    if entry.is_dir() {
+                        remove_dir(entry.path()).await.unwrap();
+                    } else {
+                        remove_file(entry.path()).await.unwrap();
+                    }
+                }
+                remove_dir(&deep).await.unwrap();
+                remove_dir(root.join("a/b")).await.unwrap();
+                remove_dir(root.join("a")).await.unwrap();
+                remove_dir(&root).await.unwrap();
+            }
+        })
+        .unwrap();
+    assert!(!root.exists());
+}
+
+#[test]
+fn direct_files_can_end_between_blocks() {
+    let path = scratch("exact-length");
+    rt(1)
+        .run({
+            let path = path.clone();
+            move || async move {
+                let file = DmaFile::create(&path).await.unwrap();
+                let block = file.alloc(1).unwrap().capacity();
+                file.allocate(0, 4 * block as u64).await.unwrap();
+
+                // Whole blocks go in; the file is then cut to what counts.
+                let mut buf = file.alloc(block).unwrap();
+                buf.fill_padded(b"twelve bytes");
+                let (result, _) = file.write_at(buf, 0).await;
+                assert_eq!(result.unwrap(), block);
+                file.set_len(12).await.unwrap();
+                file.sync_data().await.unwrap();
+                assert_eq!(file.size().await.unwrap(), 12);
+
+                // A read of whole blocks stops at the end of the file.
+                let (result, buf) = file.read_at(file.alloc(block).unwrap(), 0).await;
+                assert_eq!(result.unwrap(), 12);
+                assert_eq!(&buf[..], b"twelve bytes");
+                file.close().await.unwrap();
+                starfish::fs::remove_file(&path).await.unwrap();
+            }
+        })
+        .unwrap();
+}
+
+#[test]
+fn dropped_files_are_closed_without_being_awaited() {
+    let path = scratch("many-opens");
+    let (before, during, after) = rt(1)
+        .run({
+            let path = path.clone();
+            move || async move {
+                File::create(&path).await.unwrap().close().await.unwrap();
+                let before = open_descriptors(&path);
+                // Kept open, then all dropped at once.
+                let mut files = Vec::new();
+                for _ in 0..300 {
+                    files.push(File::open(&path).await.unwrap());
+                }
+                let during = open_descriptors(&path);
+                drop(files);
+                // The closes are in the ring; give them a turn.
+                sleep(Duration::from_millis(20)).await;
+                let after = open_descriptors(&path);
+
+                // Dropped one by one, far more often than a process may
+                // have files open.
+                for _ in 0..3000 {
+                    drop(File::open(&path).await.unwrap());
+                }
+                // And one left open when the runtime stops.
+                let leftover = File::open(&path).await.unwrap();
+                spawn(async move {
+                    let _leftover = leftover;
+                    std::future::pending::<()>().await;
+                });
+                (before, during, after)
+            }
+        })
+        .unwrap();
+    // The file left open in a task went with the runtime.
+    assert_eq!(open_descriptors(&path), 0);
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!((before, during, after), (0, 300, 0));
+}

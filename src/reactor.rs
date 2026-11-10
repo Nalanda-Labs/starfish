@@ -20,6 +20,8 @@ use crate::runtime::try_current;
 const WAKE: u64 = u64::MAX;
 /// Completion of a cancel request; nobody waits for it.
 const CANCEL: u64 = u64::MAX - 1;
+/// Completion of a close that nobody waits for (see `close_detached`).
+const CLOSE: u64 = u64::MAX - 2;
 /// How often `push` flushes a full submission queue before giving up.
 const PUSH_ATTEMPTS: usize = 64;
 
@@ -133,6 +135,10 @@ pub(crate) struct Reactor {
     eventfd: RawFd,
     wake_buf: Box<[u8; 8]>,
     wake_armed: bool,
+    /// Closes sent to the kernel whose completions are still to come.
+    closing: usize,
+    /// `drain` has run: nothing will collect completions any more.
+    drained: bool,
 }
 
 impl Reactor {
@@ -159,6 +165,8 @@ impl Reactor {
             eventfd,
             wake_buf: Box::new([0; 8]),
             wake_armed: false,
+            closing: 0,
+            drained: false,
         }
     }
 
@@ -355,6 +363,22 @@ impl Reactor {
         let _ = self.push(&sqe);
     }
 
+    /// Closes a file descriptor through the ring, with nobody waiting for
+    /// the outcome, so that dropping a file does not block the shard.
+    /// Returns whether the close was queued; if not, the caller still owns
+    /// the descriptor.
+    pub(crate) fn close_detached(&mut self, fd: RawFd) -> bool {
+        if self.drained {
+            return false;
+        }
+        let sqe = opcode::Close::new(types::Fd(fd)).build().user_data(CLOSE);
+        if self.push(&sqe).is_err() {
+            return false;
+        }
+        self.closing = self.closing.saturating_add(1);
+        true
+    }
+
     /// Keeps one read pending on the eventfd so that a write to it from
     /// another thread produces a completion and ends `park`.
     fn arm_wake(&mut self) -> io::Result<()> {
@@ -375,6 +399,7 @@ impl Reactor {
             match cqe.user_data() {
                 WAKE => self.wake_armed = false,
                 CANCEL => {}
+                CLOSE => self.closing = self.closing.saturating_sub(1),
                 user_data => {
                     let key = user_data as usize;
                     let Some(state) = self.ops.get_mut(key) else { continue };
@@ -534,6 +559,7 @@ impl Reactor {
 
     fn in_flight(&self) -> bool {
         self.wake_armed
+            || self.closing > 0
             || self.ops.iter().any(|(_, state)| {
                 matches!(
                     state.stage,
@@ -584,6 +610,8 @@ impl Reactor {
             self.reap();
         }
         wakers.append(&mut self.ready);
+        // Files dropped from here on are closed directly.
+        self.drained = true;
         Completions {
             wakers,
             garbage: std::mem::take(&mut self.garbage),
