@@ -8,18 +8,18 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use brine::fs::DmaFile;
-use brine::iotune::{measure, Options};
-use brine::{shard_count, shard_id, spawn, submit_to_all, Runtime};
+use starfish::fs::DmaFile;
+use starfish::iotune::{measure, Options};
+use starfish::{shard_count, shard_id, spawn, submit_to_all, Runtime};
 
 #[global_allocator]
-static GLOBAL: brine::alloc::ShardAlloc = brine::alloc::ShardAlloc;
+static GLOBAL: starfish::alloc::ShardAlloc = starfish::alloc::ShardAlloc;
 
 const FILE_SIZE: u64 = 256 << 20;
 const BLOCK: u64 = 4096;
 const DEPTH: usize = 64;
 
-fn main() -> brine::Result<()> {
+fn main() -> starfish::Result<()> {
     let directory = std::env::args().nth(1).unwrap_or_else(|| String::from("."));
     let seconds: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(3);
     let phase = Duration::from_secs(seconds);
@@ -34,7 +34,7 @@ fn main() -> brine::Result<()> {
         println!("straight to the kernel: {:>8} random reads/s", raw.read_iops.unwrap_or(0));
 
         // The same shape of load, through `DmaFile::read_at`.
-        let path = std::path::Path::new(&directory).join(".brine-bench-disk");
+        let path = std::path::Path::new(&directory).join(".starfish-bench-disk");
         {
             let file = DmaFile::create(&path).await?;
             let mut offset = 0;
@@ -80,7 +80,7 @@ fn main() -> brine::Result<()> {
                 for worker in workers {
                     worker.await??;
                 }
-                Ok::<u64, brine::Error>(done.get())
+                Ok::<u64, starfish::Error>(done.get())
             }
         })
         .await?;
@@ -88,8 +88,8 @@ fn main() -> brine::Result<()> {
         for count in counts {
             total += count?;
         }
-        brine::fs::remove_file(&path).await?;
+        starfish::fs::remove_file(&path).await?;
         println!("through the scheduler:  {:>8} random reads/s", total / seconds.max(1));
-        Ok::<(), brine::Error>(())
+        Ok::<(), starfish::Error>(())
     })?
 }

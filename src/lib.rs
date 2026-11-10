@@ -9,10 +9,10 @@
 //! instance of a service on every shard.
 //!
 //! ```no_run
-//! use brine::{Runtime, Sharded};
+//! use starfish::{Runtime, Sharded};
 //! use std::cell::Cell;
 //!
-//! fn main() -> brine::Result<()> {
+//! fn main() -> starfish::Result<()> {
 //!     let total = Runtime::new().run(|| async {
 //!         let counter = Sharded::start(|_shard| Cell::new(0u64)).await?;
 //!         counter

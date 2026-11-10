@@ -246,7 +246,7 @@ pub async fn measure(directory: impl AsRef<Path>, options: Options) -> io::Resul
     let shards = crate::shard_count()? as u64;
     let path = directory
         .as_ref()
-        .join(format!(".brine-iotune-{}", std::process::id()));
+        .join(format!(".starfish-iotune-{}", std::process::id()));
 
     // Creating the file also tells us the device's block size.
     let block = {

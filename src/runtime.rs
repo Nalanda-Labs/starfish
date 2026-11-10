@@ -991,7 +991,7 @@ impl Runtime {
             let devices = devices.clone();
             let cpu = cpu_for(parts.shared.id);
             let thread = std::thread::Builder::new()
-                .name(format!("brine-{}", parts.shared.id))
+                .name(format!("starfish-{}", parts.shared.id))
                 .spawn(move || {
                     if let Some(cpu) = cpu {
                         affinity::pin_current_thread(cpu);

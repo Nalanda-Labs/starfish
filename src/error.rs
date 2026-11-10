@@ -36,8 +36,8 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Io(err) => write!(f, "I/O error: {err}"),
-            Error::NoRuntime => f.write_str("not running inside a brine runtime"),
-            Error::AlreadyRunning => f.write_str("a brine runtime is already running on this thread"),
+            Error::NoRuntime => f.write_str("not running inside a starfish runtime"),
+            Error::AlreadyRunning => f.write_str("a starfish runtime is already running on this thread"),
             Error::Panicked => f.write_str("task panicked"),
             Error::Canceled => f.write_str("task was canceled"),
             Error::InvalidShard { shard, count } => {

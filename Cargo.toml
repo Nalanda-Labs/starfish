@@ -1,5 +1,5 @@
 [package]
-name = "brine"
+name = "starfish"
 version = "0.1.0"
 edition = "2021"
 description = "A shared-nothing, thread-per-core async runtime on io_uring, modelled on Seastar"

@@ -2,8 +2,8 @@
 
 use std::alloc::{alloc, dealloc, realloc, Layout};
 
-use brine::alloc::{stats, ShardAlloc};
-use brine::{shard_id, submit_to, yield_now, Runtime};
+use starfish::alloc::{stats, ShardAlloc};
+use starfish::{shard_id, submit_to, yield_now, Runtime};
 
 #[global_allocator]
 static GLOBAL: ShardAlloc = ShardAlloc;

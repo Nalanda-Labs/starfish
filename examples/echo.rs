@@ -4,8 +4,8 @@
 
 use std::net::SocketAddr;
 
-use brine::net::{TcpListener, TcpStream};
-use brine::{shard_id, sleep, spawn, submit_to_all, Runtime};
+use starfish::net::{TcpListener, TcpStream};
+use starfish::{shard_id, sleep, spawn, submit_to_all, Runtime};
 
 async fn echo(stream: TcpStream) -> std::io::Result<()> {
     let mut buf = Vec::with_capacity(16 * 1024);
@@ -20,7 +20,7 @@ async fn echo(stream: TcpStream) -> std::io::Result<()> {
     }
 }
 
-fn main() -> brine::Result<()> {
+fn main() -> starfish::Result<()> {
     let addr: SocketAddr = match "127.0.0.1:7000".parse() {
         Ok(addr) => addr,
         Err(err) => return Err(std::io::Error::other(err).into()),
@@ -44,13 +44,13 @@ fn main() -> brine::Result<()> {
                     }
                 }
             });
-            Ok::<(), brine::Error>(())
+            Ok::<(), starfish::Error>(())
         })
         .await?;
         for result in bound {
             result?;
         }
-        println!("echo server on {addr}, {} shards", brine::shard_count()?);
+        println!("echo server on {addr}, {} shards", starfish::shard_count()?);
         loop {
             sleep(std::time::Duration::from_secs(3600)).await;
         }

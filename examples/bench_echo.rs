@@ -1,6 +1,6 @@
-//! Request-response throughput over loopback TCP, brine against Tokio.
+//! Request-response throughput over loopback TCP, starfish against Tokio.
 //!
-//! `cargo run --release --example bench_echo -- <brine|tokio> [threads] [connections] [seconds]`
+//! `cargo run --release --example bench_echo -- <starfish|tokio> [threads] [connections] [seconds]`
 //!
 //! Server and clients share the same threads in both cases: each
 //! connection sends a 64-byte message and waits for it to come back.
@@ -11,13 +11,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[global_allocator]
-static GLOBAL: brine::alloc::ShardAlloc = brine::alloc::ShardAlloc;
+static GLOBAL: starfish::alloc::ShardAlloc = starfish::alloc::ShardAlloc;
 
 const MESSAGE: usize = 64;
 
-fn run_brine(threads: usize, connections: usize, seconds: u64) -> u64 {
-    use brine::net::{TcpListener, TcpStream};
-    use brine::{shard_id, sleep, spawn, submit_to_all, Runtime};
+fn run_starfish(threads: usize, connections: usize, seconds: u64) -> u64 {
+    use starfish::net::{TcpListener, TcpStream};
+    use starfish::{shard_id, sleep, spawn, submit_to_all, Runtime};
 
     Runtime::new()
         .shards(threads)
@@ -156,14 +156,14 @@ fn run_tokio(threads: usize, connections: usize, seconds: u64) -> u64 {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let which = args.get(1).map(String::as_str).unwrap_or("brine");
+    let which = args.get(1).map(String::as_str).unwrap_or("starfish");
     let threads = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4);
     let connections = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(64);
     let seconds = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(3);
     let start = Instant::now();
     let requests = match which {
         "tokio" => run_tokio(threads, connections, seconds),
-        _ => run_brine(threads, connections, seconds),
+        _ => run_starfish(threads, connections, seconds),
     };
     let rate = requests as f64 / start.elapsed().as_secs_f64();
     println!("{which:6} threads={threads} connections={connections}: {rate:>10.0} requests/s");

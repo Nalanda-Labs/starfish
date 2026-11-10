@@ -4,7 +4,7 @@
 //!
 //! ```no_run
 //! #[global_allocator]
-//! static GLOBAL: brine::alloc::ShardAlloc = brine::alloc::ShardAlloc;
+//! static GLOBAL: starfish::alloc::ShardAlloc = starfish::alloc::ShardAlloc;
 //! ```
 //!
 //! Every shard then allocates from a heap of its own, with no locks and no

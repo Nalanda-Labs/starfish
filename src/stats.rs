@@ -4,8 +4,8 @@
 //! whole runtime, collect them with [`submit_to_all`](crate::submit_to_all):
 //!
 //! ```no_run
-//! # async fn example() -> brine::Result<()> {
-//! let per_shard = brine::submit_to_all(|| async { brine::stats::shard() }).await?;
+//! # async fn example() -> starfish::Result<()> {
+//! let per_shard = starfish::submit_to_all(|| async { starfish::stats::shard() }).await?;
 //! # Ok(()) }
 //! ```
 

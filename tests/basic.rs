@@ -2,16 +2,16 @@ use std::cell::Cell;
 
 // The whole suite runs on the per-shard allocator.
 #[global_allocator]
-static GLOBAL: brine::alloc::ShardAlloc = brine::alloc::ShardAlloc;
+static GLOBAL: starfish::alloc::ShardAlloc = starfish::alloc::ShardAlloc;
 
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use brine::fs::{AlignedBuf, DmaFile, File, DMA_ALIGNMENT};
-use brine::net::{TcpListener, TcpStream};
-use brine::{shard_count, shard_id, sleep, spawn, submit_to, submit_to_all, timeout, yield_now};
-use brine::{maybe_yield, Error, Runtime, SchedulingGroup, Sharded};
+use starfish::fs::{AlignedBuf, DmaFile, File, DMA_ALIGNMENT};
+use starfish::net::{TcpListener, TcpStream};
+use starfish::{shard_count, shard_id, sleep, spawn, submit_to, submit_to_all, timeout, yield_now};
+use starfish::{maybe_yield, Error, Runtime, SchedulingGroup, Sharded};
 use std::cell::RefCell;
 
 /// Tests run in parallel in one process. Unpinned, so that their shards do
@@ -633,7 +633,7 @@ fn dropped_disk_requests_are_withdrawn() {
 fn device_capacity_is_shared_by_all_shards() {
     const MIB: u64 = 1 << 20;
     let directory = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
-    let properties = brine::IoProperties {
+    let properties = starfish::IoProperties {
         write_bytes_per_sec: Some(4 * MIB),
         ..Default::default()
     };
@@ -663,7 +663,7 @@ fn device_capacity_is_shared_by_all_shards() {
                 // the writes already admitted.
                 let (result, _) = file.read_at(Vec::with_capacity(64 << 10), 0).await;
                 assert_eq!(result.unwrap(), 64 << 10);
-                brine::fs::remove_file(&path).await.unwrap();
+                starfish::fs::remove_file(&path).await.unwrap();
             })
             .await
             .unwrap();
@@ -681,13 +681,13 @@ fn iotune_measures_all_four_rates() {
     let directory = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
     let properties = rt(2)
         .run(move || async move {
-            let options = brine::iotune::Options {
+            let options = starfish::iotune::Options {
                 file_size: 16 << 20,
                 phase: Duration::from_millis(60),
                 depth: 8,
                 ..Default::default()
             };
-            brine::iotune::measure(&directory, options).await
+            starfish::iotune::measure(&directory, options).await
         })
         .unwrap()
         .unwrap();
@@ -710,7 +710,7 @@ fn iotune_measures_all_four_rates() {
 
 #[test]
 fn registered_buffers_on_sockets_and_files() {
-    use brine::buf::FixedBuf;
+    use starfish::buf::FixedBuf;
 
     let path = scratch("fixed.bin");
     let path_in = path.clone();
@@ -802,7 +802,7 @@ fn registered_buffers_on_sockets_and_files() {
 
 #[test]
 fn any_owned_buffer_can_be_written() {
-    use brine::buf::FixedBuf;
+    use starfish::buf::FixedBuf;
 
     rt(1)
         .run(|| async {
@@ -843,7 +843,7 @@ fn any_owned_buffer_can_be_written() {
 
 #[test]
 fn zero_copy_send_returns_before_the_buffer_does() {
-    use brine::buf::FixedBuf;
+    use starfish::buf::FixedBuf;
 
     rt(1)
         .fixed_buffers(4, 64 << 10)
@@ -896,7 +896,7 @@ fn statistics_describe_the_shard() {
     rt(2)
         .run(move || async move {
             let group = SchedulingGroup::create("worker", 200).unwrap();
-            let before = brine::stats::shard().unwrap();
+            let before = starfish::stats::shard().unwrap();
             assert_eq!(before.shard, 0);
 
             let spinner = group.spawn(async {
@@ -912,7 +912,7 @@ fn statistics_describe_the_shard() {
             let (result, _) = file.write_all_at(vec![1u8; 10_000], 0).await;
             result.unwrap();
 
-            let after = brine::stats::shard().unwrap();
+            let after = starfish::stats::shard().unwrap();
             assert!(after.tasks >= 1);
             assert!(after.tasks_polled > before.tasks_polled);
             assert!(after.loops > before.loops);
@@ -922,7 +922,7 @@ fn statistics_describe_the_shard() {
             assert!(after.messages_sent > before.messages_sent);
             assert!(after.messages_received > before.messages_received);
 
-            let groups = brine::stats::groups().unwrap();
+            let groups = starfish::stats::groups().unwrap();
             let worker = groups.iter().find(|group| group.name == "worker").unwrap();
             assert_eq!((worker.cpu_shares, worker.io_shares), (200, 200));
             assert!(worker.cpu_time >= Duration::from_millis(25), "{worker:?}");
@@ -930,22 +930,22 @@ fn statistics_describe_the_shard() {
             assert!(worker.tasks_polled > 10, "{worker:?}");
             assert_eq!(groups[0].name, "main");
 
-            let devices = brine::stats::devices().unwrap();
+            let devices = starfish::stats::devices().unwrap();
             assert_eq!(devices.len(), 1);
             assert_eq!((devices[0].dispatched, devices[0].bytes), (1, 10_000));
             assert_eq!((devices[0].queued, devices[0].in_flight), (0, 0));
 
             // Other shards keep their own books.
-            let other = submit_to(1, || async { brine::stats::shard().unwrap() }).await.unwrap();
+            let other = submit_to(1, || async { starfish::stats::shard().unwrap() }).await.unwrap();
             assert_eq!(other.shard, 1);
             assert!(other.messages_received >= 2);
         })
         .unwrap();
     let _ = std::fs::remove_file(&path);
-    assert!(matches!(brine::stats::shard(), Err(Error::NoRuntime)));
+    assert!(matches!(starfish::stats::shard(), Err(Error::NoRuntime)));
 }
 
-static STALLS: std::sync::Mutex<Vec<brine::stats::StallReport>> = std::sync::Mutex::new(Vec::new());
+static STALLS: std::sync::Mutex<Vec<starfish::stats::StallReport>> = std::sync::Mutex::new(Vec::new());
 
 #[inline(never)]
 fn hog_the_cpu_for_a_while(duration: Duration) -> u64 {
@@ -969,9 +969,9 @@ fn stalls_are_counted_and_reported_with_a_backtrace() {
             for _ in 0..100 {
                 yield_now().await;
             }
-            assert_eq!(brine::stats::shard().unwrap().stalls, 0);
+            assert_eq!(starfish::stats::shard().unwrap().stalls, 0);
             group.spawn(async { hog_the_cpu_for_a_while(Duration::from_millis(80)) }).await.unwrap();
-            brine::stats::shard().unwrap()
+            starfish::stats::shard().unwrap()
         })
         .unwrap();
     assert_eq!(stats.stalls, 1);
@@ -995,7 +995,7 @@ fn memory_pressure_asks_the_application_to_free() {
             let cache: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
             let evictions = Rc::new(Cell::new(0u32));
             let (held, count) = (cache.clone(), evictions.clone());
-            brine::alloc::on_pressure(move || {
+            starfish::alloc::on_pressure(move || {
                 held.borrow_mut().clear();
                 count.set(count.get() + 1);
             })
@@ -1012,20 +1012,20 @@ fn memory_pressure_asks_the_application_to_free() {
             for _ in 0..16 {
                 cache.borrow_mut().push(vec![0u8; 1 << 20]);
             }
-            assert!(brine::alloc::stats().unwrap().allocated_bytes > 16 << 20);
+            assert!(starfish::alloc::stats().unwrap().allocated_bytes > 16 << 20);
             for _ in 0..200 {
                 yield_now().await;
             }
             assert_eq!(evictions.get(), 1);
             assert!(cache.borrow().is_empty());
-            assert!(brine::alloc::stats().unwrap().allocated_bytes < 8 << 20);
+            assert!(starfish::alloc::stats().unwrap().allocated_bytes < 8 << 20);
         })
         .unwrap();
 }
 
 #[test]
 fn udp_datagrams() {
-    use brine::net::UdpSocket;
+    use starfish::net::UdpSocket;
 
     rt(2)
         .run(|| async {
