@@ -301,14 +301,17 @@ impl SchedulingGroup {
         Ok(())
     }
 
+    /// The group's CPU weight.
     pub fn cpu_shares(&self) -> Result<u32> {
         Ok(self.info()?.cpu_shares.load(Ordering::Relaxed))
     }
 
+    /// The group's disk weight.
     pub fn io_shares(&self) -> Result<u32> {
         Ok(self.info()?.io_shares.load(Ordering::Relaxed))
     }
 
+    /// The name the group was created with.
     pub fn name(&self) -> Result<String> {
         Ok(self.info()?.name.clone())
     }

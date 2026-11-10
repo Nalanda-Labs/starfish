@@ -46,6 +46,8 @@
 //! with the result, because the kernel keeps writing to it even if the future
 //! is dropped.
 //!
+//! The [guide] walks through all of this with examples.
+//!
 //! # Panics
 //!
 //! The runtime itself does not panic: every failure is reported as an
@@ -70,6 +72,12 @@
     clippy::unwrap_in_result,
     clippy::panic_in_result_fn
 )]
+// Everything public is documented.
+#![warn(missing_docs)]
+
+#[cfg(doc)]
+#[doc = include_str!("../docs/guide.md")]
+pub mod guide {}
 
 mod error;
 mod ioqueue;

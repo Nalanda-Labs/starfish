@@ -37,12 +37,22 @@ fn main() -> starfish::Result<()> {
 }
 ```
 
-`examples/echo.rs` is a TCP echo server with one listener per shard.
+[docs/guide.md](docs/guide.md) is a tour of the whole library with
+examples; `cargo doc --open` shows it together with the API reference.
+
+`examples/echo.rs` is a TCP echo server with one listener per shard, a limit
+on connections, and an orderly shutdown on Ctrl-C.
 
 ## What is in it
 
-- **Tasks:** `spawn`, `JoinHandle`, `sleep`, `timeout`, `yield_now`. A task is
-  one allocation.
+- **Tasks:** `spawn`, `JoinHandle` (with `abort`), `sleep`, `timeout`,
+  `yield_now`. A task is one allocation.
+- **Coordination:** `sync::Semaphore` to bound what runs at once on a shard,
+  `sync::channel` to pass values between its tasks with backpressure, and
+  `sync::Gate` to refuse new work and wait for work in progress when
+  shutting down.
+- **Signals:** `signal::termination` and `signal::Signals`, to shut down in
+  an orderly way on Ctrl-C or `SIGTERM`.
 - **Shards:** `submit_to` runs a closure on another shard over a lock-free
   queue dedicated to that pair of shards; `Sharded<T>` keeps one instance of
   a service per shard.
@@ -86,14 +96,16 @@ unwinding, so it does not hold under `panic = "abort"`.
 
 ```sh
 cargo clippy --all-targets          # includes the no-panic lints
+RUSTDOCFLAGS='-D warnings' cargo doc --no-deps
 cargo test                          # unit, integration and doc tests
 MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test --lib
 RUSTFLAGS=-Zsanitizer=thread cargo +nightly test -Zbuild-std \
     --target x86_64-unknown-linux-gnu --lib --test basic --test alloc
 ```
 
-- **Miri** runs the unit tests: the task type, the shard-to-shard queue, the
-  I/O scheduler's arithmetic and the allocator's size tables. It cannot run
+- **Miri** runs the unit tests: the task type, the semaphore, channel and gate, the
+  shard-to-shard queue, the I/O scheduler's arithmetic and the allocator's
+  size tables. It cannot run
   io_uring or the allocator's memory mapping.
 - **The thread sanitizer** runs the integration tests.
 - **Fuzzing:** `cargo +nightly fuzz run alloc_ops` (needs `cargo-fuzz`).

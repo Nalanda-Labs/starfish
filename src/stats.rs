@@ -40,6 +40,7 @@ pub(crate) fn nanos(duration: Duration) -> u64 {
 /// The event loop of one shard.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShardStats {
+    /// The shard's index.
     pub shard: usize,
     /// Tasks that exist on the shard, runnable or waiting.
     pub tasks: usize,
@@ -53,21 +54,26 @@ pub struct ShardStats {
     pub busy: Duration,
     /// Time spent asleep.
     pub idle: Duration,
-    /// Messages sent to, and received from, other shards.
+    /// Messages sent to other shards.
     pub messages_sent: u64,
+    /// Messages received from other shards and from threads outside the
+    /// runtime.
     pub messages_received: u64,
     /// How many time slices ran past the stall threshold
-    /// ([`Runtime::stall_threshold`](crate::Runtime::stall_threshold)),
-    /// and the longest of them.
+    /// ([`Runtime::stall_threshold`](crate::Runtime::stall_threshold)).
     pub stalls: u64,
+    /// The longest of those slices.
     pub longest_stall: Duration,
 }
 
 /// One scheduling group on one shard.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GroupStats {
+    /// The name the group was created with.
     pub name: String,
+    /// The group's CPU weight.
     pub cpu_shares: u32,
+    /// The group's disk weight.
     pub io_shares: u32,
     /// CPU time the group's tasks have used on this shard.
     pub cpu_time: Duration,
@@ -86,12 +92,14 @@ pub struct DeviceStats {
     pub queued: usize,
     /// Requests the shard has in the kernel now.
     pub in_flight: usize,
-    /// Requests sent to the kernel so far, and the bytes they covered.
+    /// Requests sent to the kernel so far.
     pub dispatched: u64,
+    /// The bytes those requests covered.
     pub bytes: u64,
-    /// Time requests spent waiting in the scheduler before being sent: the
-    /// sum over all requests, and the longest single wait.
+    /// Time requests spent waiting in the scheduler before being sent,
+    /// summed over all requests.
     pub total_queue_time: Duration,
+    /// The longest any one request waited in the scheduler.
     pub longest_queue_time: Duration,
 }
 
@@ -137,6 +145,7 @@ pub fn devices() -> Result<Vec<DeviceStats>> {
 /// about a task that did not yield.
 #[derive(Clone, Debug)]
 pub struct StallReport {
+    /// The index of the shard that stalled.
     pub shard: usize,
     /// How long the slice ran.
     pub duration: Duration,

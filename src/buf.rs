@@ -4,7 +4,7 @@
 //! because the kernel may keep using the memory after the future is
 //! dropped. [`IoBuf`] and [`IoBufMut`] describe what such a buffer must
 //! provide; they are implemented for the usual owned byte containers, for
-//! [`AlignedBuf`](crate::fs::AlignedBuf) and for [`FixedBuf`].
+//! [`AlignedBuf`] and for [`FixedBuf`].
 //!
 //! A [`FixedBuf`] comes from a pool that each shard registers with its
 //! io_uring at start-up ([`Runtime::fixed_buffers`](crate::Runtime::fixed_buffers)).
@@ -40,6 +40,7 @@ pub unsafe trait IoBuf: Unpin + 'static {
     /// Number of initialised bytes.
     fn len(&self) -> usize;
 
+    /// Whether the buffer holds no initialised bytes.
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -308,14 +309,19 @@ impl FixedBuf {
         Acquire { waiter: None }
     }
 
+    /// Number of bytes in the buffer.
     pub fn len(&self) -> usize {
         self.len
     }
 
+    /// Whether the buffer holds no bytes.
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
+    /// Number of bytes the buffer has room for: the size given to
+    /// [`Runtime::fixed_buffers`](crate::Runtime::fixed_buffers), rounded
+    /// up to whole pages.
     pub fn capacity(&self) -> usize {
         self.region.size
     }

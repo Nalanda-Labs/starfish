@@ -1,4 +1,4 @@
-//! TCP sockets.
+//! TCP and UDP sockets, on the kernel's network stack.
 //!
 //! A socket is not tied to a shard: each call submits to the ring of the
 //! shard it is made on, so a connection can be handed to another shard with
@@ -44,11 +44,16 @@ impl TcpListener {
         Ok(TcpListener { fd: socket.into() })
     }
 
+    /// The address the listener is bound to. After binding to port 0, this
+    /// tells which port the kernel chose.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         to_socket_addr(SockRef::from(&self.fd).local_addr()?)
     }
 
     /// Waits for the next connection.
+    ///
+    /// Dropping the future cancels the wait. A connection that arrives at
+    /// that very moment is closed, not handed to a later call.
     pub async fn accept(&self) -> io::Result<TcpStream> {
         let sqe = opcode::Accept::new(
             types::Fd(self.fd.as_raw_fd()),
@@ -73,6 +78,7 @@ pub struct TcpStream {
 }
 
 impl TcpStream {
+    /// Opens a connection to `addr`.
     pub async fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
         let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
         let fd: OwnedFd = socket.into();
@@ -172,14 +178,19 @@ impl TcpStream {
         Ok(sent as usize)
     }
 
+    /// The address of the other end of the connection.
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         to_socket_addr(SockRef::from(&self.fd).peer_addr()?)
     }
 
+    /// The address of this end of the connection.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         to_socket_addr(SockRef::from(&self.fd).local_addr()?)
     }
 
+    /// Turns `TCP_NODELAY` on or off. On, small writes are sent at once
+    /// instead of being held back to be merged with later ones (Nagle's
+    /// algorithm), which is what request/response protocols want.
     pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
         SockRef::from(&self.fd).set_nodelay(nodelay)
     }
@@ -283,6 +294,8 @@ impl UdpSocket {
         Ok(UdpSocket { fd: socket.into() })
     }
 
+    /// The address the socket is bound to. After binding to port 0, this
+    /// tells which port the kernel chose.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         to_socket_addr(SockRef::from(&self.fd).local_addr()?)
     }
@@ -293,6 +306,7 @@ impl UdpSocket {
         SockRef::from(&self.fd).connect(&addr.into())
     }
 
+    /// Allows or forbids sending to a broadcast address (`SO_BROADCAST`).
     pub fn set_broadcast(&self, broadcast: bool) -> io::Result<()> {
         SockRef::from(&self.fd).set_broadcast(broadcast)
     }

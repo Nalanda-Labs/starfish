@@ -18,6 +18,10 @@ jobs:
         run: uname -r
       - name: Clippy (includes the no-panic lints)
         run: cargo clippy --all-targets -- -D warnings
+      - name: Documentation (no broken links, examples compile)
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
       - name: Tests
         run: cargo test
       - name: Tests, release

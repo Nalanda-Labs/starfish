@@ -341,14 +341,17 @@ impl AlignedBuf {
         tail.fill(0);
     }
 
+    /// Number of bytes in the buffer.
     pub fn len(&self) -> usize {
         self.len
     }
 
+    /// Whether the buffer holds no bytes.
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
+    /// Number of bytes the buffer has room for, a whole number of blocks.
     pub fn capacity(&self) -> usize {
         self.capacity
     }
