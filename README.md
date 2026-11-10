@@ -43,7 +43,7 @@ wrong). `cargo doc --open` shows it together with the API reference.
 
 ## Examples
 
-There are 44 programs in `examples/`. Run one with
+There are 45 programs in `examples/`. Run one with
 `cargo run --release --example <name>`. Those marked *server* run until
 Ctrl-C; the others do their work and exit.
 
@@ -61,6 +61,7 @@ Ctrl-C; the others do their work and exit.
 | | `kv_store` | Data split across shards by key hash |
 | | `parallel_primes` | Dividing a computation over all shards |
 | | `shared_channel` | Streaming values between shards with backpressure |
+| | `shared_mpsc` | Many shards reporting to one |
 | Coordination | `semaphore` | Limiting concurrency and budgeting memory |
 | | `rate_limiter` | A token bucket from a semaphore and a timer |
 | | `channel` | Backpressure between a producer and a consumer |
@@ -109,8 +110,9 @@ The servers listen on 127.0.0.1, ports 7000 to 7005.
 - **Shards:** `submit_to` runs a closure on another shard over a lock-free
   queue dedicated to that pair of shards; `Sharded<T>` keeps one instance of
   a service per shard; `sync::shared_channel` streams values from one shard
-  to another. A shard that falls behind slows its senders down: calls in
-  progress between two shards are limited, and the channel is bounded.
+  to another, and `sync::shared_mpsc` from several shards to one. A shard
+  that falls behind slows its senders down: calls in progress between two
+  shards are limited, and the channels are bounded.
 - **Scheduling groups:** classes of work with separate CPU and I/O shares.
   Preemption is cooperative (`maybe_yield`), and the check is two memory
   reads.

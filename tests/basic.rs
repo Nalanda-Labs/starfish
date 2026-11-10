@@ -2106,3 +2106,80 @@ fn direct_io_streams_take_pieces_of_any_size() {
         })
         .unwrap();
 }
+
+#[test]
+fn several_shards_stream_to_one() {
+    use starfish::sync::shared_mpsc;
+
+    const VALUES: u64 = 20_000;
+    rt(4)
+        .run(|| async {
+            // Shards 1 to 3 produce as fast as they can; shard 0 consumes.
+            let (sender, mut receiver) = shared_mpsc(8);
+            let producers: Vec<_> = (1..4)
+                .map(|shard| {
+                    let mut sender = sender.clone();
+                    spawn(submit_to(shard, move || async move {
+                        for value in 0..VALUES {
+                            sender.send((shard as u64, value)).await.unwrap();
+                        }
+                    }))
+                })
+                .collect();
+            // Two tasks on one shard, each with a sender of its own.
+            let local: Vec<_> = (4..6u64)
+                .map(|id| {
+                    let mut sender = sender.clone();
+                    spawn(async move {
+                        for value in 0..1000 {
+                            sender.send((id, value)).await.unwrap();
+                        }
+                    })
+                })
+                .collect();
+            drop(sender);
+
+            let mut next = [0u64; 6];
+            let mut total = 0u64;
+            // Ends by itself when the last sender is gone.
+            while let Some((producer, value)) = receiver.recv().await {
+                assert_eq!(value, next[producer as usize], "out of order from {producer}");
+                next[producer as usize] += 1;
+                total += 1;
+                if total.is_multiple_of(4096) {
+                    sleep(Duration::from_millis(1)).await;
+                }
+            }
+            assert_eq!(total, 3 * VALUES + 2000);
+            assert_eq!(next, [0, VALUES, VALUES, VALUES, 1000, 1000]);
+            for producer in producers {
+                producer.await.unwrap().unwrap();
+            }
+            for task in local {
+                task.await.unwrap();
+            }
+
+            // The receiver goes away while senders on two shards are blocked.
+            let (sender, receiver) = shared_mpsc(2);
+            let blocked: Vec<_> = (1..3)
+                .map(|shard| {
+                    let mut sender = sender.clone();
+                    spawn(submit_to(shard, move || async move {
+                        let mut sent = 0u32;
+                        while sender.send(sent).await.is_ok() {
+                            sent += 1;
+                        }
+                        sent
+                    }))
+                })
+                .collect();
+            sleep(Duration::from_millis(10)).await;
+            drop(receiver);
+            for sender in blocked {
+                let sent = timeout(Duration::from_secs(5), sender).await.unwrap().unwrap().unwrap();
+                assert!(sent <= 2, "only what fits in a queue can have been sent, not {sent}");
+            }
+            assert!(sender.is_closed());
+        })
+        .unwrap();
+}

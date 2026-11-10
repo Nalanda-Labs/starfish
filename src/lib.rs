@@ -7,9 +7,10 @@
 //! Shards talk to each other only by message passing: [`submit_to`] runs a
 //! closure on another shard and returns its result, [`Sharded`] keeps one
 //! instance of a service on every shard, and a
-//! [`shared_channel`](sync::shared_channel) carries a stream of values from
-//! one shard to another. All three slow the sender down when the receiving
-//! shard falls behind.
+//! [`shared_channel`](sync::shared_channel) or
+//! [`shared_mpsc`](sync::shared_mpsc) carries a stream of values from one
+//! shard, or from several, to another. All of them slow the sender down
+//! when the receiving shard falls behind.
 //!
 //! ```no_run
 //! use starfish::{Runtime, Sharded};

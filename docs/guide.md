@@ -442,8 +442,8 @@ async fn stream() -> starfish::Result<u64> {
 
 **Caveats**
 
-- One sender and one receiver. Neither end can be cloned; for several
-  producers, give each its own channel.
+- One sender and one receiver, and neither end can be cloned. For several
+  producers use `shared_mpsc`, below.
 - The capacity is rounded up to a power of two, and is at least 2.
 - A value queued just as the receiver is dropped is dropped unseen, with
   no error to the sender. A successful `send` means "queued", not
@@ -451,6 +451,58 @@ async fn stream() -> starfish::Result<u64> {
 - Values still queued when both ends are gone are dropped on whichever
   thread lets go last, which is why they must be `Send`.
 - There is no way to close a channel except dropping an end.
+
+## From several shards to one
+
+[`shared_mpsc`](crate::sync::shared_mpsc) is the same thing with any
+number of senders: for many shards reporting to one, such as a logger or a
+collector of statistics. Cloning a sender makes another sender.
+
+```rust,no_run
+use starfish::sync::shared_mpsc;
+use starfish::{shard_count, spawn, submit_to};
+
+async fn collect() -> starfish::Result<u64> {
+    let (sender, mut receiver) = shared_mpsc(64);
+    for shard in 0..shard_count()? {
+        let mut sender = sender.clone();
+        spawn(submit_to(shard, move || async move {
+            for n in 0..1000u64 {
+                if sender.send(n).await.is_err() {
+                    break; // the receiver is gone
+                }
+            }
+        }));
+    }
+    // The loop ends when every sender is gone, the original included.
+    drop(sender);
+    let mut sum = 0;
+    while let Some(n) = receiver.recv().await {
+        sum += n;
+    }
+    Ok(sum)
+}
+```
+
+**Caveats**
+
+- Every sender has a queue of its own, so the capacity is per sender. A
+  hundred senders with a capacity of 64 can hold 6,400 values between
+  them, and each clone allocates its queue.
+- Values from one sender arrive in the order it sent them. Values from
+  different senders arrive in no particular order, and not in the order
+  they were sent.
+- A sender is used by one task at a time. Two tasks that both send need
+  a clone each, even on the same shard.
+- The receiver's loop ends only when *every* sender is gone, including
+  the original that the clones were made from.
+- The receiver takes from the senders in turn. A sender that produces
+  faster than the others gets no more than its turn, and waits.
+- One receiver. There is no way to have several shards take from one
+  queue.
+- As with `shared_channel`, a value queued just as the receiver is
+  dropped is lost without an error, and the capacity is rounded up to a
+  power of two, at least 2.
 
 # Semaphores
 
@@ -1579,8 +1631,7 @@ has let go of it.
 - Networking uses the kernel's stack. There is no userspace TCP.
 - No TLS, no HTTP, no DNS resolution: addresses are `SocketAddr`s.
 - No calls for links or for changing permissions.
-- A [`shared_channel`](crate::sync::shared_channel) has one sender and one
-  receiver. There is no cross-shard channel with several senders.
+- No cross-shard channel with several receivers.
 - No work stealing or load balancing between shards.
 - No interval timer and no `select` over several futures.
 - Only Linux on x86-64.
