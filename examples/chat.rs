@@ -12,45 +12,11 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
 
-use starfish::net::{TcpListener, TcpStream};
+use starfish::net::{BufReader, TcpListener, TcpStream};
 use starfish::sync::{channel, Sender};
 use starfish::{spawn, Runtime};
 
 type Room = Rc<RefCell<HashMap<u64, Sender<String>>>>;
-
-/// Splits what a socket delivers into lines.
-struct Lines<'a> {
-    stream: &'a TcpStream,
-    pending: Vec<u8>,
-    buf: Vec<u8>,
-}
-
-impl<'a> Lines<'a> {
-    fn new(stream: &'a TcpStream) -> Lines<'a> {
-        Lines {
-            stream,
-            pending: Vec::new(),
-            buf: Vec::with_capacity(4096),
-        }
-    }
-
-    /// The next line, without its line ending. `None` when the peer has
-    /// stopped sending.
-    async fn next(&mut self) -> std::io::Result<Option<String>> {
-        loop {
-            if let Some(end) = self.pending.iter().position(|byte| *byte == b'\n') {
-                let line: Vec<u8> = self.pending.drain(..=end).collect();
-                return Ok(Some(String::from_utf8_lossy(&line).trim_end().to_owned()));
-            }
-            let (result, filled) = self.stream.read(std::mem::take(&mut self.buf)).await;
-            self.buf = filled;
-            if result? == 0 {
-                return Ok(None);
-            }
-            self.pending.extend_from_slice(&self.buf);
-        }
-    }
-}
 
 fn broadcast(room: &Room, from: u64, text: &str) {
     for (client, queue) in room.borrow().iter() {
@@ -80,8 +46,9 @@ async fn client(id: u64, stream: TcpStream, room: Room) {
         }
     });
 
-    let mut lines = Lines::new(&stream);
-    while let Ok(Some(line)) = lines.next().await {
+    // A line may be at most 1 KiB; a longer one ends the connection.
+    let mut lines = BufReader::new(stream.clone()).limit(1024);
+    while let Ok(Some(line)) = lines.next_line().await {
         broadcast(&room, id, &line);
     }
 

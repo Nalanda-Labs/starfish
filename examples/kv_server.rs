@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 
-use starfish::net::{TcpListener, TcpStream};
+use starfish::net::{BufReader, BufWriter, TcpListener, TcpStream};
 use starfish::{shard_count, spawn, submit_to_all, Runtime, Sharded};
 
 /// The keys one shard owns.
@@ -97,45 +97,20 @@ impl Store {
     }
 }
 
-/// Splits what a socket delivers into lines.
-struct Lines<'a> {
-    stream: &'a TcpStream,
-    pending: Vec<u8>,
-    buf: Vec<u8>,
-}
-
-impl<'a> Lines<'a> {
-    fn new(stream: &'a TcpStream) -> Lines<'a> {
-        Lines {
-            stream,
-            pending: Vec::new(),
-            buf: Vec::with_capacity(4096),
-        }
-    }
-
-    async fn next(&mut self) -> std::io::Result<Option<String>> {
-        loop {
-            if let Some(end) = self.pending.iter().position(|byte| *byte == b'\n') {
-                let line: Vec<u8> = self.pending.drain(..=end).collect();
-                return Ok(Some(String::from_utf8_lossy(&line).trim_end().to_owned()));
-            }
-            let (result, filled) = self.stream.read(std::mem::take(&mut self.buf)).await;
-            self.buf = filled;
-            if result? == 0 {
-                return Ok(None);
-            }
-            self.pending.extend_from_slice(&self.buf);
-        }
-    }
-}
-
 async fn serve(stream: TcpStream, store: Store) -> starfish::Result<()> {
     stream.set_nodelay(true)?;
-    let mut lines = Lines::new(&stream);
-    while let Some(line) = lines.next().await? {
+    // A request may be at most 64 KiB; a longer one ends the connection.
+    let mut requests = BufReader::new(&stream).limit(64 * 1024);
+    let mut replies = BufWriter::new(&stream);
+    while let Some(line) = requests.next_line().await? {
         let reply = store.execute(&line).await?;
-        let (result, _) = stream.write_all(reply).await;
-        result?;
+        replies.write_all(reply.as_bytes()).await?;
+        // Answer at once unless the next request has already arrived:
+        // a client that sends many requests together gets the replies
+        // together.
+        if requests.buffer().is_empty() {
+            replies.flush().await?;
+        }
     }
     Ok(())
 }

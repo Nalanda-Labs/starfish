@@ -318,6 +318,28 @@ async fn echo_server() -> std::io::Result<()> {
 }
 ```
 
+For protocols made of lines or of pieces of known length,
+[`BufReader`](crate::net::BufReader) and [`BufWriter`](crate::net::BufWriter)
+put a buffer in front of a stream. They borrow, own or share the stream,
+so one task can read while another writes.
+
+```rust,no_run
+use starfish::net::{BufReader, BufWriter, TcpStream};
+
+async fn shout_lines(stream: TcpStream) -> std::io::Result<()> {
+    // Refuse lines over 64 KiB instead of buffering them without end.
+    let mut reader = BufReader::new(&stream).limit(64 * 1024);
+    let mut writer = BufWriter::new(&stream);
+    while let Some(line) = reader.next_line().await? {
+        writer.write_all(line.to_uppercase().as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        // Nothing is sent until the buffer is full or flushed.
+        writer.flush().await?;
+    }
+    Ok(())
+}
+```
+
 [`TcpStream`](crate::net::TcpStream) also has `connect`, `write` (which may
 send only part of the buffer), `shutdown`, `set_nodelay` and the two
 address getters. [`UdpSocket`](crate::net::UdpSocket) has `send_to` and

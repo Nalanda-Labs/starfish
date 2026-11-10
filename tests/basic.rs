@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use starfish::fs::{AlignedBuf, DmaFile, File, DMA_ALIGNMENT};
-use starfish::net::{TcpListener, TcpStream};
+use starfish::net::{BufReader, BufWriter, TcpListener, TcpStream};
 use starfish::signal::Signals;
 use starfish::sync::{channel, shared_channel, Gate, Semaphore};
 use starfish::{shard_count, shard_id, sleep, spawn, submit_to, submit_to_all, timeout, yield_now};
@@ -1490,4 +1490,110 @@ fn shared_channel_carries_a_stream_between_shards() {
         .unwrap();
     assert_eq!(sum, VALUES * (VALUES - 1) / 2);
     assert!(peak <= 2, "only what fits in the queue can have been sent, not {peak}");
+}
+
+#[test]
+fn buffered_reader_and_writer_frame_a_stream() {
+    rt(1)
+        .run(|| async {
+            let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let client = spawn(async move { TcpStream::connect(addr).await.unwrap() });
+            let server = listener.accept().await.unwrap();
+            let client = client.await.unwrap();
+            client.set_nodelay(true).unwrap();
+
+            // Lines arrive cut up in ways that have nothing to do with
+            // where they end.
+            let sender = spawn(async move {
+                for piece in ["first li", "ne\nsecond line\r\n\nfour", "th\n", "\x00\x01\x02\x03tail"] {
+                    let (result, _) = client.write_all(piece).await;
+                    result.unwrap();
+                    sleep(Duration::from_millis(2)).await;
+                }
+                client
+            });
+
+            // A buffer smaller than a line, to cross its edge many times.
+            let mut reader = BufReader::with_capacity(5, &server);
+            assert_eq!(reader.next_line().await.unwrap().as_deref(), Some("first line"));
+            assert_eq!(reader.next_line().await.unwrap().as_deref(), Some("second line"));
+            assert_eq!(reader.next_line().await.unwrap().as_deref(), Some(""));
+            let mut line = String::new();
+            assert_eq!(reader.read_line(&mut line).await.unwrap(), 7);
+            assert_eq!(line, "fourth\n");
+
+            // Then a piece of known length, and what is left.
+            let mut header = [0u8; 4];
+            reader.read_exact(&mut header).await.unwrap();
+            assert_eq!(header, [0, 1, 2, 3]);
+            let client = sender.await.unwrap();
+            client.shutdown(std::net::Shutdown::Write).unwrap();
+            // A last line without an ending still counts.
+            assert_eq!(reader.next_line().await.unwrap().as_deref(), Some("tail"));
+            assert_eq!(reader.next_line().await.unwrap(), None);
+            let mut more = [0u8; 2];
+            let short = reader.read_exact(&mut more).await.unwrap_err();
+            assert_eq!(short.kind(), std::io::ErrorKind::UnexpectedEof);
+
+            // The other way: many small writes leave as few sends, and
+            // nothing leaves before the buffer is full or flushed.
+            let mut writer = BufWriter::with_capacity(64, &server);
+            for n in 0..10 {
+                writer.write_all(format!("{n},").as_bytes()).await.unwrap();
+            }
+            assert_eq!(writer.buffer(), b"0,1,2,3,4,5,6,7,8,9,");
+            let nothing = timeout(Duration::from_millis(20), client.read(Vec::with_capacity(64))).await;
+            assert!(nothing.is_err(), "sent before the flush");
+            writer.flush().await.unwrap();
+            assert!(writer.buffer().is_empty());
+            let (result, buf) = client.read(Vec::with_capacity(64)).await;
+            assert_eq!(result.unwrap(), 20);
+            assert_eq!(buf, b"0,1,2,3,4,5,6,7,8,9,");
+
+            // More than the buffer holds goes out in buffer-sized pieces.
+            let big: Vec<u8> = (0..1000u32).map(|n| (n % 251) as u8).collect();
+            writer.write_all(&big).await.unwrap();
+            writer.flush().await.unwrap();
+            drop(writer);
+            server.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut reader = BufReader::new(&client);
+            let mut received = Vec::new();
+            // No such byte follows: reads to the end.
+            assert_eq!(reader.read_until(255, &mut received).await.unwrap(), 1000);
+            assert_eq!(received, big);
+        })
+        .unwrap();
+}
+
+#[test]
+fn buffered_reader_refuses_overlong_lines() {
+    rt(1)
+        .run(|| async {
+            let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let client = spawn(async move { TcpStream::connect(addr).await.unwrap() });
+            let server = Rc::new(listener.accept().await.unwrap());
+            let client = client.await.unwrap();
+
+            let (result, _) = client.write_all("short\nexactly ten\n".to_owned() + &"x".repeat(5000)).await;
+            result.unwrap();
+            // A shared stream works too, so another task could write to it.
+            let mut reader = BufReader::with_capacity(16, server.clone()).limit(12);
+            assert_eq!(reader.next_line().await.unwrap().as_deref(), Some("short"));
+            assert_eq!(reader.next_line().await.unwrap().as_deref(), Some("exactly ten"));
+            let refused = reader.next_line().await.unwrap_err();
+            assert_eq!(refused.kind(), std::io::ErrorKind::InvalidData);
+
+            // Bytes that are not text are refused as a line.
+            let (result, _) = client.write_all(vec![b'\n', 0xff, 0xfe, b'\n']).await;
+            result.unwrap();
+            let mut reader = BufReader::new(reader.into_inner());
+            let mut skipped = Vec::new();
+            reader.read_until(b'\n', &mut skipped).await.unwrap();
+            let refused = reader.next_line().await.unwrap_err();
+            assert_eq!(refused.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(reader.get_ref().peer_addr().unwrap(), client.local_addr().unwrap());
+        })
+        .unwrap();
 }
