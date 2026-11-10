@@ -1575,7 +1575,7 @@ async fn serve_until_stopped(acceptor: JoinHandle<()>, serving: Gate) -> starfis
 - A second Ctrl-C does nothing unless the program listens for it. To let
   an impatient operator force the exit, keep a
   [`Signals`](crate::signal::Signals) and [`select`](crate::select)
-  between the gate closing and the next signal.
+  between the shutdown and the next signal, as the `kvdb` example does.
 - At the very end the runtime cancels every operation still in the
   kernel and waits until the kernel has let go of all buffers, so that
   none is freed while in use. That is normally immediate.

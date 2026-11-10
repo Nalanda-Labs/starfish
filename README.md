@@ -43,7 +43,7 @@ wrong). `cargo doc --open` shows it together with the API reference.
 
 ## Examples
 
-There are 49 programs in `examples/`. Run one with
+There are 50 programs in `examples/`. Run one with
 `cargo run --release --example <name>`. Those marked *server* run until
 Ctrl-C; the others do their work and exit.
 
@@ -95,7 +95,7 @@ Ctrl-C; the others do their work and exit.
 | | `memory_pressure` | A cache that shrinks at the shard's memory limit |
 | Complete | `kvdb` | *Server.* A durable key-value store: log per shard, group commit, recovery, compaction |
 | | `kvdb_bench` | A load generator for `kvdb` |
-| Benchmarks | `bench_echo`, `bench_spawn`, `bench_disk` | See [Benchmarks](#benchmarks) |
+| Benchmarks | `bench_echo`, `bench_spawn`, `bench_connect`, `bench_disk` | See [Benchmarks](#benchmarks) |
 
 The servers listen on 127.0.0.1, ports 7000 to 7006.
 
@@ -184,9 +184,9 @@ capacity) and can fail on a heavily loaded machine.
 
 ## Benchmarks
 
-`examples/bench_echo.rs`, `bench_spawn.rs` and `bench_disk.rs`. The first
-two compare with Tokio and with Monoio, another thread-per-core runtime on
-io_uring. On the one machine they have been run on (24 cores, loopback,
+`examples/bench_echo.rs`, `bench_spawn.rs`, `bench_connect.rs` and
+`bench_disk.rs`. The first three compare with Tokio and with Monoio,
+another thread-per-core runtime on io_uring. On the one machine they have been run on (24 cores, loopback,
 load generator sharing the cores), as the range of medians from two sets of
 runs:
 
@@ -195,9 +195,12 @@ runs:
 | Echo, 1 thread, 64 connections (requests/s) | 347–353k | 347–354k | 372–379k |
 | Echo, 4 threads, 64 connections (requests/s) | 1.09–1.12M | 1.08M | 0.59–0.62M |
 | Spawn a task and await it (ns) | 52 | 38–39 | 107–109 |
+| Connect and close, 1 thread, 64 clients (connections/s) | 300–306k | 279–285k | 244–252k |
 
 Read as: level with Monoio on the echo test, slower than Monoio at spawning
-tasks, behind Tokio on one thread and well ahead of it on four.
+tasks, behind Tokio on one thread and well ahead of it on four, and ahead
+of both at making and dropping connections. (That last row is the range of
+five runs of three seconds on one pinned core, over a Unix-domain socket.)
 
 `examples/kvdb.rs` is a durable key-value server built from the library's
 pieces, and `kvdb_bench` loads it. With the server on 8 cores and the load
