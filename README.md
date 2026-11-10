@@ -128,15 +128,17 @@ The servers listen on 127.0.0.1, ports 7000 to 7006.
   Preemption is cooperative (`maybe_yield`), and the check is two memory
   reads.
 - **Disk:** `fs::File` (page cache) and `fs::DmaFile` (direct I/O), with
-  sizes, truncation, preallocation and syncing, plus directories, renaming,
-  listing and metadata. `DmaStreamWriter` and `DmaStreamReader` write and
+  sizes, truncation, preallocation and syncing, `fs::OpenOptions` for how a
+  file is opened, plus directories, renaming, listing, metadata and
+  `fs::sync_dir`. `DmaStreamWriter` and `DmaStreamReader` write and
   read a direct-I/O file in pieces of any size, the reader with optional
   read-ahead. Dropping a file closes it without blocking the shard. Every
   device has an I/O queue per shard that orders waiting requests by group
   shares. Declare a device's capacity (`Runtime::io_properties`, measured
   with `iotune::measure`) and all shards together stay within it.
 - **Network:** `net::TcpListener`, `TcpStream`, `UdpSocket`, and
-  `UnixListener`/`UnixStream` for local connections. Networking
+  `UnixListener`/`UnixStream` for local connections, with `BindOptions`
+  for whether a port is shared and how long its accept queue is. Networking
   uses the kernel stack; there is no userspace TCP stack.
 - **Buffered I/O:** `io::BufReader` and `io::BufWriter` for lines and
   length-framed data, over TCP streams and, through `fs::Cursor`, files.

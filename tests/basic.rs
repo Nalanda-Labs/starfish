@@ -2731,3 +2731,115 @@ fn dropped_sockets_are_closed() {
         })
         .unwrap();
 }
+
+#[test]
+fn a_port_can_be_bound_for_one_listener_only() {
+    use starfish::net::{BindOptions, UdpSocket};
+
+    rt(1)
+        .run(|| async {
+            // By default a port is shared: that is how shards get a
+            // listener each.
+            let first = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = first.local_addr().unwrap();
+            let second = TcpListener::bind(addr).unwrap();
+            drop((first, second));
+
+            // Asked not to share, the second bind is refused, whichever
+            // way round they come.
+            let alone = BindOptions::new().reuse_port(false).backlog(16);
+            let only = TcpListener::bind_with("127.0.0.1:0".parse().unwrap(), &alone).unwrap();
+            let addr = only.local_addr().unwrap();
+            let taken = TcpListener::bind(addr).err().unwrap();
+            assert_eq!(taken.kind(), std::io::ErrorKind::AddrInUse);
+            let taken = TcpListener::bind_with(addr, &alone).err().unwrap();
+            assert_eq!(taken.kind(), std::io::ErrorKind::AddrInUse);
+            // And it works as a listener.
+            let client = spawn(async move { TcpStream::connect(addr).await.unwrap() });
+            only.accept().await.unwrap();
+            client.await.unwrap();
+
+            let only = UdpSocket::bind_with("127.0.0.1:0".parse().unwrap(), &alone).unwrap();
+            let addr = only.local_addr().unwrap();
+            assert_eq!(UdpSocket::bind(addr).err().unwrap().kind(), std::io::ErrorKind::AddrInUse);
+            let shared = UdpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            UdpSocket::bind(shared.local_addr().unwrap()).unwrap();
+            assert_eq!(BindOptions::default(), BindOptions::new());
+        })
+        .unwrap();
+}
+
+#[test]
+fn files_are_opened_the_way_the_options_say() {
+    use starfish::fs::{remove_dir, remove_file, sync_dir, OpenOptions};
+
+    let dir = scratch("open-options");
+    rt(1)
+        .run({
+            let dir = dir.clone();
+            move || async move {
+                starfish::fs::create_dir(&dir).await.unwrap();
+                let path = dir.join("file");
+                let kind = |result: std::io::Result<File>| result.err().unwrap().kind();
+
+                // Nothing is created unless asked for.
+                assert_eq!(kind(OpenOptions::new().write(true).open(&path).await), std::io::ErrorKind::NotFound);
+                // Exactly one creator.
+                let created = OpenOptions::new().write(true).create_new(true).open(&path).await.unwrap();
+                assert_eq!(
+                    kind(OpenOptions::new().write(true).create_new(true).open(&path).await),
+                    std::io::ErrorKind::AlreadyExists
+                );
+                let (result, _) = created.write_all_at("0123456789", 0).await;
+                result.unwrap();
+                sync_dir(&dir).await.unwrap();
+
+                // Read and write without emptying the file.
+                let both = OpenOptions::new().read(true).write(true).create(true).open(&path).await.unwrap();
+                assert_eq!(both.size().await.unwrap(), 10);
+                let (result, _) = both.write_all_at("ab", 2).await;
+                result.unwrap();
+                let (result, buf) = both.read_at(Vec::with_capacity(16), 0).await;
+                result.unwrap();
+                assert_eq!(buf, b"01ab456789");
+
+                // Reading only: writes are refused by the kernel.
+                let reader = OpenOptions::new().read(true).open(&path).await.unwrap();
+                let (result, _) = reader.write_at("x", 0).await;
+                assert!(result.is_err());
+
+                // Appending: to the end, whatever offset is named.
+                let log = OpenOptions::new().append(true).open(&path).await.unwrap();
+                let (result, _) = log.write_all_at("-one", 0).await;
+                result.unwrap();
+                let (result, _) = log.write_all_at("-two", 3).await;
+                result.unwrap();
+                let (result, buf) = reader.read_at(Vec::with_capacity(32), 0).await;
+                result.unwrap();
+                assert_eq!(buf, b"01ab456789-one-two");
+
+                // Emptying.
+                OpenOptions::new().write(true).truncate(true).open(&path).await.unwrap();
+                assert_eq!(reader.size().await.unwrap(), 0);
+
+                // Combinations that make no sense are refused before the
+                // kernel is asked.
+                assert_eq!(kind(OpenOptions::new().open(&path).await), std::io::ErrorKind::InvalidInput);
+                assert_eq!(
+                    kind(OpenOptions::default().read(true).truncate(true).open(&path).await),
+                    std::io::ErrorKind::InvalidInput
+                );
+                let direct = OpenOptions::new().append(true).open_direct(&path).await;
+                assert_eq!(direct.err().unwrap().kind(), std::io::ErrorKind::InvalidInput);
+                let direct = OpenOptions::new().read(true).write(true).mode(0o600).open_direct(&path).await.unwrap();
+                assert!(direct.disk_alignment() > 0);
+
+                // Only a directory can be synced as one.
+                assert!(sync_dir(&path).await.is_err());
+                remove_file(&path).await.unwrap();
+                sync_dir(&dir).await.unwrap();
+                remove_dir(&dir).await.unwrap();
+            }
+        })
+        .unwrap();
+}

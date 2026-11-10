@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use starfish::fs::{create_dir_all, read_dir, remove_dir, remove_file, rename, File};
+use starfish::fs::{create_dir_all, read_dir, remove_dir, remove_file, rename, sync_dir, File};
 use starfish::Runtime;
 
 async fn replace(directory: &Path, name: &str, contents: Vec<u8>) -> std::io::Result<()> {
@@ -29,9 +29,7 @@ async fn replace(directory: &Path, name: &str, contents: Vec<u8>) -> std::io::Re
     rename(&temporary, &target).await?;
 
     // A directory is a file of names; syncing it stores the rename.
-    let directory = File::open_with(directory, libc::O_RDONLY | libc::O_DIRECTORY, 0).await?;
-    directory.sync_all().await?;
-    directory.close().await
+    sync_dir(directory).await
 }
 
 async fn read(path: &Path) -> std::io::Result<String> {

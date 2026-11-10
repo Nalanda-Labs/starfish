@@ -171,6 +171,71 @@ macro_rules! buffered_stream {
 buffered_stream!(TcpStream);
 buffered_stream!(UnixStream);
 
+/// How a socket is bound: what [`TcpListener::bind_with`],
+/// [`UdpSocket::bind_with`] and [`UnixListener::bind_with`] take.
+///
+/// ```no_run
+/// use starfish::net::{BindOptions, TcpListener};
+///
+/// # fn example(addr: std::net::SocketAddr) -> std::io::Result<()> {
+/// // The only listener on this port, with a long queue of connections
+/// // waiting to be accepted.
+/// let options = BindOptions::new().reuse_port(false).backlog(8192);
+/// let listener = TcpListener::bind_with(addr, &options)?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BindOptions {
+    reuse_port: bool,
+    backlog: u32,
+}
+
+impl Default for BindOptions {
+    fn default() -> Self {
+        BindOptions::new()
+    }
+}
+
+impl BindOptions {
+    /// The defaults, which are what the plain `bind` functions use: the
+    /// port may be shared, and 1024 connections may wait to be accepted.
+    pub fn new() -> BindOptions {
+        BindOptions {
+            reuse_port: true,
+            backlog: 1024,
+        }
+    }
+
+    /// Whether other sockets may bind the same address and port
+    /// (`SO_REUSEPORT`). On by default, because that is how every shard
+    /// gets a listener of its own on one port.
+    ///
+    /// Turned off, a second bind of the port fails with `AddrInUse`, by
+    /// this program or any other: the way to make sure a server is not
+    /// started twice, and that nobody else takes a share of its
+    /// connections. Only one shard can then listen; it can hand
+    /// connections to the others. Ignored for Unix-domain sockets, where
+    /// a path never has more than one listener.
+    pub fn reuse_port(mut self, reuse: bool) -> BindOptions {
+        self.reuse_port = reuse;
+        self
+    }
+
+    /// How many connections the kernel holds, fully set up, until the
+    /// program accepts them. Past that, new connections are refused or
+    /// left to retry. The kernel caps this at its own limit
+    /// (`net.core.somaxconn`). Ignored for UDP sockets.
+    pub fn backlog(mut self, connections: u32) -> BindOptions {
+        self.backlog = connections;
+        self
+    }
+
+    fn backlog_for_listen(&self) -> i32 {
+        i32::try_from(self.backlog).unwrap_or(i32::MAX)
+    }
+}
+
 /// A listening TCP socket.
 pub struct TcpListener {
     fd: OwnedFd,
@@ -180,11 +245,17 @@ impl TcpListener {
     /// Binds with `SO_REUSEPORT`, so every shard can bind its own listener to
     /// the same address and the kernel spreads connections across them.
     pub fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
+        TcpListener::bind_with(addr, &BindOptions::new())
+    }
+
+    /// Binds with the given options: whether the port may be shared, and
+    /// how many connections may wait to be accepted.
+    pub fn bind_with(addr: SocketAddr, options: &BindOptions) -> io::Result<TcpListener> {
         let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
         socket.set_reuse_address(true)?;
-        socket.set_reuse_port(true)?;
+        socket.set_reuse_port(options.reuse_port)?;
         socket.bind(&addr.into())?;
-        socket.listen(1024)?;
+        socket.listen(options.backlog_for_listen())?;
         Ok(TcpListener {
             fd: socket.into(),
         })
@@ -413,9 +484,17 @@ pub struct UdpSocket {
 impl UdpSocket {
     /// Binds with `SO_REUSEPORT`.
     pub fn bind(addr: SocketAddr) -> io::Result<UdpSocket> {
+        UdpSocket::bind_with(addr, &BindOptions::new())
+    }
+
+    /// Binds with the given options. Only
+    /// [`reuse_port`](BindOptions::reuse_port) matters for UDP.
+    pub fn bind_with(addr: SocketAddr, options: &BindOptions) -> io::Result<UdpSocket> {
         let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
-        socket.set_reuse_address(true)?;
-        socket.set_reuse_port(true)?;
+        // For UDP this option alone lets two sockets share a port, so it
+        // goes with the other.
+        socket.set_reuse_address(options.reuse_port)?;
+        socket.set_reuse_port(options.reuse_port)?;
         socket.bind(&addr.into())?;
         Ok(UdpSocket {
             fd: socket.into(),
@@ -536,10 +615,16 @@ impl UnixListener {
     /// of an earlier run: the file is not removed when the listener is
     /// dropped. A server normally removes a stale file before binding.
     pub fn bind(path: impl AsRef<std::path::Path>) -> io::Result<UnixListener> {
+        UnixListener::bind_with(path, &BindOptions::new())
+    }
+
+    /// Like [`bind`](Self::bind), with the given options. Only
+    /// [`backlog`](BindOptions::backlog) matters for Unix-domain sockets.
+    pub fn bind_with(path: impl AsRef<std::path::Path>, options: &BindOptions) -> io::Result<UnixListener> {
         let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
         socket.set_cloexec(true)?;
         socket.bind(&SockAddr::unix(path)?)?;
-        socket.listen(1024)?;
+        socket.listen(options.backlog_for_listen())?;
         Ok(UnixListener {
             fd: socket.into(),
         })

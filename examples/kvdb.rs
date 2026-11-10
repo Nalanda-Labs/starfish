@@ -45,7 +45,8 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
-use starfish::fs::{create_dir_all, remove_file, rename, DmaFile, DmaStreamReader, DmaStreamWriter, File};
+use starfish::fs::{create_dir_all, remove_file, rename, sync_dir};
+use starfish::fs::{DmaFile, DmaStreamReader, DmaStreamWriter, File, OpenOptions};
 use starfish::io::{BufReader, BufWriter};
 use starfish::net::{TcpListener, TcpStream};
 use starfish::sync::{channel, oneshot, Gate, OneshotSender, Receiver, Semaphore, Sender};
@@ -198,13 +199,6 @@ async fn append_to(file: DmaFile, end: u64) -> std::io::Result<DmaStreamWriter<D
     Ok(writer)
 }
 
-/// Makes a rename in `directory` survive a crash.
-async fn sync_directory(directory: &Path) -> std::io::Result<()> {
-    let handle = File::open_with(directory, libc::O_RDONLY | libc::O_DIRECTORY, 0).await?;
-    handle.sync_all().await?;
-    handle.close().await
-}
-
 impl Partition {
     fn new(shard: usize, compact_after: u64, background: SchedulingGroup) -> Partition {
         Partition {
@@ -229,7 +223,7 @@ impl Partition {
         let path = log_path(&directory, self.shard);
         // A compaction that a crash interrupted left a half-written file.
         let _ = remove_file(new_log_path(&directory, self.shard)).await;
-        let file = DmaFile::open_with(&path, libc::O_RDWR | libc::O_CREAT, 0o644).await?;
+        let file = OpenOptions::new().read(true).write(true).create(true).open_direct(&path).await?;
         let (map, valid) = replay(&file).await?;
         let keys = map.len();
         *self.map.borrow_mut() = map;
@@ -312,7 +306,7 @@ async fn switch_logs(
     // on, this file is all there is.
     fresh.sync().await?;
     rename(new_log_path(directory, partition.shard), log_path(directory, partition.shard)).await?;
-    sync_directory(directory).await?;
+    sync_dir(directory).await?;
     fresh.get_ref().allocate(0, fresh.position() + PREALLOCATE).await?;
     partition.compactions.set(partition.compactions.get() + 1);
     Ok(fresh)
@@ -580,7 +574,7 @@ async fn check_layout(directory: &Path, shards: usize) -> starfish::Result<()> {
             result?;
             file.sync_all().await?;
             file.close().await?;
-            sync_directory(directory).await?;
+            sync_dir(directory).await?;
         }
     }
     Ok(())

@@ -852,16 +852,23 @@ another shard inside a [`submit_to`](crate::submit_to) closure.
 
 **Caveats**
 
-- `SO_REUSEPORT` is always set and cannot be turned off. Any process of
-  the same user can bind the same port and will receive a share of the
-  connections, and a second copy of a server starts without complaint.
+- `bind` sets `SO_REUSEPORT`, since that is what gives every shard its
+  own listener. With it, any process of the same user can bind the same
+  port and receive a share of the connections, and a second copy of a
+  server starts without complaint. To rule that out, bind with
+  [`BindOptions::new().reuse_port(false)`](crate::net::BindOptions): a
+  second bind then fails, and so only one shard can listen, which then
+  hands connections to the others as the `dispatcher` example does.
 - The kernel assigns each connection to a listener by hashing its
   addresses, once. A few busy, long-lived connections can load one shard
   far more than the others, and nothing moves them.
 - With one listener per shard, a shard that stops accepting (a stall, a
   full connection limit) leaves its share of new connections waiting in
   its own queue; the other shards do not take them.
-- The accept queue is 1024 connections long, fixed.
+- The accept queue is 1024 connections long unless
+  [`BindOptions::backlog`](crate::net::BindOptions::backlog) says
+  otherwise, and never longer than the kernel's own limit
+  (`net.core.somaxconn`).
 - `write` may send only part of the buffer. `write_all` sends everything,
   in as many steps as it takes, so two tasks calling `write_all` on one
   stream at the same time can interleave their data. Give each stream one
@@ -1011,7 +1018,8 @@ async fn udp_echo() -> std::io::Result<()> {
   peer that sends a great deal loads one shard.
 - `connect` on a UDP socket only sets the peer; nothing is exchanged, and
   datagrams from anyone else are discarded by the kernel from then on.
-- As with TCP, `SO_REUSEPORT` cannot be turned off.
+- As with TCP, the port is shared unless the socket is bound with
+  [`BindOptions::new().reuse_port(false)`](crate::net::BindOptions).
 
 # Unix-domain sockets
 
@@ -1102,7 +1110,7 @@ async fn files() -> std::io::Result<()> {
 
 | Call | Does |
 |---|---|
-| `open`, `create`, `open_with` | Open for reading; create or truncate; raw `open(2)` flags |
+| `open`, `create`, `OpenOptions`, `open_with` | Open for reading; create or truncate; any combination in words; raw `open(2)` flags |
 | `read_at`, `write_at`, `write_all_at` | Transfer data at an offset |
 | `sync_all`, `sync_data` | Flush to the device, with or without all metadata |
 | `size`, `set_len`, `allocate` | Ask, set and reserve the length |
@@ -1112,7 +1120,12 @@ async fn files() -> std::io::Result<()> {
 
 - `File::open` opens for reading only, and `File::create` truncates an
   existing file. For anything else (append, read-write without
-  truncating, exclusive creation) pass the flags to `open_with`.
+  truncating, exclusive creation) use
+  [`OpenOptions`](crate::fs::OpenOptions).
+- A file opened for appending puts every write at its end, whatever
+  offset the write names. That is the kernel's rule, and it is what makes
+  appending safe from several writers; it also means `write_at` cannot
+  be used to change such a file in the middle.
 - Data is not safe until a sync returns. A successful write has only
   reached the page cache.
 - `read_at` returning fewer bytes than the buffer holds means the end of
@@ -1275,7 +1288,8 @@ Free functions in [`fs`](crate::fs) cover the rest:
 [`create_dir_all`](crate::fs::create_dir_all),
 [`remove_dir`](crate::fs::remove_dir),
 [`remove_file`](crate::fs::remove_file), [`rename`](crate::fs::rename),
-[`read_dir`](crate::fs::read_dir) and [`metadata`](crate::fs::metadata).
+[`read_dir`](crate::fs::read_dir), [`metadata`](crate::fs::metadata) and
+[`sync_dir`](crate::fs::sync_dir).
 
 ```rust,no_run
 use starfish::fs::{create_dir_all, read_dir, rename, File};
@@ -1310,8 +1324,9 @@ async fn replace(dir: &str, name: &str, contents: Vec<u8>) -> std::io::Result<()
   the order matters.
 - `rename` replaces the target if it exists, and both names must be on
   the same filesystem. It is atomic for readers, but it only survives a
-  crash once the directory itself has been synced; the `atomic_update`
-  example shows how.
+  crash once the directory itself has been synced with
+  [`sync_dir`](crate::fs::sync_dir). The same goes for creating and
+  removing files. The `atomic_update` example shows the whole sequence.
 - `create_dir_all` and `read_dir` are sequences of steps, not atomic:
   another process changing the same directories at the same time can
   make them fail or return a listing that was never true at one instant.

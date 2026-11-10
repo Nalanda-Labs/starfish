@@ -458,6 +458,158 @@ pub async fn read_dir(path: impl AsRef<Path>) -> io::Result<Vec<DirEntry>> {
     .await?
 }
 
+/// Makes a change to a directory durable: a file created, removed or
+/// renamed in it survives a crash only once this has returned.
+///
+/// A directory is itself a file, of names, and like any file it has to be
+/// synced. Syncing the file whose name changed is not enough.
+pub async fn sync_dir(path: impl AsRef<Path>) -> io::Result<()> {
+    let directory = File::open_with(path, libc::O_RDONLY | libc::O_DIRECTORY, 0).await?;
+    directory.sync_all().await?;
+    directory.close().await
+}
+
+/// How a file is opened: for reading or writing, and what happens if it
+/// does or does not exist. It works like `std::fs::OpenOptions`.
+///
+/// ```no_run
+/// use starfish::fs::OpenOptions;
+///
+/// # async fn example() -> std::io::Result<()> {
+/// // Read and write an existing file, without emptying it.
+/// let file = OpenOptions::new().read(true).write(true).open("/var/data/table").await?;
+///
+/// // A new file that must not exist yet.
+/// let lock = OpenOptions::new().write(true).create_new(true).open("/var/data/LOCK").await?;
+///
+/// // A log that every write is added to the end of.
+/// let log = OpenOptions::new().append(true).create(true).open("/var/log/events").await?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenOptions {
+    read: bool,
+    write: bool,
+    append: bool,
+    create: bool,
+    create_new: bool,
+    truncate: bool,
+    mode: u32,
+}
+
+impl Default for OpenOptions {
+    fn default() -> Self {
+        OpenOptions::new()
+    }
+}
+
+impl OpenOptions {
+    /// Nothing set: add at least [`read`](Self::read),
+    /// [`write`](Self::write) or [`append`](Self::append).
+    pub fn new() -> OpenOptions {
+        OpenOptions {
+            read: false,
+            write: false,
+            append: false,
+            create: false,
+            create_new: false,
+            truncate: false,
+            mode: 0o644,
+        }
+    }
+
+    /// Open for reading.
+    pub fn read(mut self, read: bool) -> OpenOptions {
+        self.read = read;
+        self
+    }
+
+    /// Open for writing.
+    pub fn write(mut self, write: bool) -> OpenOptions {
+        self.write = write;
+        self
+    }
+
+    /// Open for writing, with every write going to the end of the file
+    /// whatever offset it names. The kernel places each write, so several
+    /// writers, even several processes, do not overwrite each other.
+    pub fn append(mut self, append: bool) -> OpenOptions {
+        self.append = append;
+        self
+    }
+
+    /// Create the file if it does not exist.
+    pub fn create(mut self, create: bool) -> OpenOptions {
+        self.create = create;
+        self
+    }
+
+    /// Create the file, and fail with `AlreadyExists` if it exists. The
+    /// check and the creation are one step, so of several programs trying
+    /// at once exactly one succeeds.
+    pub fn create_new(mut self, create_new: bool) -> OpenOptions {
+        self.create_new = create_new;
+        self
+    }
+
+    /// Empty the file if it exists.
+    pub fn truncate(mut self, truncate: bool) -> OpenOptions {
+        self.truncate = truncate;
+        self
+    }
+
+    /// The permission bits a newly created file gets, before the
+    /// process's umask is taken off. Default `0o644`.
+    pub fn mode(mut self, mode: u32) -> OpenOptions {
+        self.mode = mode;
+        self
+    }
+
+    fn flags(&self) -> io::Result<i32> {
+        let writing = self.write || self.append;
+        let access = match (self.read, writing) {
+            (true, true) => libc::O_RDWR,
+            (true, false) => libc::O_RDONLY,
+            (false, true) => libc::O_WRONLY,
+            (false, false) => return Err(invalid("a file is opened for reading, writing or both")),
+        };
+        if !writing && (self.create || self.create_new || self.truncate) {
+            return Err(invalid("creating or emptying a file needs it opened for writing"));
+        }
+        let mut flags = access;
+        if self.append {
+            flags |= libc::O_APPEND;
+        }
+        if self.create_new {
+            flags |= libc::O_CREAT | libc::O_EXCL;
+        } else if self.create {
+            flags |= libc::O_CREAT;
+        }
+        if self.truncate {
+            flags |= libc::O_TRUNC;
+        }
+        Ok(flags)
+    }
+
+    /// Opens a file through the page cache.
+    pub async fn open(&self, path: impl AsRef<Path>) -> io::Result<File> {
+        File::open_with(path, self.flags()?, self.mode).await
+    }
+
+    /// Opens a file for direct I/O.
+    ///
+    /// Appending does not go with direct I/O's whole-block writes at
+    /// stated offsets; use a
+    /// [`DmaStreamWriter`](crate::fs::DmaStreamWriter) for that.
+    pub async fn open_direct(&self, path: impl AsRef<Path>) -> io::Result<DmaFile> {
+        if self.append {
+            return Err(invalid("a file opened for direct I/O cannot be in append mode"));
+        }
+        DmaFile::open_with(path, self.flags()?, self.mode).await
+    }
+}
+
 /// An open file. There is no cursor: every read and write names its offset,
 /// so concurrent operations on one file do not interfere.
 pub struct File {
@@ -476,7 +628,8 @@ impl File {
         File::open_with(path, libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC, 0o644).await
     }
 
-    /// Opens a file with raw `open(2)` flags and creation mode.
+    /// Opens a file with raw `open(2)` flags and creation mode. For the
+    /// usual combinations, [`OpenOptions`] says the same in words.
     pub async fn open_with(path: impl AsRef<Path>, flags: i32, mode: u32) -> io::Result<File> {
         let fd = open_fd(path.as_ref(), flags, mode).await?;
         let info = stat_fd(&fd).await?;
