@@ -318,12 +318,13 @@ impl Task {
         if self.header().queued.swap(true, Ordering::AcqRel) {
             return;
         }
-        let home = self.header().shard.clone();
         let mut task = Some(self);
         let here = try_current();
         if let Some(shard) = &here {
-            if Arc::ptr_eq(&shard.shared, &home) {
-                // Woken on its own shard: straight onto the run queue.
+            let at_home = task.as_ref().is_some_and(|task| Arc::ptr_eq(&shard.shared, &task.header().shard));
+            if at_home {
+                // Woken on its own shard, which is nearly always: straight
+                // onto the run queue.
                 shard.run_queue.with(|queue| {
                     if let Some(task) = task.take() {
                         queue.push(task);
@@ -332,6 +333,8 @@ impl Task {
             }
         }
         let Some(task) = task else { return };
+        // Only a wake from elsewhere needs its own reference to the shard.
+        let home = task.header().shard.clone();
         match here {
             // From another shard of the same runtime: over the queue those
             // two shards share.
