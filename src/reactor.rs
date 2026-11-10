@@ -16,15 +16,24 @@ use slab::Slab;
 use crate::ioqueue::{Direction, IoScheduler, QueuedRequest};
 use crate::runtime::try_current;
 
-/// Completion of the eventfd read that wakes a sleeping shard.
+/// The tag of the eventfd read that wakes a sleeping shard. Tags are how
+/// a completion says which request it belongs to; ordinary operations use
+/// their slot number, and the largest numbers are kept for these special
+/// ones.
 const WAKE: u64 = u64::MAX;
-/// Completion of a cancel request; nobody waits for it.
+/// The tag of a cancel request. Its completion says only whether the
+/// cancel found its target; nobody waits for it.
 const CANCEL: u64 = u64::MAX - 1;
-/// Completion of a close that nobody waits for (see `close_detached`).
+/// The tag of a close that nobody waits for (see `close_detached`).
 const CLOSE: u64 = u64::MAX - 2;
-/// How often `push` flushes a full submission queue before giving up.
+/// How often `push` flushes a full submission queue before giving up. In
+/// practice one flush makes room; the bound is there so that a ring the
+/// kernel refuses to drain produces an error instead of a hang.
 const PUSH_ATTEMPTS: usize = 64;
 
+/// Where an operation is in its life: waiting in a disk queue, in the
+/// kernel, finished, or in one of two states in which its future is gone or
+/// satisfied but the kernel still holds its buffer.
 enum Stage {
     /// Waiting in a disk queue; the kernel has not seen it.
     Queued,
@@ -40,6 +49,10 @@ enum Stage {
     ResultTaken,
 }
 
+/// The reactor's record of one operation: its stage, the waker of the
+/// task waiting for it, the disk queue it belongs to if any, and the pieces
+/// needed for operations that report in two steps or whose buffer the
+/// reactor holds.
 struct OpState {
     stage: Stage,
     waker: Option<Waker>,
@@ -58,7 +71,7 @@ struct OpState {
     early: bool,
 }
 
-/// What `Reactor::poll_op` found.
+/// What `Reactor::poll_op` found when a future asked about its operation.
 enum OpPoll {
     /// Finished. Carries the buffer the reactor held, if it is free now.
     Done(i32, Option<Box<dyn Any>>),
@@ -70,7 +83,8 @@ enum OpPoll {
 }
 
 /// Errors from `io_uring_enter` that mean "try again", not "the ring is
-/// broken".
+/// broken": a timeout, an interrupted call, a ring that is momentarily
+/// busy.
 fn transient(err: &io::Error) -> bool {
     matches!(
         err.raw_os_error(),
@@ -79,7 +93,9 @@ fn transient(err: &io::Error) -> bool {
 }
 
 thread_local! {
-    /// The current shard's slice-timer ring, for `completions_pending`.
+    /// The current shard's slice-timer ring, for `completions_pending`. A raw
+    /// pointer, so that the check is a load and two reads with no bookkeeping;
+    /// it is null when the thread has no shard.
     static RING: Cell<*const IoUring> = const { Cell::new(std::ptr::null()) };
 }
 
@@ -111,7 +127,9 @@ pub(crate) fn completions_pending() -> bool {
 }
 
 /// What a turn of the reactor leaves for the shard to deal with once the
-/// reactor is no longer borrowed.
+/// reactor is no longer borrowed: tasks to wake and buffers to drop. Both
+/// are calls into code from outside the runtime, which must not happen
+/// while the reactor's state is in use.
 #[derive(Default)]
 pub(crate) struct Completions {
     /// Tasks to wake.
@@ -121,6 +139,13 @@ pub(crate) struct Completions {
     pub(crate) garbage: Vec<Box<dyn Any>>,
 }
 
+/// One shard's connection to the kernel: its io_uring, the operations in
+/// progress on it, and the disk I/O scheduler that decides when file
+/// requests are handed over.
+///
+/// There are two rings. The main one carries every operation. The second
+/// carries only the timer that ends a time slice, so that "has the slice
+/// run out" can be answered by looking at that ring alone.
 pub(crate) struct Reactor {
     ring: IoUring,
     /// Carries nothing but the slice timer.
@@ -149,6 +174,9 @@ pub(crate) struct Reactor {
 }
 
 impl Reactor {
+    /// A reactor over the given rings. `disabled` says that the main ring was
+    /// created disabled and has to be enabled by the thread that will use it.
+    /// `quota` is the length of a time slice.
     pub(crate) fn new(
         ring: IoUring,
         disabled: bool,
@@ -223,6 +251,8 @@ impl Reactor {
         let _ = RING.try_with(|ring| ring.set(&self.preempt));
     }
 
+    /// Withdraws the ring `publish` announced. Called before the reactor is
+    /// dropped, so that the pointer never dangles.
     pub(crate) fn unpublish() {
         let _ = RING.try_with(|ring| ring.set(std::ptr::null()));
     }
@@ -255,7 +285,8 @@ impl Reactor {
         Ok(())
     }
 
-    /// Queues an entry, flushing to the kernel when the queue is full.
+    /// Queues an entry on the main ring, flushing to the kernel when the
+    /// queue is full and collecting completions to make room.
     fn push(&mut self, sqe: &squeue::Entry) -> io::Result<()> {
         for _ in 0..PUSH_ATTEMPTS {
             // SAFETY: callers guarantee the entry's pointers stay valid until
@@ -287,7 +318,9 @@ impl Reactor {
         }
     }
 
-    /// Submits an operation straight to the kernel.
+    /// Submits an operation straight to the kernel: records it, tags the
+    /// entry with its slot number and queues it. Returns the slot number, which
+    /// is how the operation's future finds it again.
     fn submit_op(&mut self, sqe: squeue::Entry) -> io::Result<usize> {
         let key = self.ops.insert(OpState {
             stage: Stage::InKernel,
@@ -333,7 +366,9 @@ impl Reactor {
         Ok(key)
     }
 
-    /// Submits a disk operation through the I/O scheduler.
+    /// Submits a disk operation through the I/O scheduler: records it as
+    /// queued and lets the scheduler decide when it reaches the kernel. Returns
+    /// its slot number.
     fn submit_disk(
         &mut self,
         sqe: squeue::Entry,
@@ -396,6 +431,7 @@ impl Reactor {
         ring.submitter().register_buffers(buffers)
     }
 
+    /// The state of every device queue on this shard, for the statistics.
     pub(crate) fn device_stats(&self) -> Vec<crate::stats::DeviceStats> {
         self.disk.stats()
     }
@@ -443,6 +479,10 @@ impl Reactor {
         Ok(())
     }
 
+    /// Collects the completions the kernel has posted and updates each
+    /// operation's record: stores the result and queues the waiting task's
+    /// waker, or, for an operation whose future is gone, frees what was being
+    /// kept for it.
     fn reap(&mut self) {
         let mut completions = self.ring.completion();
         for cqe in &mut completions {
@@ -504,6 +544,7 @@ impl Reactor {
         Ok(self.take_completions())
     }
 
+    /// Hands over the wakers and buffers gathered since the last call.
     fn take_completions(&mut self) -> Completions {
         Completions {
             wakers: std::mem::take(&mut self.ready),
@@ -607,6 +648,9 @@ impl Reactor {
         }
     }
 
+    /// Whether the kernel still holds anything of ours: an operation, a
+    /// buffer, a pending close or the wake-up read. Shutdown waits until it
+    /// does not.
     fn in_flight(&self) -> bool {
         self.wake_armed
             || self.closing > 0
@@ -689,6 +733,8 @@ pub(crate) fn close_fd(fd: RawFd) {
     }
 }
 
+/// A raw completion result as a `Result`: negative values are error
+/// numbers, the rest is a count or a descriptor.
 fn to_result(result: i32) -> io::Result<u32> {
     if result < 0 {
         Err(io::Error::from_raw_os_error(result.saturating_neg()))
@@ -697,6 +743,9 @@ fn to_result(result: i32) -> io::Result<u32> {
     }
 }
 
+/// Closes a file descriptor that an operation produced after its future
+/// was dropped. Without this, a cancelled `accept` or `open` that completed
+/// anyway would leak the descriptor.
 fn close_orphan(result_is_fd: bool, result: i32) {
     if result_is_fd && result >= 0 {
         // SAFETY: the kernel just handed us this fd and nobody else has it.
@@ -769,6 +818,8 @@ impl<D: Unpin + 'static> Op<D> {
         Op::from_submission(submitted, data)
     }
 
+    /// Makes the future for an operation that was, or could not be,
+    /// submitted.
     fn from_submission(submitted: io::Result<usize>, data: D) -> Op<D> {
         let (key, error) = match submitted {
             Ok(key) => (Some(key), None),
@@ -792,8 +843,15 @@ impl<D: Unpin + 'static> Op<D> {
 }
 
 impl<D: Unpin + 'static> Future for Op<D> {
+    /// The operation's result and the data that was lent to the kernel, which
+    /// is how a buffer comes back to its owner.
     type Output = (io::Result<u32>, D);
 
+    /// Completes with the result once the kernel has reported it; until then,
+    /// leaves the task's waker with the reactor.
+    ///
+    /// An operation that could not be submitted completes at once with the
+    /// error.
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
         let Some(key) = this.key else {
@@ -833,6 +891,10 @@ impl<D: Unpin + 'static> Future for Op<D> {
 }
 
 impl<D: Unpin + 'static> Drop for Op<D> {
+    /// Lets go of the operation. If the kernel is still working on it, its
+    /// data is handed to the reactor to keep until the kernel is done, and the
+    /// kernel is asked to cancel; freeing the data here would let the kernel
+    /// write into freed memory.
     fn drop(&mut self) {
         let Some(data) = self.data.take() else { return };
         // Never submitted: the kernel has no pointer to the data.
@@ -912,8 +974,12 @@ impl HeldOp {
 }
 
 impl Future for HeldOp {
+    /// How much the kernel accepted, or the error. The buffer does not come
+    /// back: the reactor holds it until the kernel releases it.
     type Output = io::Result<u32>;
 
+    /// Completes with the outcome as soon as the kernel has reported it,
+    /// without waiting for the kernel to release the buffer.
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let Some(key) = self.key else {
             return match self.error.take() {
@@ -944,6 +1010,9 @@ impl Future for HeldOp {
 }
 
 impl Drop for HeldOp {
+    /// Tells the reactor that nobody waits for the result any more. The
+    /// buffer is already the reactor's and stays with it until the kernel lets
+    /// go.
     fn drop(&mut self) {
         let (Some(key), Some(shard)) = (self.key, try_current()) else {
             return;

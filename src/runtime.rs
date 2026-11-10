@@ -41,10 +41,20 @@ use crate::timer::Timers;
 pub(crate) struct Local<T>(RefCell<T>);
 
 impl<T> Local<T> {
+    /// Wraps a value as a shard's own.
     pub(crate) fn new(value: T) -> Local<T> {
         Local(RefCell::new(value))
     }
 
+    /// Runs `f` with exclusive access to the value and returns what it
+    /// returns, or `None` if the value is already in use further up the call
+    /// stack.
+    ///
+    /// `None` is how a mistake that would be a panic with a plain `RefCell`
+    /// shows up here instead. Every caller treats it as "could not be done" and
+    /// carries on in whatever way is safe. Following the rule in the type's
+    /// documentation, that the closure runs runtime code only, keeps it from ever
+    /// happening.
     pub(crate) fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> Option<R> {
         match self.0.try_borrow_mut() {
             Ok(mut value) => Some(f(&mut value)),
@@ -54,6 +64,10 @@ impl<T> Local<T> {
 }
 
 /// Drops a user-supplied value, containing a panic from its `Drop`.
+///
+/// The runtime drops values of the application's all the time: futures,
+/// outputs, buffers, wakers. A destructor that panics must not take the
+/// shard down with it, so such drops go through here.
 pub(crate) fn drop_quietly<T>(value: T) {
     if let Err(payload) = catch_unwind(AssertUnwindSafe(move || drop(value))) {
         discard_panic(payload);
@@ -69,7 +83,9 @@ pub(crate) fn discard_panic(payload: Box<dyn Any + Send>) {
     }
 }
 
-/// The text a panic carried, if it carried text.
+/// The text a panic carried, if it carried text: a `&str`, as
+/// `panic!("literal")` produces, or a `String`, as a formatted `panic!`
+/// does. Any other payload has no message.
 pub(crate) fn panic_message(payload: &(dyn Any + Send)) -> Option<String> {
     match payload.downcast_ref::<&'static str>() {
         Some(text) => Some((*text).to_owned()),
@@ -79,6 +95,11 @@ pub(crate) fn panic_message(payload: &(dyn Any + Send)) -> Option<String> {
 
 /// Makes a future and runs it to the end, turning a panic, in the making
 /// or in the running, into an error that holds the panic's message.
+///
+/// This is the boundary at which the runtime contains panics in code it
+/// runs on someone's behalf without a task of its own: a call that runs in
+/// place, a call run for another shard, the main future. After a panic the
+/// future is not polled again; it is dropped when this function returns.
 pub(crate) async fn catch_panic<F: Future>(make: impl FnOnce() -> F) -> std::result::Result<F::Output, Option<String>> {
     let caught = |payload: Box<dyn Any + Send>| {
         let message = panic_message(&*payload);
@@ -100,13 +121,17 @@ pub(crate) async fn catch_panic<F: Future>(make: impl FnOnce() -> F) -> std::res
 }
 
 /// Calls a waker that may not be ours, containing a panic from it.
+///
+/// Wakers reach the runtime from anywhere: from other executors, from
+/// libraries, from tests. Calling one is calling unknown code.
 pub(crate) fn wake_quietly(waker: Waker) {
     if let Err(payload) = catch_unwind(AssertUnwindSafe(move || waker.wake())) {
         discard_panic(payload);
     }
 }
 
-/// A message delivered to a shard from another thread.
+/// A message delivered to a shard from another thread: a task to make
+/// runnable, a closure to run, or the order to stop.
 pub(crate) enum Message {
     /// A task owned by the receiving shard was woken from elsewhere.
     Wake(Task),
@@ -117,16 +142,23 @@ pub(crate) enum Message {
 }
 
 /// How many turns of the event loop pass before the application is asked
-/// for memory again, after a request that left the heap over its limit.
+/// for memory again, after a request that left the heap over its limit. A
+/// reclaimer with nothing left to give should not be called thousands of
+/// times a second.
 const RECLAIM_BACKOFF: u64 = 64;
 /// How many messages fit in the queue between two shards before the
-/// sender has to hold further ones back.
+/// sender has to hold further ones back in its own memory.
 const SMP_QUEUE_LENGTH: usize = 128;
 /// How long a shard sleeps at most while it still holds messages that did
-/// not fit into a full queue.
+/// not fit into a full queue. The receiving shard drains its queue without
+/// telling anyone, so the sender has to look again by itself.
 const SMP_RETRY: Duration = Duration::from_micros(50);
 
-/// The part of a shard that other threads may touch.
+/// The part of a shard that other threads may touch: its number, the way
+/// to send it a message from outside the runtime, whether it is asleep, and
+/// the eventfd that wakes it.
+///
+/// Everything else a shard has belongs to its thread alone.
 pub(crate) struct ShardShared {
     pub(crate) id: usize,
     /// Messages from threads that are not shards of this runtime. Shards
@@ -139,7 +171,8 @@ pub(crate) struct ShardShared {
 
 impl ShardShared {
     /// A shard that exists only as a destination for wake-ups, with the
-    /// receiving end of its inbox.
+    /// receiving end of its inbox, so that the task type can be tested without a
+    /// running event loop.
     #[cfg(test)]
     pub(crate) fn for_test() -> (Arc<ShardShared>, Receiver<Message>) {
         let (alien, receiver) = channel();
@@ -165,6 +198,11 @@ impl ShardShared {
     }
 
     /// Makes sure the shard notices a message that was just queued for it.
+    ///
+    /// A shard that is running will find the message on its next turn, and
+    /// nothing needs doing. Only one that is asleep in the kernel has to be
+    /// woken, by a write to its eventfd, which is a system call; the `sleeping`
+    /// flag is what lets a sender skip that call nearly always.
     fn notify(&self) {
         // Only pay for the eventfd write when the shard is actually asleep.
         if self.sleeping.swap(false, Ordering::SeqCst) {
@@ -177,7 +215,8 @@ impl ShardShared {
     }
 }
 
-/// One shard's sending end towards another shard.
+/// One shard's sending end towards another shard: the lock-free queue, the
+/// messages that did not fit into it yet, and the shard to wake.
 struct Outgoing {
     queue: Producer<Message>,
     /// Messages that did not fit into the queue yet, oldest first. Its
@@ -188,6 +227,8 @@ struct Outgoing {
 }
 
 impl Outgoing {
+    /// Sends a message, or holds it back if the queue is full or earlier
+    /// messages are already held back, so that the order is kept.
     fn send(&mut self, msg: Message) {
         if !self.overflow.is_empty() {
             // Keep the order: the new message goes behind the held ones.
@@ -201,7 +242,8 @@ impl Outgoing {
         }
     }
 
-    /// Moves held messages into the queue. Returns whether some remain.
+    /// Moves held messages into the queue, as many as fit, and wakes the
+    /// receiver if any went. Returns whether some remain.
     fn flush(&mut self) -> bool {
         let mut moved = false;
         while let Some(msg) = self.overflow.pop_front() {
@@ -220,7 +262,9 @@ impl Outgoing {
     }
 }
 
-/// Everything a shard thread is handed at start-up.
+/// Everything a shard thread is handed at start-up. It is put together on
+/// the thread that starts the runtime, where a failure can be reported, and
+/// moved to the shard's own thread.
 struct ShardParts {
     shared: Arc<ShardShared>,
     alien: Receiver<Message>,
@@ -237,6 +281,8 @@ struct ShardParts {
     incoming: Vec<Consumer<Message>>,
 }
 
+/// What the shards of one runtime have in common: each other's shared
+/// parts, the table of scheduling groups, and the first fatal error.
 pub(crate) struct RuntimeShared {
     pub(crate) shards: Vec<Arc<ShardShared>>,
     pub(crate) groups: Arc<GroupTable>,
@@ -246,7 +292,8 @@ pub(crate) struct RuntimeShared {
 
 impl RuntimeShared {
     /// Records a fatal shard error and stops every shard, so that
-    /// [`Runtime::run`] returns the error.
+    /// [`Runtime::run`] returns the error. Only the first error is kept: the
+    /// later ones are usually consequences of it.
     fn fail(&self, err: io::Error) {
         {
             let mut failure = self.failure.lock().unwrap_or_else(PoisonError::into_inner);
@@ -259,12 +306,17 @@ impl RuntimeShared {
         }
     }
 
+    /// The first fatal error any shard hit, if one did.
     fn take_failure(&self) -> Option<io::Error> {
         self.failure.lock().unwrap_or_else(PoisonError::into_inner).take()
     }
 }
 
-/// All state owned by one shard thread.
+/// All state owned by one shard thread: its reactor, run queues, timers,
+/// services, buffer pool, task table and message queues.
+///
+/// Each piece that is mutated sits in its own [`Local`] cell, so that code
+/// working on one of them can call into another.
 pub(crate) struct Shard {
     pub(crate) shared: Arc<ShardShared>,
     pub(crate) runtime: Arc<RuntimeShared>,
@@ -296,10 +348,14 @@ pub(crate) struct Shard {
 }
 
 thread_local! {
+    /// The shard running on this thread, if any. Set for the duration of
+    /// [`Runtime::run`] on shard 0's thread and for the life of each worker
+    /// thread.
     static CURRENT: RefCell<Option<Rc<Shard>>> = const { RefCell::new(None) };
 }
 
-/// The shard running on this thread, if any.
+/// The shard running on this thread, if any. `None` on a thread that is
+/// not a shard, and during the thread's teardown.
 pub(crate) fn try_current() -> Option<Rc<Shard>> {
     CURRENT
         .try_with(|current| current.try_borrow().ok().and_then(|shard| shard.clone()))
@@ -307,21 +363,36 @@ pub(crate) fn try_current() -> Option<Rc<Shard>> {
         .flatten()
 }
 
+/// The shard running on this thread, or [`Error::NoRuntime`].
 pub(crate) fn current() -> Result<Rc<Shard>> {
     try_current().ok_or(Error::NoRuntime)
 }
 
-/// The index of the shard the caller is running on.
+/// The index of the shard the caller is running on, from 0 to
+/// [`shard_count`]` - 1`. Shard 0 is the one that runs the future given to
+/// [`Runtime::run`].
+///
+/// # Errors
+///
+/// [`Error::NoRuntime`] outside a runtime.
 pub fn shard_id() -> Result<usize> {
     Ok(current()?.shared.id)
 }
 
-/// The number of shards in the running runtime.
+/// The number of shards in the running runtime. It is fixed when the
+/// runtime starts.
+///
+/// # Errors
+///
+/// [`Error::NoRuntime`] outside a runtime.
 pub fn shard_count() -> Result<usize> {
     Ok(current()?.runtime.shards.len())
 }
 
 impl Shard {
+    /// Builds a shard from its parts. Called on the shard's own thread, after
+    /// that thread has taken a heap, so that everything the shard owns is
+    /// allocated from its own heap.
     fn new(
         parts: ShardParts,
         runtime: Arc<RuntimeShared>,
@@ -399,6 +470,12 @@ impl Shard {
         task
     }
 
+    /// Polls one task, and if that finishes it, takes it out of the task
+    /// table.
+    ///
+    /// The table entry is compared with the task before it is removed, because
+    /// a wake-up for a task that has already finished can arrive after its place
+    /// has been given to a new one.
     fn run_task(&self, task: Task) {
         // SAFETY: tasks only reach this shard's run queue if it spawned
         // them, and the loop that calls this is not inside any task.
@@ -418,12 +495,16 @@ impl Shard {
         }
     }
 
+    /// How many tasks exist on the shard, runnable or waiting.
     pub(crate) fn task_count(&self) -> usize {
         self.tasks.with(|tasks| tasks.len()).unwrap_or(0)
     }
 
-    /// Sends a message to another shard of this runtime over the queue the
-    /// two shards share.
+    /// Sends a message to another shard of this runtime over the queue the two
+    /// shards share.
+    ///
+    /// If that queue cannot be used right now, the message goes the way
+    /// messages from outside the runtime go, which is slower but always works.
     pub(crate) fn send_to(&self, target: usize, msg: Message) {
         stats::add(&self.stats.messages_sent, 1);
         let mut msg = Some(msg);
@@ -445,7 +526,8 @@ impl Shard {
     }
 
     /// Retries messages that did not fit into a full queue. Returns whether
-    /// some are still held back.
+    /// some are still held back, in which case the shard must not sleep for
+    /// long.
     fn flush_outgoing(&self) -> bool {
         self.outgoing
             .with(|outgoing| {
@@ -460,8 +542,11 @@ impl Shard {
             .unwrap_or(false)
     }
 
-    /// Handles everything other threads have sent. Returns whether there was
-    /// anything.
+    /// Handles everything other threads have sent: wake-ups, closures to run,
+    /// the order to stop. Returns whether there was anything.
+    ///
+    /// The messages are collected first and acted on afterwards, because acting
+    /// on one runs runtime code that may itself send or receive.
     fn drain_inbox(&self) -> bool {
         // Collect first, then act: handling a message runs runtime code
         // that may itself send messages.
@@ -491,6 +576,7 @@ impl Shard {
         any
     }
 
+    /// Wakes the tasks whose timers are due.
     fn fire_timers(&self) {
         let expired = self.timers.with(|timers| timers.expired(Instant::now()));
         for waker in expired.unwrap_or_default() {
@@ -500,6 +586,10 @@ impl Shard {
 
     /// The event loop. Returns when the shard is asked to stop, or with the
     /// error that made its io_uring unusable.
+    ///
+    /// Each turn runs one scheduling group's tasks for at most a time slice,
+    /// then handles messages, timers and I/O completions, and sleeps in the
+    /// kernel when there is nothing left to do.
     fn run(&self) -> io::Result<()> {
         loop {
             stats::add(&self.stats.loops, 1);
@@ -640,7 +730,8 @@ impl Shard {
     }
 
     /// Records a slice that ran past the stall threshold and tells the
-    /// application, if it asked to be told.
+    /// application, if it asked to be told. A panic in the application's handler
+    /// is contained.
     fn report_stall(&self, group: usize, duration: Duration) {
         stats::add(&self.stats.stalls, 1);
         let nanos = stats::nanos(duration);
@@ -663,8 +754,9 @@ impl Shard {
         }
     }
 
-    /// Asks the application to free memory while this shard's heap is over
-    /// its limit.
+    /// Asks the application to free memory while this shard's heap is over its
+    /// limit, by calling the functions registered for that. They are called
+    /// outside any borrow, with panics contained.
     fn reclaim_memory(&self) {
         if !crate::alloc::over_limit() {
             return;
@@ -686,10 +778,16 @@ impl Shard {
         }
     }
 
+    /// Asks the event loop to stop at the end of its current turn.
     pub(crate) fn request_stop(&self) {
         self.stop.set(true);
     }
 
+    /// Tears the shard down: drops every task, service, timer and reclaimer,
+    /// then waits for the kernel to let go of every buffer.
+    ///
+    /// Dropping a task or a service may spawn more of either, so the first step
+    /// repeats until nothing is left.
     fn shutdown(&self) {
         // Dropping a task or a service may spawn more of either, so repeat
         // until nothing is left. Each value is dropped outside any borrow
@@ -725,10 +823,19 @@ impl Shard {
     }
 }
 
-/// Installs a shard as the current one and tears it down on drop.
+/// Installs a shard as the current one and tears it down on drop. Holds
+/// the shard's stall timer, if it has one.
 struct Entered(Rc<Shard>, Option<StallTimer>);
 
 impl Entered {
+    /// Makes `shard` the current shard of this thread: enables its ring,
+    /// publishes its preemption timer, sets its memory limit and starts its
+    /// stall timer.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::AlreadyRunning`] if the thread already has a shard, and the
+    /// kernel's error if the ring cannot be enabled.
     fn new(shard: Rc<Shard>) -> Result<Entered> {
         let installed = CURRENT.try_with(|current| match current.try_borrow_mut() {
             Ok(mut current) if current.is_none() => {
@@ -768,6 +875,9 @@ impl Entered {
 }
 
 impl Drop for Entered {
+    /// Stops the stall timer, shuts the shard down and clears the thread's
+    /// current shard, in that order: the shard must still be current while its
+    /// tasks are being dropped, since their destructors may use it.
     fn drop(&mut self) {
         self.1 = None;
         self.0.shutdown();
@@ -778,13 +888,16 @@ impl Drop for Entered {
     }
 }
 
-/// Stops and joins the worker shards on drop.
+/// Stops and joins the worker shards on drop, so that
+/// [`Runtime::run`] never returns while one of its threads is running,
+/// whichever way it returns.
 struct Workers {
     runtime: Arc<RuntimeShared>,
     threads: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for Workers {
+    /// Tells every worker to stop and waits for its thread to end.
     fn drop(&mut self) {
         for shard in self.runtime.shards.iter().skip(1) {
             shard.send_alien(Message::Stop);
@@ -798,10 +911,11 @@ impl Drop for Workers {
 }
 
 /// Stops the shard when the main task ends, whether it returned, panicked
-/// or was dropped.
+/// or was dropped. Held by the main task for exactly that purpose.
 struct StopOnDrop;
 
 impl Drop for StopOnDrop {
+    /// Asks the shard to stop.
     fn drop(&mut self) {
         if let Some(shard) = try_current() {
             shard.request_stop();
@@ -810,7 +924,8 @@ impl Drop for StopOnDrop {
 }
 
 /// Upper bound on the shard count, so that a nonsensical request fails
-/// cleanly instead of exhausting memory.
+/// cleanly instead of exhausting memory. It is also how many heaps the
+/// allocator has room for.
 const MAX_SHARDS: usize = 1024;
 
 /// What to call after a stall.
@@ -818,11 +933,13 @@ const MAX_SHARDS: usize = 1024;
 struct StallHandler(Arc<dyn Fn(&StallReport) + Send + Sync>);
 
 impl std::fmt::Debug for StallHandler {
+    /// Prints `StallHandler`; the closure has no useful form.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("StallHandler")
     }
 }
 
+/// The settings every shard needs a copy of.
 #[derive(Clone, Debug)]
 struct ShardConfig {
     task_quota: Duration,
@@ -836,6 +953,27 @@ struct ShardConfig {
 }
 
 /// Configures and runs a runtime.
+///
+/// It is a builder: start with [`new`](Self::new), change what needs
+/// changing with the methods that take and return `Runtime`, and call
+/// [`run`](Self::run), which starts the shards and does not return until
+/// the program's main future has finished.
+///
+/// ```no_run
+/// use std::time::Duration;
+/// use starfish::Runtime;
+///
+/// fn main() -> starfish::Result<()> {
+///     Runtime::new()
+///         .shards(4)
+///         .task_quota(Duration::from_millis(1))
+///         .run(|| async {
+///             // ... the program ...
+///         })
+/// }
+/// ```
+///
+/// A `Runtime` does nothing until `run` is called.
 #[derive(Debug)]
 #[must_use = "a runtime does nothing until `run` is called"]
 pub struct Runtime {
@@ -849,13 +987,19 @@ pub struct Runtime {
 }
 
 impl Default for Runtime {
+    /// A runtime with the default settings, as [`Runtime::new`].
     fn default() -> Self {
         Runtime::new()
     }
 }
 
 impl Runtime {
-    /// A runtime with one shard per CPU the process is allowed to run on.
+    /// A runtime with one shard per CPU the process is allowed to run on, and
+    /// every other setting at its default.
+    ///
+    /// "Allowed" is the thread's CPU affinity when this is called, which is what
+    /// `taskset`, a container's CPU set or a batch scheduler restrict. A process
+    /// confined to four of a machine's sixty-four CPUs gets four shards.
     pub fn new() -> Runtime {
         let shards = match affinity::allowed_cpus().len() {
             0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
@@ -882,18 +1026,32 @@ impl Runtime {
     }
 
     /// Sets the number of shards, clamped to `1..=1024`.
+    ///
+    /// One per CPU is the design: fewer leaves CPUs unused, and more puts
+    /// several shards on one CPU, where they only get in each other's way.
+    /// Programs whose data is laid out by shard must use the same number every
+    /// time they run.
     pub fn shards(mut self, shards: usize) -> Runtime {
         self.shards = shards.clamp(1, MAX_SHARDS);
         self
     }
 
     /// Whether to pin each shard to its own CPU. On by default.
+    ///
+    /// Pinned, a shard's data stays in one CPU's caches and the operating system
+    /// does not move it. Turn it off for tests, where many small runtimes run at
+    /// once, and on machines shared with other work.
     pub fn pin_threads(mut self, pin: bool) -> Runtime {
         self.pin = pin;
         self
     }
 
-    /// Sets the submission queue size of each shard's io_uring.
+    /// Sets the submission queue size of each shard's io_uring: how many
+    /// operations can be queued between two turns of the event loop before the
+    /// shard has to hand them to the kernel early. Default 1024.
+    ///
+    /// It is not a limit on operations in progress. Raise it for shards that
+    /// start thousands of operations in one burst.
     pub fn ring_entries(mut self, entries: u32) -> Runtime {
         self.ring_entries = entries;
         self
@@ -960,6 +1118,12 @@ impl Runtime {
     }
 
     /// Calls `handler` on the shard's thread after every stall.
+    ///
+    /// The handler receives a [`StallReport`]. One handler serves all shards,
+    /// so it must be `Send` and `Sync`; it may capture such things as a counter
+    /// or the sending end of a channel to a logging thread. It runs between
+    /// tasks, on the shard that stalled: it should be quick and must not block.
+    /// A panic in it is caught and ignored.
     pub fn on_stall(mut self, handler: impl Fn(&StallReport) + Send + Sync + 'static) -> Runtime {
         self.config.on_stall = Some(StallHandler(Arc::new(handler)));
         self
@@ -1225,6 +1389,7 @@ impl Runtime {
     }
 }
 
+/// A new eventfd, close-on-exec, for waking a shard from another thread.
 fn new_eventfd() -> io::Result<OwnedFd> {
     // SAFETY: plain syscall; the returned fd is owned by nobody else.
     let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
@@ -1237,9 +1402,11 @@ fn new_eventfd() -> io::Result<OwnedFd> {
 mod affinity {
     use std::mem;
 
+    /// How many CPUs a CPU set can describe.
     const SET_SIZE: usize = libc::CPU_SETSIZE as usize;
 
-    /// The CPUs this thread may currently run on.
+    /// The CPUs this thread may currently run on, in ascending order. Empty
+    /// if the kernel would not say.
     pub(super) fn allowed_cpus() -> Vec<usize> {
         match get() {
             Some(set) => (0..SET_SIZE)
@@ -1250,7 +1417,8 @@ mod affinity {
         }
     }
 
-    /// Best effort: a failure leaves the thread unpinned.
+    /// Pins the calling thread to one CPU. Best effort: a failure leaves the
+    /// thread unpinned, which costs performance and nothing else.
     pub(super) fn pin_current_thread(cpu: usize) {
         if cpu >= SET_SIZE {
             return;
@@ -1263,6 +1431,7 @@ mod affinity {
         }
     }
 
+    /// The calling thread's current CPU set.
     fn get() -> Option<libc::cpu_set_t> {
         // SAFETY: the kernel fills a correctly sized set.
         unsafe {
@@ -1272,16 +1441,19 @@ mod affinity {
         }
     }
 
-    /// Restores the thread's original affinity mask on drop.
+    /// Restores the thread's original affinity mask on drop, so that the
+    /// thread that called `Runtime::run` is not left pinned afterwards.
     pub(super) struct Restore(Option<libc::cpu_set_t>);
 
     impl Restore {
+        /// Remembers the calling thread's CPU set as it is now.
         pub(super) fn capture() -> Restore {
             Restore(get())
         }
     }
 
     impl Drop for Restore {
+        /// Puts the remembered CPU set back.
         fn drop(&mut self) {
             if let Some(set) = &self.0 {
                 // SAFETY: `set` came from sched_getaffinity.
