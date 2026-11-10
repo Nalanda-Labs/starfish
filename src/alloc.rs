@@ -34,38 +34,97 @@ use std::cell::Cell;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
+/// Base-two logarithm of the page size. The allocator works in 4 KiB pages
+/// whatever the machine's page size is; every size the kernel is asked to
+/// commit is a multiple of 2 MiB, so a larger system page size still divides
+/// it.
 const PAGE_SHIFT: u32 = 12;
+/// Bytes in a page: 4096.
 const PAGE: usize = 1 << PAGE_SHIFT;
-/// Address space per heap: 32 GiB.
+/// Base-two logarithm of an area's size. An area is the address space of
+/// one heap: 32 GiB, which is therefore the most one shard can ever hold in
+/// its heap. Because every area has this size and they lie side by side, the
+/// heap that owns a pointer is found by shifting the pointer's offset in the
+/// region (see [`owner_of`]).
 const AREA_SHIFT: u32 = 35;
+/// Bytes of address space in one area: 32 GiB.
 const AREA: usize = 1 << AREA_SHIFT;
+/// Pages in one area: 2^23. Page indexes therefore fit a `u32` with room
+/// to spare, which is what [`PageDesc`] stores them in.
 const AREA_PAGES: usize = AREA >> PAGE_SHIFT;
-/// One heap per shard a runtime may have.
+/// How many areas the region has room for at most, which is one heap per
+/// shard a runtime may have. At 32 GiB each that is 32 TiB of address space;
+/// [`reserve_region`] settles for less where the process is not allowed that
+/// much.
 const MAX_HEAPS: usize = 1024;
 
+/// Bytes set aside at the start of an area for the [`Heap`] header. Far
+/// more than the header needs (an assertion below checks it fits); the round
+/// figure keeps the descriptor array page-aligned.
 const HEADER_BYTES: usize = 64 << 10;
+/// Bytes the descriptor array would occupy if every page of the area had
+/// its descriptor committed: 2^23 descriptors of 32 bytes, 256 MiB. Only
+/// address space; the array is committed as far as the heap has grown.
 const DESC_BYTES: usize = AREA_PAGES * std::mem::size_of::<PageDesc>();
-/// The heap grows by this many pages at a time (2 MiB).
+/// The heap grows by this many pages at a time (2 MiB), or a multiple of
+/// it for a request larger than that. 2 MiB is the size of a huge page on
+/// x86-64, so each step can be backed by one.
 const GROW_PAGES: usize = 512;
+/// Bytes in one growth step: 2 MiB. Also the alignment of the region and
+/// of the first data page.
 const GROW_BYTES: usize = GROW_PAGES << PAGE_SHIFT;
+/// Index of the first page that holds allocations. The pages before it
+/// are the header and the descriptor array; the sum of the two is rounded up
+/// to 2 MiB so that the data pages start on a huge-page boundary. It comes to
+/// about 258 MiB into the area. A page index below this never refers to a
+/// span, which is why index 0 can mean "none" in the lists.
 const FIRST_DATA_PAGE: usize =
     ((HEADER_BYTES + DESC_BYTES).div_ceil(GROW_BYTES) * GROW_BYTES) >> PAGE_SHIFT;
 
+/// How many size classes small objects come in. See [`class_table`] for
+/// the sizes.
 const CLASSES: usize = 36;
+/// The largest request served from a size class: 16 KiB. Anything larger
+/// gets a span of whole pages to itself.
 const MAX_SMALL: usize = 16 << 10;
+/// How many free lists the page level keeps. List `b` holds the free
+/// spans of 2^b to 2^(b+1) - 1 pages; the last one holds only a span that is
+/// the whole area, which the assertion below ties to the area's size.
 const BUCKETS: usize = 24;
+/// Checks that the last bucket is exactly the one for a span as large
+/// as the area, so [`bucket_of`] never needs a bucket that does not exist.
 const _: () = assert!(AREA_PAGES == 1 << (BUCKETS - 1));
 /// How many spans of the first candidate list are examined for a fit.
+/// Spans in the bucket a request maps to may be smaller than the request, so
+/// that list has to be searched; the search stops after this many, and the
+/// request is then served from a larger bucket, where any span fits. This
+/// bounds the cost of an allocation at the price of sometimes splitting a
+/// larger span than necessary.
 const SCAN_LIMIT: usize = 16;
 /// Freed spans of at least this many pages (1 MiB) have their memory
-/// returned to the operating system.
+/// returned to the operating system with `MADV_DONTNEED`. Smaller ones keep
+/// their memory, because they are likely to be reused soon and giving memory
+/// back and faulting it in again costs more than holding it.
 const RELEASE_PAGES: usize = 256;
 
 // Page states. Zero is what untouched descriptor memory reads as.
+/// State of a page that carries no information of its own: the middle of
+/// a span, or a page the heap has not used yet. It is zero because that is
+/// what freshly committed descriptor memory reads as.
 const INTERIOR: u8 = 0;
+/// State of the first page of a free span. Its descriptor holds the
+/// span's length and the links of the free list it is on.
 const FREE_HEAD: u8 = 1;
+/// State of the last page of a free span of two or more pages. Its
+/// descriptor points back at the span's first page, which is how a span being
+/// freed finds a free neighbour that ends just before it.
 const FREE_TAIL: u8 = 2;
+/// State of every page of a span that is cut into small objects. Each
+/// such page points at the span's first page, so the span of an object is
+/// found from the object's address in two steps.
 const SMALL: u8 = 3;
+/// State of the first page of a span allocated whole, for one large
+/// request. The other pages of the span are `INTERIOR`.
 const LARGE: u8 = 4;
 
 /// One per page. What the fields mean depends on `state`:
@@ -84,26 +143,52 @@ const LARGE: u8 = 4;
 /// doubles as "none" in links.
 #[repr(C)]
 struct PageDesc {
+    /// One of `INTERIOR`, `FREE_HEAD`, `FREE_TAIL`, `SMALL`, `LARGE`.
     state: u8,
+    /// Size class of a `SMALL` span; set on its first page only.
     class: u8,
+    /// Objects of a `SMALL` span that can be handed out: those freed and
+    /// those never used. Zero means the span is full and off its class's list.
     free_count: u16,
+    /// Objects of a `SMALL` span that were never handed out. They lie at
+    /// the end of the span, after the ones that were.
     fresh: u16,
+    /// Makes the layout explicit; unused.
     _pad: u16,
+    /// Length of the span in pages, on the first page of a free, small or
+    /// large span.
     span_pages: u32,
+    /// Index of the span's first page, on a `FREE_TAIL` page and on every
+    /// page of a `SMALL` span.
     span_head: u32,
+    /// Previous span in the list this one is on (a free list or a class's
+    /// list), or 0 if it is the first.
     prev: u32,
+    /// Next span in the list, or 0 if this is the last.
     next: u32,
+    /// First freed object of a `SMALL` span, or null. Freed objects are
+    /// chained through their first word.
     free_head: *mut u8,
 }
 
+/// Checks the descriptor's size: the layout of an area, and the cost of
+/// 256 MiB of address space for the array, are computed from it.
 const _: () = assert!(std::mem::size_of::<PageDesc>() == 32);
 
-/// The header at the start of an area. Only the owning thread touches it,
-/// except for `remote`.
+/// The header at the start of an area: everything a heap knows about
+/// itself apart from the per-page descriptors. Only the owning thread touches
+/// it, except for `remote`, which any thread may push to.
+///
+/// It lives in memory the allocator commits itself and is never constructed
+/// as a value: a freshly committed header is all zeros, which is the empty
+/// state of every list and counter, and [`enter`] sets the three fields that
+/// are not zero. It is always handled through a raw pointer, because a
+/// reference would claim exclusive access that `remote` does not have.
 #[repr(C)]
 struct Heap {
     /// Objects freed by other threads, linked through their first word.
     remote: AtomicPtr<u8>,
+    /// Address of the area, which is the address of this header.
     base: usize,
     /// Pages below this index are committed.
     top: usize,
@@ -113,23 +198,38 @@ struct Heap {
     pools: [u32; CLASSES],
     /// Per size bucket: the first free span.
     free_spans: [u32; BUCKETS],
+    /// Bytes in live allocations, at the size reserved for each.
     allocated_bytes: usize,
     /// Above this many allocated bytes the shard asks for memory back.
     /// Zero means no limit.
     limit: usize,
 }
 
+/// Checks that the header fits the space the layout gives it.
 const _: () = assert!(std::mem::size_of::<Heap>() <= HEADER_BYTES);
 
+/// What the allocator needs to know about one size class.
 #[derive(Clone, Copy)]
 struct ClassInfo {
+    /// Size of an object of the class in bytes; a multiple of 16.
     size: u32,
+    /// Pages in a span of the class.
     pages: u16,
+    /// Objects in a span of the class: as many as fit.
     objects: u16,
 }
 
-/// Sizes 16 to 128 in steps of 16, then four evenly spaced sizes per
-/// doubling up to 16 KiB, which bounds the rounding waste at 25%.
+/// Computes the table of size classes, at compile time.
+///
+/// The sizes are 16 to 128 in steps of 16, then four evenly spaced sizes per
+/// doubling up to 16 KiB (160, 192, 224, 256, 320, ...). A request is rounded
+/// up to the next class, so at most a quarter of an object is wasted on
+/// rounding. Every size is a multiple of 16, and since spans start on a page
+/// boundary every object is 16-byte aligned; an object of a power-of-two
+/// class is aligned to its own size, up to a page.
+///
+/// A span of a class has enough pages for at least 16 objects, but never
+/// more than 64 pages (256 KiB), which is what the largest class gets.
 #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // compile-time only
 const fn class_table() -> [ClassInfo; CLASSES] {
     let mut table = [ClassInfo {
@@ -161,8 +261,12 @@ const fn class_table() -> [ClassInfo; CLASSES] {
     table
 }
 
+/// The size classes, indexed by class number.
 static CLASS_INFO: [ClassInfo; CLASSES] = class_table();
 
+/// Looks up a size class. A class number out of range, which no caller
+/// produces, gives the largest class instead of a panic: an allocator cannot
+/// panic, because panicking allocates.
 fn class_info(class: usize) -> ClassInfo {
     match CLASS_INFO.get(class) {
         Some(info) => *info,
@@ -174,7 +278,13 @@ fn class_info(class: usize) -> ClassInfo {
     }
 }
 
-/// The smallest class whose objects hold `size` bytes (`1..=MAX_SMALL`).
+/// The smallest class whose objects hold `size` bytes. `size` must be
+/// between 1 and [`MAX_SMALL`].
+///
+/// Up to 128 bytes the class follows from dividing by 16. Above, the position
+/// of the highest bit of `size - 1` gives the doubling and the two bits below
+/// it give which of the four steps of that doubling; no table or loop is
+/// needed.
 fn class_of(size: usize) -> usize {
     if size <= 128 {
         return (size.wrapping_add(15) >> 4).wrapping_sub(1);
@@ -189,30 +299,52 @@ fn class_of(size: usize) -> usize {
         .wrapping_add(step)
 }
 
-/// Whether `ShardAlloc` is the program's allocator; shards only set up
-/// heaps if so.
+/// Whether `ShardAlloc` is the program's allocator. Set by the first
+/// allocation that goes through it, which in practice happens before `main`.
+/// Shards set up heaps only if it is set, so a program that does not install
+/// the allocator reserves nothing.
 static INSTALLED: AtomicBool = AtomicBool::new(false);
-/// Start of the reserved address range; zero until reserved.
+/// Start of the reserved address range; zero until it is reserved. A
+/// pointer is one of ours exactly if it lies in the `REGION_LEN` bytes from
+/// here.
 static REGION_BASE: AtomicUsize = AtomicUsize::new(0);
-/// Length of the reserved range in bytes. Written before `REGION_BASE`.
+/// Length of the reserved range in bytes: the number of heaps it has
+/// room for, times the area size. Written before `REGION_BASE`, so a thread
+/// that sees the base also sees the length.
 static REGION_LEN: AtomicUsize = AtomicUsize::new(0);
-/// Serialises the one-time reservation.
+/// Serialises the one-time reservation, so two shards starting at once
+/// do not both map a region. Taken only in [`reserve_region`], never on an
+/// allocation path.
 static RESERVING: std::sync::Mutex<()> = std::sync::Mutex::new(());
-/// Which areas have an owning thread right now.
+/// Which areas have an owning thread right now. A thread takes an area
+/// by flipping its flag from false to true and gives it up by clearing it.
 static CLAIMED: [AtomicBool; MAX_HEAPS] = [const { AtomicBool::new(false) }; MAX_HEAPS];
-/// Which areas have an initialised header.
+/// Which areas have an initialised header. Set once, the first time an
+/// area is claimed, and never cleared: an area keeps its contents when its
+/// owner leaves and is taken over as it is by the next thread to claim it.
 static READY: [AtomicBool; MAX_HEAPS] = [const { AtomicBool::new(false) }; MAX_HEAPS];
 
 thread_local! {
-    /// The heap this thread owns; null for threads that are not shards.
+    /// The heap this thread owns; null for threads that are not shards,
+    /// which allocate from the system. A plain thread-local pointer: reading it
+    /// is the only work an allocation does before reaching the heap.
     static HEAP: Cell<*mut Heap> = const { Cell::new(ptr::null_mut()) };
 }
 
+/// The calling thread's heap, or null if it has none. Also null while the
+/// thread is being torn down and its thread-locals are gone; allocations made
+/// then go to the system allocator.
 fn current_heap() -> *mut Heap {
     HEAP.try_with(Cell::get).unwrap_or(ptr::null_mut())
 }
 
-/// The heap whose area contains `ptr`, if it is one of ours.
+/// The heap whose area contains `ptr`, or `None` if `ptr` lies outside the
+/// region, which means it came from the system allocator.
+///
+/// This is how a block finds its way home when freed: no header in front of
+/// the block and no lookup structure, only a subtraction, a comparison and a
+/// shift. It is also what makes it safe to mix the two allocators in one
+/// program: every block is freed by the allocator its address says made it.
 fn owner_of(ptr: *mut u8) -> Option<*mut Heap> {
     let base = REGION_BASE.load(Ordering::Relaxed);
     let offset = (ptr as usize).wrapping_sub(base);
@@ -228,7 +360,13 @@ fn owner_of(ptr: *mut u8) -> Option<*mut Heap> {
 ///
 /// It asks for room for `MAX_HEAPS` heaps and settles for half as many,
 /// repeatedly, where the process's address space is restricted (a resource
-/// limit, or a sanitizer's own layout).
+/// limit, or a sanitizer's own layout). The reservation is `PROT_NONE` and
+/// `MAP_NORESERVE`: it uses no memory and counts against no memory limit
+/// until parts of it are committed. It is never unmapped.
+///
+/// Each attempt maps 2 MiB more than needed and the region starts at the
+/// first 2 MiB boundary inside the mapping, so that every heap's growth steps
+/// can be backed by huge pages.
 fn reserve_region() -> usize {
     let base = REGION_BASE.load(Ordering::Acquire);
     if base != 0 {
@@ -270,7 +408,12 @@ fn reserve_region() -> usize {
     0
 }
 
-/// Makes `len` bytes at `addr` (inside the reservation) usable.
+/// Makes `len` bytes at `addr` usable, by giving the pages read and write
+/// permission. Returns whether the kernel agreed. The pages read as zeros
+/// until written, and take up memory only once touched.
+///
+/// SAFETY: the range must lie inside the reservation, in the area of a heap
+/// the caller owns.
 unsafe fn commit(addr: usize, len: usize) -> bool {
     libc::mprotect(addr as *mut libc::c_void, len, libc::PROT_READ | libc::PROT_WRITE) == 0
 }
@@ -281,30 +424,48 @@ unsafe fn commit(addr: usize, len: usize) -> bool {
 // SAFETY contract shared by all of them: `h` points to an initialised heap
 // header and the caller is the thread that owns that heap.
 
+/// Pointer to the descriptor of page `page`. The descriptor array
+/// follows the header.
+///
+/// SAFETY: besides the shared contract above, `page` must be below the
+/// heap's `top`, or its descriptor may not be committed.
 unsafe fn desc(h: *mut Heap, page: usize) -> *mut PageDesc {
     ((*h).base.wrapping_add(HEADER_BYTES) as *mut PageDesc).add(page)
 }
 
+/// Address of page `page` of the heap.
 unsafe fn page_addr(h: *mut Heap, page: usize) -> usize {
     (*h).base.wrapping_add(page << PAGE_SHIFT)
 }
 
+/// Pointer to the head of a class's list of spans with available
+/// objects. An out-of-range class is clamped to the last one, so the pointer
+/// is always inside the header.
 unsafe fn pool_head(h: *mut Heap, class: usize) -> *mut u32 {
     ptr::addr_of_mut!((*h).pools).cast::<u32>().add(class.min(CLASSES - 1))
 }
 
+/// The free list a span of `pages` pages belongs on: the base-two
+/// logarithm of its length, rounded down.
 fn bucket_of(pages: usize) -> usize {
     (pages.checked_ilog2().unwrap_or(0) as usize).min(BUCKETS - 1)
 }
 
+/// Pointer to the head of a free list. An out-of-range bucket is clamped
+/// to the last one.
 unsafe fn bucket_head(h: *mut Heap, bucket: usize) -> *mut u32 {
     ptr::addr_of_mut!((*h).free_spans)
         .cast::<u32>()
         .add(bucket.min(BUCKETS - 1))
 }
 
-/// Puts a span on the free list of its size. The span must not be
-/// adjacent to another free span.
+/// Puts a span on the free list of its size, at the front, and marks its
+/// first and last pages so that neighbours can find it.
+///
+/// The span must not be adjacent to another free span: callers merge first
+/// ([`free_pages`]) or know the neighbours are in use ([`alloc_pages`]). That
+/// free spans never touch is what keeps the heap from fragmenting into
+/// adjacent pieces that could have served a larger request.
 unsafe fn insert_free(h: *mut Heap, start: usize, pages: usize) {
     let head = bucket_head(h, bucket_of(pages));
     let d = desc(h, start);
@@ -323,7 +484,10 @@ unsafe fn insert_free(h: *mut Heap, start: usize, pages: usize) {
     }
 }
 
-/// Takes a free span off its list and clears its markers.
+/// Takes the free span that starts at `start` off its list and clears
+/// the markers on its first and last pages. Returns its length in pages.
+/// Works on a span anywhere in its list, since the lists are doubly
+/// linked.
 unsafe fn remove_free(h: *mut Heap, start: usize) -> usize {
     let d = desc(h, start);
     let pages = (*d).span_pages as usize;
@@ -343,7 +507,14 @@ unsafe fn remove_free(h: *mut Heap, start: usize) -> usize {
     pages
 }
 
-/// Finds and removes a free span of at least `want` pages.
+/// Finds and removes a free span of at least `want` pages. Returns its
+/// first page and its length, which may be more than was asked for; the
+/// caller gives back what it does not use.
+///
+/// It looks first in the bucket `want` falls in, where spans may be too
+/// small, examining at most [`SCAN_LIMIT`] of them, and then takes the first
+/// span of the next non-empty larger bucket, where every span is large
+/// enough. `None` means the heap has to grow.
 unsafe fn take_span(h: *mut Heap, want: usize) -> Option<(usize, usize)> {
     let first = bucket_of(want);
     // Spans in the first bucket may be smaller than wanted; look at a few.
@@ -369,7 +540,13 @@ unsafe fn take_span(h: *mut Heap, want: usize) -> Option<(usize, usize)> {
     None
 }
 
-/// Returns a span to the free lists, merging it with free neighbours.
+/// Returns a span to the free lists, merging it with a free span that
+/// starts right after it and with one that ends right before it, so that two
+/// free spans are never adjacent. The pages must already be marked
+/// `INTERIOR` apart from the first, which this clears.
+///
+/// The neighbour after is recognised by its `FREE_HEAD` page; the one before
+/// by its `FREE_TAIL` page, or by `FREE_HEAD` if it is a single page.
 unsafe fn free_pages(h: *mut Heap, start: usize, pages: usize) {
     let mut start = start;
     let mut pages = pages;
@@ -395,7 +572,15 @@ unsafe fn free_pages(h: *mut Heap, start: usize, pages: usize) {
     insert_free(h, start, pages);
 }
 
-/// Commits more of the area, enough for a span of `want` pages.
+/// Commits more of the area: enough for a span of `want` pages, rounded
+/// up to a multiple of 2 MiB. Returns false if the area is exhausted or the
+/// kernel refuses the memory, in which case the heap is unchanged apart from
+/// descriptor pages that may have been committed.
+///
+/// The descriptors of the new pages are committed first, then the pages,
+/// which are also marked as candidates for huge pages. The new pages join
+/// the free lists as one span, merged with a free span at the old top if
+/// there is one.
 unsafe fn grow(h: *mut Heap, want: usize) -> bool {
     let Some(pages) = want.max(GROW_PAGES).checked_next_multiple_of(GROW_PAGES) else {
         return false;
@@ -434,8 +619,13 @@ unsafe fn grow(h: *mut Heap, want: usize) -> bool {
 }
 
 /// Allocates a span of `pages` pages whose address is a multiple of
-/// `align` (a power of two, at least a page). Returns its first page
-/// index, or 0 on failure. The span is marked `LARGE`.
+/// `align` (a power of two, at least a page). Returns its first page index,
+/// or 0 on failure. The span's first page is marked `LARGE`.
+///
+/// For an alignment above a page it takes a span longer than needed by the
+/// alignment less one page, which always contains a suitably aligned start,
+/// and puts the unused pages before and after back on the free lists. The
+/// heap grows if no free span is long enough.
 unsafe fn alloc_pages(h: *mut Heap, pages: usize, align: usize) -> usize {
     let slack = (align >> PAGE_SHIFT).max(1).wrapping_sub(1);
     let Some(want) = pages.checked_add(slack) else { return 0 };
@@ -477,6 +667,9 @@ unsafe fn alloc_pages(h: *mut Heap, pages: usize, align: usize) -> usize {
     first
 }
 
+/// Puts a span at the front of its class's list of spans with available
+/// objects. Done when a span is created and when a full span gets an object
+/// back.
 unsafe fn pool_insert(h: *mut Heap, class: usize, span: usize) {
     let head = pool_head(h, class);
     let d = desc(h, span);
@@ -488,6 +681,8 @@ unsafe fn pool_insert(h: *mut Heap, class: usize, span: usize) {
     *head = span as u32;
 }
 
+/// Takes a span off its class's list, either because it is full or
+/// because it is being dissolved, and clears its links.
 unsafe fn pool_remove(h: *mut Heap, class: usize, span: usize) {
     let d = desc(h, span);
     let (prev, next) = ((*d).prev, (*d).next);
@@ -503,6 +698,14 @@ unsafe fn pool_remove(h: *mut Heap, class: usize, span: usize) {
     (*d).next = 0;
 }
 
+/// Allocates one object of a size class. Returns null if a new span was
+/// needed and the heap could not provide one.
+///
+/// The object comes from the first span on the class's list: a previously
+/// freed object if the span has one, since that memory is likely still in
+/// the processor's cache, and otherwise the next object never handed out. If
+/// the list is empty a new span is cut from the page level. A span that
+/// gives out its last object leaves the list.
 unsafe fn alloc_small(h: *mut Heap, class: usize) -> *mut u8 {
     let info = class_info(class);
     let mut span = *pool_head(h, class) as usize;
@@ -548,6 +751,9 @@ unsafe fn alloc_small(h: *mut Heap, class: usize) -> *mut u8 {
     object
 }
 
+/// Allocates a span of whole pages for a request too large or too
+/// strictly aligned for a size class. Returns null on failure, including a
+/// size so large that rounding it up to pages overflows.
 unsafe fn alloc_large(h: *mut Heap, size: usize, align: usize) -> *mut u8 {
     let Some(bytes) = size.checked_add(PAGE - 1) else {
         return ptr::null_mut();
@@ -561,6 +767,20 @@ unsafe fn alloc_large(h: *mut Heap, size: usize, align: usize) -> *mut u8 {
     page_addr(h, span) as *mut u8
 }
 
+/// Allocates `size` bytes aligned to `align` from heap `h`; the entry
+/// point for the owning thread. Returns null if the heap cannot serve the
+/// request.
+///
+/// It first takes back anything other threads have freed, if the list is not
+/// empty, so that memory freed elsewhere is reused before the heap grows.
+/// Then it picks the cheapest path that satisfies the alignment:
+///
+/// - alignment up to 16 and size up to 16 KiB: the size class for the size;
+/// - alignment up to a page: a power-of-two class, whose objects are aligned
+///   to their size, if the rounded size is still at most 16 KiB;
+/// - anything else: a span of its own.
+///
+/// A zero-size request is treated as one byte.
 unsafe fn heap_alloc(h: *mut Heap, size: usize, align: usize) -> *mut u8 {
     if !(*h).remote.load(Ordering::Relaxed).is_null() {
         drain_remote(h);
@@ -582,7 +802,10 @@ unsafe fn heap_alloc(h: *mut Heap, size: usize, align: usize) -> *mut u8 {
     alloc_large(h, size, align)
 }
 
-/// How many bytes the allocation at `ptr` can hold.
+/// How many bytes the allocation at `ptr` can hold, which is its class's
+/// object size or its span's length, and may be more than was asked for.
+/// Used by `realloc` to decide whether a block can stay where it is. Returns
+/// 0 for an address that is not the start of an allocation's page.
 unsafe fn usable_size(h: *mut Heap, ptr: *mut u8) -> usize {
     let page = (ptr as usize).wrapping_sub((*h).base) >> PAGE_SHIFT;
     let d = desc(h, page);
@@ -594,6 +817,20 @@ unsafe fn usable_size(h: *mut Heap, ptr: *mut u8) -> usize {
 }
 
 /// Frees an object of this heap, on the owning thread.
+///
+/// A small object goes on its span's list of freed objects, with the link
+/// written into the object itself. If the span was full it goes back on its
+/// class's list; if all its objects are now free and the class has another
+/// span with room, the span is dissolved and its pages return to the page
+/// level. The last span of a class is kept, so a program that allocates and
+/// frees one object in a loop does not create and dissolve a span each time.
+///
+/// A large span returns to the page level, and if it is at least
+/// [`RELEASE_PAGES`] long its memory is given back to the operating system
+/// first.
+///
+/// A pointer outside the heap's data pages, or to a page that is not
+/// allocated, is ignored; a double free of a small object is not detected.
 unsafe fn free_local(h: *mut Heap, ptr: *mut u8) {
     let page = (ptr as usize).wrapping_sub((*h).base) >> PAGE_SHIFT;
     if page < FIRST_DATA_PAGE || page >= (*h).top {
@@ -646,7 +883,11 @@ unsafe fn free_local(h: *mut Heap, ptr: *mut u8) {
     }
 }
 
-/// Frees everything other threads have handed back.
+/// Frees everything other threads have handed back. The whole list is
+/// taken with one atomic swap, after which this thread owns it and walks it
+/// without further synchronisation. Called from [`heap_alloc`] and from
+/// [`poll`], and only when the list is not empty, so the common case costs
+/// one load.
 unsafe fn drain_remote(h: *mut Heap) {
     let mut object = (*h).remote.swap(ptr::null_mut(), Ordering::AcqRel);
     while !object.is_null() {
@@ -656,7 +897,13 @@ unsafe fn drain_remote(h: *mut Heap) {
     }
 }
 
-/// Hands an object back to the heap that owns it, from any thread.
+/// Hands an object back to the heap that owns it, from any thread, by
+/// pushing it onto the owner's `remote` list. The owner frees it for real
+/// the next time it allocates or its event loop comes round.
+///
+/// The push is the usual lock-free stack push, with the link stored in the
+/// object's first word. The stack is only ever emptied whole, never popped
+/// one element at a time, so the ABA problem does not arise.
 ///
 /// SAFETY: `owner` is an initialised heap and `ptr` a live allocation of
 /// at least one word from it.
@@ -673,12 +920,30 @@ unsafe fn free_remote(owner: *mut Heap, ptr: *mut u8) {
 }
 
 /// The allocator. See the [module documentation](self).
+///
+/// A unit type with no state of its own: everything lives in the reserved
+/// region and a thread-local. It is meant to be used in exactly one way, as
+/// the program's `#[global_allocator]`:
+///
+/// ```no_run
+/// #[global_allocator]
+/// static GLOBAL: starfish::alloc::ShardAlloc = starfish::alloc::ShardAlloc;
+/// ```
+///
+/// Installing it changes nothing for threads that are not shards, which keep
+/// using the system allocator through it. Not installing it is also fine:
+/// the runtime works the same on the system allocator, only without per-shard
+/// heaps, [`stats`], or the memory limit.
 pub struct ShardAlloc;
 
 // SAFETY: memory comes either from the system allocator or from a span or
 // object of a heap that nothing else uses until it is freed; a block is
 // freed by the allocator that produced it, found from its address.
 unsafe impl GlobalAlloc for ShardAlloc {
+    /// Allocates from the calling thread's heap if it has one, and from the
+    /// system allocator otherwise, or if the heap cannot serve the request (the
+    /// area is exhausted, or the kernel refuses to commit more). Also records,
+    /// the first time, that this allocator is installed.
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if !INSTALLED.load(Ordering::Relaxed) {
             INSTALLED.store(true, Ordering::Relaxed);
@@ -693,6 +958,10 @@ unsafe impl GlobalAlloc for ShardAlloc {
         System.alloc(layout)
     }
 
+    /// Frees a block where it came from, which its address tells: the system
+    /// allocator for an address outside the region, the calling thread's heap
+    /// directly if it owns the block, and otherwise the owning heap's remote
+    /// list.
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         match owner_of(ptr) {
             None => System.dealloc(ptr, layout),
@@ -701,6 +970,12 @@ unsafe impl GlobalAlloc for ShardAlloc {
         }
     }
 
+    /// Resizes a block. One owned by the calling thread stays in place if
+    /// the new size fits what the block can already hold and is at least half of
+    /// that, so growing within a size class and modest shrinking cost nothing.
+    /// Otherwise a new block is allocated, the contents copied and the old block
+    /// freed, which also moves a block from another shard's heap to the calling
+    /// shard's. Blocks from the system allocator are resized by it.
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let Some(owner) = owner_of(ptr) else {
             return System.realloc(ptr, layout, new_size);
@@ -725,13 +1000,27 @@ unsafe impl GlobalAlloc for ShardAlloc {
     }
 }
 
-/// Ownership of a heap by the current thread; given up on drop.
+/// Ownership of a heap by the current thread; given up on drop. A shard
+/// thread holds one for as long as it runs.
 pub(crate) struct Entered {
+    /// Index of the claimed area.
     slot: usize,
 }
 
 /// Gives the current thread a heap, if `ShardAlloc` is installed and one
-/// is available. Otherwise the thread keeps using the system allocator.
+/// is available. Otherwise returns `None` and the thread keeps using the
+/// system allocator, which is not an error: the runtime works either way.
+///
+/// Called by each shard thread as it starts. It reserves the region if this
+/// is the first shard of the process, claims the first unclaimed area, and
+/// initialises the area's header if no thread has used it before. An area
+/// used by an earlier shard (of a runtime that has since stopped) is taken
+/// over with everything in it, so memory that outlived that runtime can
+/// still be freed, and its free memory is reused.
+///
+/// `None` is returned if the allocator is not installed, the thread already
+/// has a heap, no address space could be reserved, every area is claimed, or
+/// the header could not be committed.
 pub(crate) fn enter() -> Option<Entered> {
     if !INSTALLED.load(Ordering::Relaxed) || !current_heap().is_null() {
         return None;
@@ -772,6 +1061,7 @@ pub(crate) fn enter() -> Option<Entered> {
     Some(Entered { slot })
 }
 
+/// Marks an area as unowned again, so another thread can claim it.
 fn release_claim(slot: usize) {
     if let Some(claimed) = CLAIMED.get(slot) {
         claimed.store(false, Ordering::Release);
@@ -779,6 +1069,11 @@ fn release_claim(slot: usize) {
 }
 
 impl Drop for Entered {
+    /// Detaches the thread from its heap and releases the area.
+    ///
+    /// From here on this thread allocates from the system, and frees what it
+    /// still holds from the heap through the remote list. The heap keeps its
+    /// contents for whichever thread claims it next.
     fn drop(&mut self) {
         // From here on this thread allocates from the system, and frees
         // what it still holds from the heap through the remote list. The
@@ -789,6 +1084,10 @@ impl Drop for Entered {
 }
 
 /// Reclaims memory that other threads freed back to this shard's heap.
+/// Called by the event loop every turn, so that a shard which itself
+/// allocates little still takes back, and can return to the page level,
+/// what other shards free to it. Does nothing on a thread without a heap, and
+/// costs one load when nothing is waiting.
 pub(crate) fn poll() {
     let heap = current_heap();
     if heap.is_null() {
@@ -803,7 +1102,11 @@ pub(crate) fn poll() {
     }
 }
 
-/// Memory use of one shard's heap.
+/// Memory use of one shard's heap, as returned by [`stats`].
+///
+/// Both figures describe the heap, not the process: memory the shard
+/// allocated before it had a heap, or that came from the system allocator,
+/// is not included.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Stats {
@@ -817,6 +1120,22 @@ pub struct Stats {
 
 /// Memory use of the current shard's heap, or `None` if the calling thread
 /// has none (it is not a shard, or `ShardAlloc` is not installed).
+///
+/// Reading it costs nothing: the heap keeps the totals as it goes. Memory
+/// freed by other shards is counted as allocated until this shard takes it
+/// back, which it does every turn of its event loop.
+///
+/// ```no_run
+/// # async fn example() -> starfish::Result<()> {
+/// // One figure per shard.
+/// let per_shard = starfish::submit_to_all(|| async { starfish::alloc::stats() }).await?;
+/// for (shard, stats) in per_shard.iter().enumerate() {
+///     if let Some(stats) = stats {
+///         println!("shard {shard}: {} bytes live", stats.allocated_bytes);
+///     }
+/// }
+/// # Ok(()) }
+/// ```
 pub fn stats() -> Option<Stats> {
     let heap = current_heap();
     if heap.is_null() {
@@ -832,7 +1151,9 @@ pub fn stats() -> Option<Stats> {
 }
 
 /// Sets the current shard's memory limit (see
-/// [`Runtime::memory_limit`](crate::Runtime::memory_limit)).
+/// [`Runtime::memory_limit`](crate::Runtime::memory_limit)); zero means none.
+/// Called by each shard as it starts. Does nothing on a thread without a
+/// heap, which is why the limit only works with `ShardAlloc` installed.
 pub(crate) fn set_limit(bytes: usize) {
     let heap = current_heap();
     if !heap.is_null() {
@@ -841,7 +1162,9 @@ pub(crate) fn set_limit(bytes: usize) {
     }
 }
 
-/// Whether the current shard's heap holds more than its limit.
+/// Whether the current shard's heap holds more than its limit. Always
+/// false without a limit or without a heap. The event loop asks this every
+/// turn; it is two loads and a comparison.
 pub(crate) fn over_limit() -> bool {
     let heap = current_heap();
     if heap.is_null() {
@@ -862,6 +1185,30 @@ pub(crate) fn over_limit() -> bool {
 /// The function stays registered until the runtime stops, or until
 /// [`remove`](PressureHook::remove) is called on what this returns.
 /// Dropping the returned value does not remove it.
+///
+/// The function is registered for the calling shard only; a cache on every
+/// shard needs a registration on every shard. It runs on the shard's thread
+/// outside any task, so it cannot await, and should free what it can and
+/// return. Several functions may be registered, and all are called each
+/// time. A panic in one is caught and discarded.
+///
+/// # Errors
+///
+/// [`Error::NoRuntime`](crate::Error::NoRuntime) if the calling thread is
+/// not a shard.
+///
+/// # Example
+///
+/// ```no_run
+/// # use std::{cell::RefCell, collections::HashMap, rc::Rc};
+/// # fn example() -> starfish::Result<()> {
+/// let cache: Rc<RefCell<HashMap<u64, Vec<u8>>>> = Rc::default();
+/// let evict = cache.clone();
+/// let hook = starfish::alloc::on_pressure(move || evict.borrow_mut().clear())?;
+/// // Later, if the cache goes away before the runtime does:
+/// hook.remove();
+/// # Ok(()) }
+/// ```
 pub fn on_pressure(reclaim: impl Fn() + 'static) -> crate::Result<PressureHook> {
     let shard = crate::runtime::current()?;
     let hook: std::rc::Rc<dyn Fn()> = std::rc::Rc::new(reclaim);
@@ -875,14 +1222,20 @@ pub fn on_pressure(reclaim: impl Fn() + 'static) -> crate::Result<PressureHook> 
 }
 
 /// A function registered with [`on_pressure`], for taking it out again.
+///
+/// It is only a handle: dropping it leaves the function registered, for the
+/// rest of the runtime's life. It cannot be sent to another thread.
 pub struct PressureHook {
+    /// The registered function; compared by address to find it in the
+    /// shard's list.
     hook: std::rc::Rc<dyn Fn()>,
 }
 
 impl PressureHook {
-    /// Stops the function from being called. It must be done on the shard
-    /// the function was registered on, which is the only place this value
-    /// can be.
+    /// Stops the function from being called, and drops it. It must be done
+    /// on the shard the function was registered on, which is the only place this
+    /// value can be. Does nothing if the runtime has already stopped, or if the
+    /// function was already removed.
     pub fn remove(self) {
         let Some(shard) = crate::runtime::try_current() else { return };
         // Taken out of the list here and dropped after, outside the

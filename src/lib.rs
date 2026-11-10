@@ -44,7 +44,7 @@
 //! [`channel`](sync::channel) to pass values with backpressure, and a
 //! [`Gate`](sync::Gate) to wait for work in progress before shutting down.
 //! Code that blocks goes to [`run_blocking`], off the shard.
-//! [`select`] waits for whichever of two things happens first.
+//! [`select()`] waits for whichever of two things happens first.
 //! A task that is no longer wanted is cancelled with [`JoinHandle::abort`],
 //! and [`signal::termination`] tells the program when it is asked to stop.
 //!
@@ -88,6 +88,25 @@
 
 /// Implements `Debug` for types whose insides would mean nothing to a
 /// reader: prints the type's name and, where given, a few telling values.
+///
+/// Most of the library's types hold raw pointers, ring state or closures,
+/// which either cannot be printed or would bury the useful part. They
+/// still implement `Debug`, so that a type holding one can derive it; the
+/// `missing_debug_implementations` lint above keeps that true.
+///
+/// The forms it takes:
+///
+/// ```ignore
+/// debug_impl!(Timer);                              // Timer { .. }
+/// debug_impl!(<T> Sender<T>);                      // generic types
+/// debug_impl!(File, "fd" => |file| file.fd);       // File { fd: 7, .. }
+/// ```
+///
+/// Each `"name" => |this| value` pair adds a field; `this` is bound to
+/// `&self` and the value must itself be `Debug`. The output always ends in
+/// `..`, since there is always more inside than is shown. Generic
+/// parameters get no `Debug` bound: nothing of theirs is printed unless a
+/// field expression does it.
 macro_rules! debug_impl {
     ($(<$($generic:ident),+>)? $name:ident $(<$($arg:ident),+>)? $(, $field:literal => |$this:ident| $value:expr)*) => {
         impl$(<$($generic),+>)? std::fmt::Debug for $name$(<$($arg),+>)? {

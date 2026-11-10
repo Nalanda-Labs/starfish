@@ -108,7 +108,7 @@ fn invalid_data(message: &'static str) -> io::Error {
 /// # Cancellation
 ///
 /// A read that is given up, by [`timeout`](crate::timeout) or
-/// [`select`](crate::select) or an aborted task, loses nothing with
+/// [`select`](crate::select()) or an aborted task, loses nothing with
 /// [`fill_buf`](Self::fill_buf), [`read`](Self::read),
 /// [`read_line`](Self::read_line) and [`next_line`](Self::next_line): the
 /// reader keeps the read it had started and the part of a line it had

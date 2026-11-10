@@ -265,7 +265,7 @@ that calls `maybe_yield`.
 
 # Waiting for one of several things
 
-[`select`](crate::select) waits for whichever of two futures finishes
+[`select`](crate::select()) waits for whichever of two futures finishes
 first: a message or a timer, a connection or the order to stop.
 [`select3`](crate::select3) takes three, and
 [`select_all`](crate::select_all) any number of the same kind, such as
@@ -1723,7 +1723,7 @@ async fn serve_until_stopped(acceptor: JoinHandle<()>, serving: Gate) -> starfis
   second Ctrl-C normally ends the program at once, as for any program:
   nothing listens any more. (Not if the program was started with the
   signal ignored; see [Signals](#signals).) To decide yourself what a second signal does, keep a
-  [`Signals`](crate::signal::Signals) and [`select`](crate::select)
+  [`Signals`](crate::signal::Signals) and [`select`](crate::select())
   between the shutdown and the next signal, as the `kvdb` example does.
 - At the very end the runtime cancels every operation still in the
   kernel and waits until the kernel has let go of all buffers, so that

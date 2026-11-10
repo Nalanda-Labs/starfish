@@ -93,7 +93,7 @@ impl Timers {
 /// held up by a long-running task is as long as that task runs.
 ///
 /// Dropping a `Sleep` disarms its timer, so wrapping one in
-/// [`timeout`] or [`select`](crate::select) leaves nothing behind.
+/// [`timeout`] or [`select`](crate::select()) leaves nothing behind.
 ///
 /// It belongs to the shard that first polled it and cannot be sent to
 /// another thread.
