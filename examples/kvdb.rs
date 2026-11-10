@@ -44,7 +44,7 @@ use std::time::Duration;
 use starfish::fs::{create_dir_all, rename, DmaFile, DmaStreamReader, DmaStreamWriter, File};
 use starfish::io::{BufReader, BufWriter};
 use starfish::net::{TcpListener, TcpStream};
-use starfish::sync::{channel, Gate, Receiver, Semaphore, Sender};
+use starfish::sync::{channel, oneshot, Gate, OneshotSender, Receiver, Semaphore, Sender};
 use starfish::{shard_count, shard_id, signal, spawn, timeout, JoinHandle, Runtime, Sharded};
 
 const PORT: u16 = 7006;
@@ -120,10 +120,10 @@ enum LogRequest {
     /// and whether the key was there before (for `DEL`).
     Commit {
         change: Change,
-        done: Sender<Option<bool>>,
+        done: OneshotSender<Option<bool>>,
     },
     Compact {
-        done: Sender<bool>,
+        done: OneshotSender<bool>,
     },
 }
 
@@ -228,18 +228,18 @@ impl Partition {
     async fn commit(&self, change: Change) -> Option<bool> {
         // A clone, so that no borrow is held while waiting.
         let log = self.log.borrow().clone()?;
-        let (done, mut answer) = channel(1);
+        let (done, answer) = oneshot();
         log.send(LogRequest::Commit { change, done }).await.ok()?;
-        answer.recv().await.flatten()
+        answer.await.flatten()
     }
 
     async fn compact(&self) -> bool {
         let Some(log) = self.log.borrow().clone() else { return false };
-        let (done, mut answer) = channel(1);
+        let (done, answer) = oneshot();
         if log.send(LogRequest::Compact { done }).await.is_err() {
             return false;
         }
-        answer.recv().await.unwrap_or(false)
+        answer.await.unwrap_or(false)
     }
 
     /// Stops the committer once nobody can send to it any more, which
@@ -324,7 +324,7 @@ async fn commit_loop(
             match request {
                 LogRequest::Commit { change, done } => {
                     let outcome = stored.then(|| apply(&mut partition.map.borrow_mut(), change));
-                    let _ = done.try_send(outcome);
+                    let _ = done.send(outcome);
                 }
                 LogRequest::Compact { done } => compactions.push(done),
             }
@@ -342,7 +342,7 @@ async fn commit_loop(
                 }
             };
             for done in compactions {
-                let _ = done.try_send(compacted);
+                let _ = done.send(compacted);
             }
         }
     }

@@ -105,7 +105,8 @@ The servers listen on 127.0.0.1, ports 7000 to 7006.
 - **Blocking work:** `run_blocking` runs a closure on a thread outside the
   runtime, for system calls and libraries with no asynchronous form.
 - **Coordination:** `sync::Semaphore` to bound what runs at once on a shard,
-  `sync::channel` to pass values between its tasks with backpressure, and
+  `sync::channel` to pass values between its tasks with backpressure,
+  `sync::oneshot` for one task's single answer to another, and
   `sync::Gate` to refuse new work and wait for work in progress when
   shutting down.
 - **Signals:** `signal::termination` and `signal::Signals`, to shut down in

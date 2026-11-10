@@ -4,7 +4,8 @@
 //! requests in flight, bytes of memory in use. A [`Gate`] counts the work in
 //! progress so that shutdown can refuse new work and wait for the rest to
 //! finish. A [`channel`] passes values from some tasks to another and makes
-//! the senders wait when the receiver falls behind.
+//! the senders wait when the receiver falls behind, and a [`oneshot`]
+//! carries one task's single answer to another.
 //!
 //! Those belong to the shard they were created on. Their handles are not
 //! `Send`: to coordinate across shards, keep one per shard in a
@@ -748,6 +749,147 @@ impl<T> Drop for Receiver<T> {
     }
 }
 
+struct OneshotState<T> {
+    value: Option<T>,
+    /// The receiving task, if it is waiting.
+    receiver: Option<Waker>,
+    sender_gone: bool,
+    receiver_gone: bool,
+}
+
+/// Creates a channel for a single value: one task's answer to another on
+/// the same shard.
+///
+/// It is the way to wait for something that another task will finish: the
+/// waiting task keeps the [`OneshotReceiver`] and awaits it, and hands the
+/// [`OneshotSender`] to whoever will produce the result. It costs one
+/// allocation.
+///
+/// ```no_run
+/// use starfish::sync::oneshot;
+///
+/// # async fn example() {
+/// let (answer, wait) = oneshot();
+/// starfish::spawn(async move {
+///     // ... work something out ...
+///     let _ = answer.send(42);
+/// });
+/// // `None` would mean the sender was dropped without sending.
+/// assert_eq!(wait.await, Some(42));
+/// # }
+/// ```
+pub fn oneshot<T>() -> (OneshotSender<T>, OneshotReceiver<T>) {
+    let state = Rc::new(Local::new(OneshotState {
+        value: None,
+        receiver: None,
+        sender_gone: false,
+        receiver_gone: false,
+    }));
+    let sender = OneshotSender { state: state.clone() };
+    (sender, OneshotReceiver { state })
+}
+
+/// The sending end of a [`oneshot`] channel.
+pub struct OneshotSender<T> {
+    state: Rc<Local<OneshotState<T>>>,
+}
+
+impl<T> OneshotSender<T> {
+    /// Sends the value and wakes the receiver. Never waits.
+    ///
+    /// # Errors
+    ///
+    /// Hands the value back if the receiver has been dropped: nobody is
+    /// waiting for it any more.
+    pub fn send(self, value: T) -> std::result::Result<(), T> {
+        let mut value = Some(value);
+        self.state.with(|state| {
+            if !state.receiver_gone {
+                state.value = value.take();
+            }
+        });
+        // Dropping `self` marks the sender gone and wakes the receiver.
+        match value {
+            Some(value) => Err(value),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether the receiver has been dropped, so that sending is
+    /// pointless. Useful for giving up on expensive work early.
+    pub fn is_closed(&self) -> bool {
+        self.state.with(|state| state.receiver_gone).unwrap_or(true)
+    }
+}
+
+impl<T> Drop for OneshotSender<T> {
+    fn drop(&mut self) {
+        let receiver = self.state.with(|state| {
+            state.sender_gone = true;
+            state.receiver.take()
+        });
+        if let Some(receiver) = receiver.flatten() {
+            wake_quietly(receiver);
+        }
+    }
+}
+
+/// The receiving end of a [`oneshot`] channel. Await it to get the value;
+/// it resolves to `None` if the sender was dropped without sending.
+///
+/// Dropping it tells the sender that nobody is waiting, and drops a value
+/// that was sent but not collected.
+#[must_use = "the value only arrives by awaiting the receiver"]
+pub struct OneshotReceiver<T> {
+    state: Rc<Local<OneshotState<T>>>,
+}
+
+impl<T> OneshotReceiver<T> {
+    /// Takes the value if it has been sent. `None` only says that it is
+    /// not there right now.
+    pub fn try_recv(&mut self) -> Option<T> {
+        self.state.with(|state| state.value.take()).flatten()
+    }
+}
+
+impl<T> Future for OneshotReceiver<T> {
+    type Output = Option<T>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        let mut waker = Some(cx.waker().clone());
+        let outcome = self.state.with(|state| {
+            if let Some(value) = state.value.take() {
+                return (Poll::Ready(Some(value)), None);
+            }
+            if state.sender_gone {
+                return (Poll::Ready(None), None);
+            }
+            (Poll::Pending, std::mem::replace(&mut state.receiver, waker.take()))
+        });
+        match outcome {
+            Some((polled, replaced)) => {
+                drop(replaced);
+                polled
+            }
+            None => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+}
+
+impl<T> Drop for OneshotReceiver<T> {
+    fn drop(&mut self) {
+        // The value and the waker are dropped here, outside the borrow.
+        let leftover = self.state.with(|state| {
+            state.receiver_gone = true;
+            (state.value.take(), state.receiver.take())
+        });
+        drop(leftover);
+    }
+}
+
 /// Error from [`Sender::send`]: the channel is closed. Holds the value that
 /// was not sent.
 pub struct SendError<T>(pub T);
@@ -1118,5 +1260,44 @@ mod tests {
         let mut send = std::pin::pin!(sender.send(value.clone()));
         assert!(matches!(poll_pinned(send.as_mut(), &waker), Poll::Ready(Err(_))));
         assert_eq!(TrySendError::Full(7).into_inner(), 7);
+    }
+
+    #[test]
+    fn a_oneshot_carries_one_value_or_the_news_that_none_will_come() {
+        let (wakes, waker) = counting_waker();
+
+        // Sent before anyone waits.
+        let (sender, mut receiver) = oneshot();
+        assert!(!sender.is_closed());
+        assert_eq!(receiver.try_recv(), None);
+        sender.send(1).unwrap();
+        assert!(matches!(poll(&mut receiver, &waker), Poll::Ready(Some(1))));
+
+        // Sent while the receiver waits: it is woken.
+        let (sender, mut receiver) = oneshot();
+        assert!(poll(&mut receiver, &waker).is_pending());
+        sender.send(2).unwrap();
+        assert_eq!(wakes.count(), 1);
+        assert!(matches!(poll(&mut receiver, &waker), Poll::Ready(Some(2))));
+
+        // The sender goes without sending.
+        let (sender, mut receiver) = oneshot::<u32>();
+        assert!(poll(&mut receiver, &waker).is_pending());
+        drop(sender);
+        assert_eq!(wakes.count(), 2);
+        assert!(matches!(poll(&mut receiver, &waker), Poll::Ready(None)));
+
+        // The receiver goes first: the value comes back, and one that was
+        // sent but never collected is dropped with the receiver.
+        let (sender, receiver) = oneshot();
+        drop(receiver);
+        assert!(sender.is_closed());
+        assert_eq!(sender.send(3), Err(3));
+        let value = Rc::new(());
+        let (sender, receiver) = oneshot();
+        sender.send(value.clone()).unwrap();
+        assert_eq!(Rc::strong_count(&value), 2);
+        drop(receiver);
+        assert_eq!(Rc::strong_count(&value), 1);
     }
 }

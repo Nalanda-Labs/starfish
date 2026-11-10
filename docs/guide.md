@@ -594,6 +594,47 @@ async fn pipeline() {
 - Both ends belong to their shard. Between shards, use
   [`shared_channel`](crate::sync::shared_channel).
 
+## A single answer
+
+[`oneshot`](crate::sync::oneshot) is a channel for exactly one value: the
+way for a task to wait for something another task on the shard will
+finish. The waiting task awaits the receiver; whoever produces the result
+gets the sender.
+
+```rust,no_run
+use starfish::sync::{channel, oneshot, OneshotSender};
+
+/// A request to a task that does the work, with the way to answer it.
+struct Request {
+    number: u64,
+    answer: OneshotSender<u64>,
+}
+
+async fn ask() -> Option<u64> {
+    let (requests, mut inbox) = channel::<Request>(16);
+    starfish::spawn(async move {
+        while let Some(request) = inbox.recv().await {
+            let _ = request.answer.send(request.number * 2);
+        }
+    });
+
+    let (answer, reply) = oneshot();
+    requests.send(Request { number: 21, answer }).await.ok()?;
+    reply.await // `None` if the worker dropped the request unanswered
+}
+```
+
+**Caveats**
+
+- The receiver resolves to `None` when the sender is dropped without
+  sending. That is how a waiting task learns that its request was
+  abandoned, so do not treat `None` as a value.
+- `send` never waits, and fails, handing the value back, if the receiver
+  is gone. A task doing expensive work for an answer can check
+  [`is_closed`](crate::sync::OneshotSender::is_closed) and stop early.
+- Both ends belong to their shard. Across shards,
+  [`submit_to`](crate::submit_to) already returns its closure's result.
+
 # Gates
 
 A [`Gate`](crate::sync::Gate) counts work in progress. Closing it turns new
@@ -1647,7 +1688,8 @@ the pieces fit.
 - Each shard has a write-ahead log on direct I/O
   ([`DmaStreamWriter`](crate::fs::DmaStreamWriter)) written by a single
   task. Requests hand it their change over a
-  [`channel`](crate::sync::channel) and wait; it writes whatever has
+  [`channel`](crate::sync::channel) and wait for a
+  [`oneshot`](crate::sync::oneshot) answer; it writes whatever has
   queued up, syncs once and answers them all, so many clients share one
   sync.
 - On start, each shard replays its log
@@ -1675,8 +1717,9 @@ the pieces fit.
   task, after being answered, lets a compaction in between lose it.
 - While a shard compacts, its writes wait. That shows as the slowest
   requests taking tens of milliseconds.
-- There is no one-shot "tell me when it is done" primitive; the example
-  uses a [`channel`](crate::sync::channel) of capacity one per request.
+- Waiting for another task's single answer came up at once, and the
+  first version used a [`channel`](crate::sync::channel) of capacity one
+  per request. That is what [`oneshot`](crate::sync::oneshot) is for.
 
 # What is not there
 
@@ -1685,6 +1728,5 @@ the pieces fit.
 - No calls for links or for changing permissions.
 - No cross-shard channel with several receivers.
 - No work stealing or load balancing between shards.
-- No interval timer, no `select` over several futures, and no one-shot
-  channel or notification primitive.
+- No interval timer and no `select` over several futures.
 - Only Linux on x86-64.
