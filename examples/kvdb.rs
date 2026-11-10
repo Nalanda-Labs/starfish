@@ -17,8 +17,9 @@
 //! COMPACT              -> rewrite the logs to hold only live data
 //! ```
 //!
-//! Ctrl-C stops it cleanly. Killing it loses nothing that was answered
-//! with `OK`: the next start replays the logs.
+//! Ctrl-C stops it cleanly, giving connections a few seconds to finish; a
+//! second Ctrl-C stops it at once. Killing it loses nothing that was
+//! answered with `OK`: the next start replays the logs.
 //!
 //! # How it works
 //!
@@ -48,8 +49,9 @@ use starfish::fs::{create_dir_all, remove_file, rename, DmaFile, DmaStreamReader
 use starfish::io::{BufReader, BufWriter};
 use starfish::net::{TcpListener, TcpStream};
 use starfish::sync::{channel, oneshot, Gate, OneshotSender, Receiver, Semaphore, Sender};
-use starfish::{maybe_yield, shard_count, shard_id, signal, spawn, timeout};
-use starfish::{JoinHandle, Runtime, SchedulingGroup, Sharded};
+use starfish::signal::Signals;
+use starfish::{maybe_yield, select, shard_count, shard_id, spawn, timeout};
+use starfish::{Either, JoinHandle, Runtime, SchedulingGroup, Sharded};
 
 const PORT: u16 = 7006;
 /// Connections each shard serves at a time.
@@ -631,37 +633,48 @@ async fn app(directory: PathBuf) -> starfish::Result<()> {
         directory.display()
     );
 
-    let signal = signal::termination().await?;
-    println!("signal {signal}: shutting down");
+    // Kept, so that a second signal can be heard during the shutdown.
+    let mut signals = Signals::new(&[libc::SIGINT, libc::SIGTERM])?;
+    let signal = signals.next().await;
+    println!("signal {signal}: shutting down (again to stop at once)");
 
-    // First stop serving, on every shard: a connection on one shard may be
-    // writing to another shard's log.
-    let unfinished = database
-        .partitions
-        .map_reduce(
-            |partition| async move {
-                if let Some(acceptor) = partition.acceptor.take() {
-                    acceptor.abort();
-                }
-                let _ = timeout(GRACE, partition.serving.close()).await;
-                partition.serving.active()
-            },
-            0,
-            |total, shard| total + shard,
-        )
-        .await?;
-    if unfinished > 0 {
-        println!("dropping {unfinished} connections that did not finish");
+    let orderly = async {
+        // First stop serving, on every shard: a connection on one shard
+        // may be writing to another shard's log.
+        let unfinished = database
+            .partitions
+            .map_reduce(
+                |partition| async move {
+                    if let Some(acceptor) = partition.acceptor.take() {
+                        acceptor.abort();
+                    }
+                    let _ = timeout(GRACE, partition.serving.close()).await;
+                    partition.serving.active()
+                },
+                0,
+                |total, shard| total + shard,
+            )
+            .await?;
+        if unfinished > 0 {
+            println!("dropping {unfinished} connections that did not finish");
+        }
+        // Then close the logs.
+        database
+            .partitions
+            .invoke_on_all(|partition| async move {
+                partition.close().await;
+                shard_id().unwrap_or(partition.shard)
+            })
+            .await?;
+        println!("logs closed");
+        Ok::<(), starfish::Error>(())
+    };
+    // The rare event first. Stopping at once is as safe as a crash: every
+    // write that was answered is in a log, and the next start replays it.
+    match select(signals.next(), orderly).await {
+        Either::First(signal) => println!("signal {signal}: stopping at once"),
+        Either::Second(result) => result?,
     }
-    // Then close the logs.
-    database
-        .partitions
-        .invoke_on_all(|partition| async move {
-            partition.close().await;
-            shard_id().unwrap_or(partition.shard)
-        })
-        .await?;
-    println!("logs closed");
     Ok(())
 }
 
