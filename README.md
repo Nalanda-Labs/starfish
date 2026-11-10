@@ -40,8 +40,54 @@ fn main() -> starfish::Result<()> {
 [docs/guide.md](docs/guide.md) is a tour of the whole library with
 examples; `cargo doc --open` shows it together with the API reference.
 
-`examples/echo.rs` is a TCP echo server with one listener per shard, a limit
-on connections, and an orderly shutdown on Ctrl-C.
+## Examples
+
+There are 40 programs in `examples/`. Run one with
+`cargo run --release --example <name>`. Those marked *server* run until
+Ctrl-C; the others do their work and exit.
+
+| Area | Example | What it shows |
+|---|---|---|
+| Basics | `hello` | Starting a runtime and returning a value |
+| | `tasks` | Spawning tasks, collecting results, sharing state with `Rc` |
+| | `timers` | `sleep`, `timeout` and a periodic tick that does not drift |
+| | `abort` | Cancelling a task and what happens to its state |
+| | `yielding` | The cost of not yielding, and `maybe_yield` |
+| | `panics` | A panic ends one task, not the shard |
+| | `blocking` | Running blocking code on a thread and awaiting it |
+| Shards | `cross_shard` | `submit_to` and `submit_to_all` |
+| | `sharded_counter` | A `Sharded` service with one instance per shard |
+| | `kv_store` | Data split across shards by key hash |
+| | `parallel_primes` | Dividing a computation over all shards |
+| Coordination | `semaphore` | Limiting concurrency and budgeting memory |
+| | `rate_limiter` | A token bucket from a semaphore and a timer |
+| | `channel` | Backpressure between a producer and a consumer |
+| | `pipeline` | Stages connected by channels |
+| | `gate` | Waiting for work in progress |
+| | `signals` | Reacting to `SIGINT`, `SIGTERM` and `SIGUSR1` |
+| Network | `tcp_roundtrip` | A TCP server and client in one program |
+| | `io_timeout` | Time limits on accept, read and connect |
+| | `dispatcher` | Accepting on one shard, serving on others |
+| | `udp_ping` | Datagrams between two UDP sockets |
+| | `fixed_buffers` | Registered buffers and zero-copy sends |
+| | `echo` | *Server.* Echo with a connection limit and orderly shutdown |
+| | `http_hello` | *Server.* A minimal HTTP/1.1 responder on every shard |
+| | `chat` | *Server.* A chat room with a queue per client |
+| | `proxy` | *Server.* A TCP relay, two tasks per connection |
+| | `kv_server` | *Server.* A text-protocol key-value store split by key |
+| | `udp_echo` | *Server.* UDP echo with a socket per shard |
+| Files | `file_copy` | Reading and writing at offsets through the page cache |
+| | `line_count` | Reading a file from start to end |
+| | `direct_io` | Aligned block I/O with `DmaFile` |
+| | `log_writer` | Many tasks appending to one file through a channel |
+| | `iotune` | Measuring a device for `Runtime::io_properties` |
+| Scheduling | `scheduling_groups` | Dividing a shard's CPU four to one |
+| Diagnostics | `shard_stats` | Event-loop counters of every shard |
+| | `stall_detector` | Finding the task that did not yield |
+| | `memory_pressure` | A cache that shrinks at the shard's memory limit |
+| Benchmarks | `bench_echo`, `bench_spawn`, `bench_disk` | See [Benchmarks](#benchmarks) |
+
+The servers listen on 127.0.0.1, ports 7000 to 7005.
 
 ## What is in it
 
