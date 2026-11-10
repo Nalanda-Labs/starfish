@@ -192,7 +192,9 @@ RUSTFLAGS=-Zsanitizer=thread cargo +nightly test -Zbuild-std \
   stops) passed on the one machine it was run on.
 
 Some integration tests assert on timing (CPU and disk shares, device
-capacity) and can fail on a heavily loaded machine.
+capacity) and can fail on a heavily loaded machine. To catch tests that
+only pass when there are CPUs to spare, also run the suite on one:
+`taskset -c 0 cargo test`.
 
 ## Benchmarks
 

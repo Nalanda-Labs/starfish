@@ -40,6 +40,7 @@ the code.
 - [Stall detection](#stall-detection)
 - [Errors and panics](#errors-and-panics)
 - [Cancellation](#cancellation)
+- [Testing code that uses the runtime](#testing-code-that-uses-the-runtime)
 - [A complete example](#a-complete-example)
 - [What is not there](#what-is-not-there)
 
@@ -120,6 +121,8 @@ fn main() -> starfish::Result<()> {
 - When the future given to `run` completes, every task still running on
   any shard is dropped where it stands, without a chance to finish. An
   orderly stop has to be arranged; see [Shutting down](#shutting-down).
+- A `Runtime` is only a description until `run` is called. Building one
+  and not running it does nothing, and the compiler warns about it.
 - `run` cannot be called from inside a runtime
   ([`Error::AlreadyRunning`](crate::Error::AlreadyRunning)). Several
   runtimes can run one after another, or on different threads.
@@ -638,6 +641,11 @@ async fn limited() -> starfish::Result<()> {
   the semaphore started with. The count is whatever these make it.
 - After [`close`](crate::sync::Semaphore::close), permits already handed
   out stay valid and are returned harmlessly.
+- A permit is given back the moment it is dropped. `let _ =
+  limit.acquire(1).await?;` drops it at once and limits nothing; bind it
+  to a name, such as `_permit`, that lives as long as the work. The
+  compiler warns when a permit is not bound at all, but not about
+  `let _ =`.
 
 # Channels on a shard
 
@@ -761,6 +769,9 @@ async fn serve(gate: Gate) -> starfish::Result<()> {
   up shutdown.
 - A closed gate stays closed. For a restart, make a new one.
 - Entering is the caller's job. Work that never entered is not waited for.
+- A guard counts only while it is alive. As with a permit, `let _ =
+  gate.enter()?;` drops it at once; move the guard into the task that
+  does the work.
 - A gate belongs to its shard; a server needs one per shard.
 
 # Buffers
@@ -1665,6 +1676,15 @@ fn report() -> starfish::Result<()> {
   device in `devices` only on shards that have used it.
 - There is no built-in exporter. Formatting and publishing the numbers
   is the application's job.
+- `messages_sent` and `messages_received` count messages between
+  shards, not calls. A call is one message out, but its reply is a
+  message back only if the caller was already waiting when it came; on a
+  busy machine the other shard can finish first, and the caller simply
+  finds the result. Do not use these to count calls. (A test in this
+  repository did, and failed on every loaded machine.)
+- The statistics structures may gain fields in later versions. They are
+  marked `#[non_exhaustive]`: read their fields, but do not build one or
+  match on all its fields without `..`.
 
 # Stall detection
 
@@ -1739,6 +1759,10 @@ same holds for a closure sent to another shard.
 - A panic in a `Drop` during another panic's unwinding aborts the
   process, as everywhere in Rust.
 - `Error` is `#[non_exhaustive]`: a `match` on it needs a wildcard arm.
+- Every public type implements `Debug`, for logging and for
+  `assert!` messages. Types that wrap a resource print a summary, such as
+  `Semaphore { available: 1, closed: false, .. }` or a socket's file
+  descriptor, never the data passing through them.
 
 # Cancellation
 
@@ -1769,6 +1793,46 @@ has let go of it.
 - Operations that create a file descriptor (`accept`, opening a file)
   are safe to cancel: a descriptor that arrives after the cancellation
   is closed.
+
+# Testing code that uses the runtime
+
+A test starts its own runtime with [`Runtime::run`](crate::Runtime::run)
+and makes its assertions inside or on what `run` returns. This
+repository's `tests/basic.rs` has some fifty tests written that way.
+
+```rust,no_run
+#[test]
+fn doubles_on_another_shard() {
+    let doubled = starfish::Runtime::new()
+        .shards(2)
+        .pin_threads(false)
+        .run(|| async { starfish::submit_to(1, || async { 21 * 2 }).await })
+        .unwrap()
+        .unwrap();
+    assert_eq!(doubled, 42);
+}
+```
+
+**Caveats**
+
+- Turn pinning off in tests (`pin_threads(false)`). Tests run in parallel
+  in one process, and pinned shards from many tests pile onto the same
+  few CPUs.
+- A test that passes on an idle many-core machine can fail on a loaded
+  or small one, because the order in which shards get to run changes.
+  Anything that assumes "the other shard has not got there yet" or "has
+  got there by now" is such a test. Run the suite with one CPU, `taskset
+  -c 0 cargo test`, before trusting it: that is how the fault above in
+  this repository's own tests was reproduced, after CI had been failing
+  on it.
+- Assertions on elapsed time need generous margins, and assertions on
+  shares of CPU or disk need a machine that is not doing much else.
+- Each test's runtime starts and stops its own threads. That is quick,
+  but a test that leaves a task holding a file or a port open keeps it
+  until its runtime has stopped, not until the test function's variables
+  go out of scope.
+- Wait for work to finish by awaiting it (a `JoinHandle`, a channel, a
+  gate), not by sleeping for a time that seems long enough.
 
 # A complete example
 
