@@ -3,3 +3,4 @@
 .starfish-example-*
 .starfish-bench-disk
 .starfish-iotune-*
+kvdb-data/

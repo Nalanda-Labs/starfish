@@ -39,6 +39,7 @@ the code.
 - [Stall detection](#stall-detection)
 - [Errors and panics](#errors-and-panics)
 - [Cancellation](#cancellation)
+- [A complete example](#a-complete-example)
 - [What is not there](#what-is-not-there)
 
 # The model
@@ -1634,6 +1635,49 @@ has let go of it.
   are safe to cancel: a descriptor that arrives after the cancellation
   is closed.
 
+# A complete example
+
+`examples/kvdb.rs` puts most of this together in under 600 lines: a
+key-value server that survives being killed. It is the place to see how
+the pieces fit.
+
+- Data is split across shards by a hash of the key
+  ([`Sharded`](crate::Sharded)); a request that arrives on another shard
+  goes to the owner with `invoke_on`.
+- Each shard has a write-ahead log on direct I/O
+  ([`DmaStreamWriter`](crate::fs::DmaStreamWriter)) written by a single
+  task. Requests hand it their change over a
+  [`channel`](crate::sync::channel) and wait; it writes whatever has
+  queued up, syncs once and answers them all, so many clients share one
+  sync.
+- On start, each shard replays its log
+  ([`DmaStreamReader`](crate::fs::DmaStreamReader) with read-ahead) up to
+  the first record whose checksum fails.
+- A log that has grown large is rewritten with only the live data and
+  renamed over the old one ([`rename`](crate::fs::rename), then a sync of
+  the directory).
+- Connections are limited by a [`Semaphore`](crate::sync::Semaphore) and
+  framed with [`BufReader`](crate::io::BufReader) and
+  [`BufWriter`](crate::io::BufWriter).
+- On Ctrl-C it stops accepting, waits for connections through a
+  [`Gate`](crate::sync::Gate), and only then closes the logs, because a
+  connection on one shard may be writing to another shard's log.
+
+**What building it showed**
+
+- The data's layout depends on the number of shards, since that decides
+  which shard owns a key. The server records the number and refuses to
+  start with another. Any design that splits data by shard needs this.
+- A map in a `RefCell` cannot stay borrowed across an await, so the
+  compaction copies the live data before writing it out.
+- A change must be applied to the map by the task that writes the log,
+  after the sync and before the answer. Applying it in the request's own
+  task, after being answered, lets a compaction in between lose it.
+- While a shard compacts, its writes wait. That shows as the slowest
+  requests taking tens of milliseconds.
+- There is no one-shot "tell me when it is done" primitive; the example
+  uses a [`channel`](crate::sync::channel) of capacity one per request.
+
 # What is not there
 
 - Networking uses the kernel's stack. There is no userspace TCP.
@@ -1641,5 +1685,6 @@ has let go of it.
 - No calls for links or for changing permissions.
 - No cross-shard channel with several receivers.
 - No work stealing or load balancing between shards.
-- No interval timer and no `select` over several futures.
+- No interval timer, no `select` over several futures, and no one-shot
+  channel or notification primitive.
 - Only Linux on x86-64.

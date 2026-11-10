@@ -43,7 +43,7 @@ wrong). `cargo doc --open` shows it together with the API reference.
 
 ## Examples
 
-There are 46 programs in `examples/`. Run one with
+There are 48 programs in `examples/`. Run one with
 `cargo run --release --example <name>`. Those marked *server* run until
 Ctrl-C; the others do their work and exit.
 
@@ -92,9 +92,11 @@ Ctrl-C; the others do their work and exit.
 | Diagnostics | `shard_stats` | Event-loop counters of every shard |
 | | `stall_detector` | Finding the task that did not yield |
 | | `memory_pressure` | A cache that shrinks at the shard's memory limit |
+| Complete | `kvdb` | *Server.* A durable key-value store: log per shard, group commit, recovery, compaction |
+| | `kvdb_bench` | A load generator for `kvdb` |
 | Benchmarks | `bench_echo`, `bench_spawn`, `bench_disk` | See [Benchmarks](#benchmarks) |
 
-The servers listen on 127.0.0.1, ports 7000 to 7005.
+The servers listen on 127.0.0.1, ports 7000 to 7006.
 
 ## What is in it
 
@@ -194,6 +196,25 @@ runs:
 
 Read as: level with Monoio on the echo test, slower than Monoio at spawning
 tasks, behind Tokio on one thread and well ahead of it on four.
+
+`examples/kvdb.rs` is a durable key-value server built from the library's
+pieces, and `kvdb_bench` loads it. With the server on 8 cores and the load
+generator on 8 others of the same machine, over loopback, 100-byte values
+and one request at a time per connection:
+
+| | Requests/s | Median | 99% within |
+|---|---|---|---|
+| Reads, 64 connections | 1.07M | 55 us | 127 us |
+| Reads, 512 connections | 1.10M | 465 us | 819 us |
+| Durable writes, 8 connections | 6.0k | 1.2 ms | 3.2 ms |
+| Durable writes, 512 connections | 118k | 3.9 ms | 8.9 ms |
+| Durable writes, 2048 connections | 394k | 4.9 ms | 11.3 ms |
+| 9 reads to 1 write, 512 connections | 919k | 115 us | 6.1 ms |
+
+A write is answered only after it has been synced to the device (a consumer
+NVMe drive here), which takes about a millisecond; throughput grows with
+the number of connections because writes that arrive together share one
+sync. One run of five seconds each.
 
 These are first indications, not a study. Each median is of five runs of
 four seconds (three runs for spawning), on one machine, with the load
