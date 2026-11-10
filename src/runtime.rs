@@ -26,6 +26,7 @@ use crate::reactor::{completions_pending, Reactor};
 use crate::stall::{self, StallTimer};
 use crate::stats::{self, Counters, StallReport};
 use crate::sched::{GroupCache, GroupTable, RunQueues, DEFAULT_GROUP};
+use crate::sync::Semaphore;
 use crate::spsc::{self, Consumer, Producer};
 use crate::task::Task;
 use crate::timer::Timers;
@@ -146,7 +147,9 @@ impl ShardShared {
 /// One shard's sending end towards another shard.
 struct Outgoing {
     queue: Producer<Message>,
-    /// Messages that did not fit into the queue yet, oldest first.
+    /// Messages that did not fit into the queue yet, oldest first. Its
+    /// length is bounded: calls are limited by `Runtime::submit_limit`, and
+    /// there is at most one wake-up in transit per task of the target.
     overflow: VecDeque<Message>,
     target: Arc<ShardShared>,
 }
@@ -241,6 +244,9 @@ pub(crate) struct Shard {
     pub(crate) stats: Counters,
     /// Callbacks that free memory when the shard's heap is over its limit.
     pub(crate) reclaimers: Local<Vec<Rc<dyn Fn()>>>,
+    /// Indexed by target shard: one permit for every call this shard may
+    /// have in progress there (see `Runtime::submit_limit`).
+    pub(crate) calls: Vec<Semaphore>,
     config: ShardConfig,
     tasks: Local<Slab<Task>>,
     outgoing: Local<Vec<Option<Outgoing>>>,
@@ -297,6 +303,11 @@ impl Shard {
         let disk = IoScheduler::new(devices, GroupCache::new(runtime.groups.clone()), config.io_depth);
         let reactor = Reactor::new(ring, preempt, eventfd, disk, config.task_quota);
         let run_queue = RunQueues::new(runtime.groups.clone());
+        let calls = runtime
+            .shards
+            .iter()
+            .map(|_| Semaphore::new(config.submit_limit))
+            .collect();
         Shard {
             shared,
             runtime,
@@ -308,6 +319,7 @@ impl Shard {
             current_group: Cell::new(DEFAULT_GROUP),
             stats: Counters::default(),
             reclaimers: Local::new(Vec::new()),
+            calls,
             config,
             tasks: Local::new(Slab::new()),
             outgoing: Local::new(outgoing),
@@ -708,6 +720,7 @@ struct ShardConfig {
     stall_backtraces: bool,
     on_stall: Option<fn(&StallReport)>,
     memory_limit: Option<usize>,
+    submit_limit: usize,
 }
 
 /// Configures and runs a runtime.
@@ -745,6 +758,7 @@ impl Runtime {
                 stall_backtraces: false,
                 on_stall: None,
                 memory_limit: None,
+                submit_limit: 1024,
             },
             io_properties: Vec::new(),
             io_latency_goal: None,
@@ -856,6 +870,24 @@ impl Runtime {
     /// installed.
     pub fn memory_limit(mut self, bytes_per_shard: usize) -> Runtime {
         self.config.memory_limit = Some(bytes_per_shard);
+        self
+    }
+
+    /// Sets how many [`submit_to`](crate::submit_to) calls one shard may
+    /// have in progress on one other shard at a time (at least one).
+    /// Default 1024.
+    ///
+    /// A call counts from when it is sent until the other shard has
+    /// finished running it, even if the caller stopped waiting. Further
+    /// calls wait their turn, in order. This is what keeps a shard that
+    /// falls behind from being buried: its callers are slowed down instead
+    /// of its queue and its task list growing without bound.
+    ///
+    /// The limit applies to each ordered pair of shards separately, and to
+    /// everything built on `submit_to`: [`submit_to_all`](crate::submit_to_all)
+    /// and the calls of a [`Sharded`](crate::Sharded) service.
+    pub fn submit_limit(mut self, calls: usize) -> Runtime {
+        self.config.submit_limit = calls.max(1);
         self
     }
 

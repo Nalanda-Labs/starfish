@@ -6,9 +6,15 @@
 //! finish. A [`channel`] passes values from some tasks to another and makes
 //! the senders wait when the receiver falls behind.
 //!
-//! All of them belong to the shard they were created on. Their handles are
-//! not `Send`: to coordinate across shards, keep one per shard in a
-//! [`Sharded`](crate::Sharded) service. None needs a running runtime.
+//! Those belong to the shard they were created on. Their handles are not
+//! `Send`: to coordinate across shards, keep one per shard in a
+//! [`Sharded`](crate::Sharded) service.
+//!
+//! The exception is [`shared_channel`], whose two ends live on different
+//! shards: a bounded queue that carries a stream of values from one shard
+//! to another and slows the sender down when the receiver falls behind.
+//!
+//! None of this needs a running runtime.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -19,6 +25,8 @@ use std::task::{Context, Poll, Waker};
 
 use crate::error::{Error, Result};
 use crate::runtime::{wake_quietly, Local};
+
+pub use crate::shared_channel::{shared_channel, SharedReceiver, SharedSender};
 
 /// A task waiting for permits.
 struct Waiter {

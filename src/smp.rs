@@ -6,10 +6,14 @@ use std::task::{Poll, Waker};
 
 use crate::error::{Error, Result};
 use crate::runtime::{current, try_current, wake_quietly, Message};
+use crate::sched::DEFAULT_GROUP;
+use crate::sync::Permit;
 
 struct Reply<T> {
     value: Option<Result<T>>,
     waker: Option<Waker>,
+    /// The call is over: it returned, panicked or was never run.
+    done: bool,
 }
 
 fn lock<T>(reply: &Mutex<Reply<T>>) -> MutexGuard<'_, Reply<T>> {
@@ -32,6 +36,7 @@ impl<T> ReplySender<T> {
         let waker = {
             let mut reply = lock(&self.reply);
             reply.value = Some(value);
+            reply.done = true;
             reply.waker.take()
         };
         // The waker belongs to a task on the calling shard; waking it from
@@ -55,12 +60,72 @@ impl<T> Drop for ReplySender<T> {
     }
 }
 
+/// The caller's side of a call in progress on another shard. It holds the
+/// call's permit from the limit on calls between the two shards.
+struct Call<T: Send + 'static> {
+    reply: Arc<Mutex<Reply<T>>>,
+    /// `None` once the call is over and the permit has been returned.
+    permit: Option<Permit>,
+}
+
+impl<T: Send + 'static> Drop for Call<T> {
+    fn drop(&mut self) {
+        let Some(permit) = self.permit.take() else { return };
+        if lock(&self.reply).done {
+            return;
+        }
+        // The caller has stopped waiting, but the other shard is still
+        // working on the call. The permit stays taken until it is done, or
+        // giving up on calls would be a way around the limit.
+        let reply = self.reply.clone();
+        let Some(shard) = try_current() else { return };
+        let hold = async move {
+            poll_fn(|cx| {
+                let mut waker = Some(cx.waker().clone());
+                let (done, replaced) = {
+                    let mut reply = lock(&reply);
+                    match reply.done {
+                        true => (true, None),
+                        false => (false, std::mem::replace(&mut reply.waker, waker.take())),
+                    }
+                };
+                drop(replaced);
+                if done {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            drop(permit);
+        };
+        drop(shard.spawn_task(DEFAULT_GROUP, hold, true));
+    }
+}
+
 /// Runs `f` on shard `shard` and returns its result to the caller.
 ///
 /// The closure and the result cross threads, so both must be `Send`. The
 /// future the closure creates runs entirely on the target shard and may hold
 /// non-`Send` state such as `Rc`s and that shard's sockets. It runs in the
 /// caller's scheduling group.
+///
+/// Dropping the returned future stops the wait, not the call: the closure
+/// still runs to completion on the target shard.
+///
+/// # Backpressure
+///
+/// A shard may have only so many calls in progress on one other shard
+/// ([`Runtime::submit_limit`](crate::Runtime::submit_limit), 1024 by
+/// default). Past that, this function waits until an earlier call has
+/// finished before it sends, so a shard that is overloaded slows its
+/// callers down.
+///
+/// Because of that, calls that depend on further calls in the same
+/// direction can block each other: if every permit from shard A to shard
+/// B is held by calls that are each waiting for a nested call from A to B,
+/// none can proceed. Keep chains of calls from doubling back, or raise the
+/// limit.
 ///
 /// # Errors
 ///
@@ -93,9 +158,19 @@ where
         return Ok(f().await);
     };
 
+    // Wait for a place among the calls in progress on that shard.
+    let limit = here.calls.get(shard).cloned();
+    drop(here);
+    let permit = match limit {
+        Some(limit) => Some(limit.acquire(1).await.map_err(|_| Error::Canceled)?),
+        None => None,
+    };
+    let here = current()?;
+
     let reply = Arc::new(Mutex::new(Reply {
         value: None,
         waker: None,
+        done: false,
     }));
     let mut sender = ReplySender {
         reply: reply.clone(),
@@ -114,10 +189,11 @@ where
     })));
     drop(here);
 
+    let mut call = Call { reply, permit };
     poll_fn(move |cx| {
         let mut waker = Some(cx.waker().clone());
         let (value, previous) = {
-            let mut reply = lock(&reply);
+            let mut reply = lock(&call.reply);
             match reply.value.take() {
                 Some(value) => (Some(value), None),
                 None => (None, std::mem::replace(&mut reply.waker, waker.take())),
@@ -125,7 +201,11 @@ where
         };
         drop(previous);
         match value {
-            Some(value) => Poll::Ready(value),
+            Some(value) => {
+                // The call is over; the next one may go.
+                drop(call.permit.take());
+                Poll::Ready(value)
+            }
             None => Poll::Pending,
         }
     })

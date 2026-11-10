@@ -71,6 +71,7 @@ fn main() -> starfish::Result<()> {
 | `io_depth` | 64 | Requests per device a shard keeps in the kernel |
 | `io_properties` | none | Measured capacity of a storage device |
 | `io_latency_goal` | 1.5 × `task_quota` | Work queued inside such a device |
+| `submit_limit` | 1024 | Calls one shard may have in progress on another |
 | `fixed_buffers` | none | Per-shard pool of registered buffers |
 | `memory_limit` | none | Heap size at which a shard asks for memory back |
 | `stall_threshold` | 25 ms | Slice length that counts as a stall |
@@ -159,6 +160,51 @@ Each pair of shards has its own lock-free queue. A call to another shard
 still costs far more than a local function call, and a wake-up through the
 kernel when that shard is asleep, so batch small pieces of work.
 
+## When a shard falls behind
+
+A shard may have only so many calls in progress on one other shard:
+[`submit_limit`](crate::Runtime::submit_limit), 1024 by default. Past
+that, `submit_to` waits for an earlier call to finish before it sends. An
+overloaded shard therefore slows its callers down, instead of collecting
+an ever longer list of calls to run. A call keeps its place until the
+other shard has finished it, even if the caller gave up waiting.
+
+One consequence: calls that wait for further calls in the same direction
+can block each other when the limit is reached. Keep chains of calls from
+doubling back to where they came from.
+
+## A stream of values
+
+For many values going the same way, one `submit_to` each is wasteful.
+[`shared_channel`](crate::sync::shared_channel) is a bounded queue with
+one end on each shard. A value costs no allocation and no task, the other
+shard is woken only when it is waiting, and a full queue makes the sender
+wait.
+
+```rust,no_run
+use starfish::submit_to;
+use starfish::sync::shared_channel;
+
+async fn stream() -> starfish::Result<u64> {
+    // Made here; each end is then moved to the shard that uses it.
+    let (mut sender, mut receiver) = shared_channel(64);
+    let producer = starfish::spawn(submit_to(1, move || async move {
+        for n in 0..10_000u64 {
+            if sender.send(n).await.is_err() {
+                break; // the receiver is gone
+            }
+        }
+    }));
+    let mut sum = 0;
+    // Ends when the sender has been dropped.
+    while let Some(n) = receiver.recv().await {
+        sum += n;
+    }
+    producer.await??;
+    Ok(sum)
+}
+```
+
 # Coordinating tasks on a shard
 
 The [`sync`](crate::sync) module has three tools. All are local to a shard
@@ -216,7 +262,8 @@ Waiting in any of them can be given up, by dropping the future, by
 permit, a value or a place for others.
 
 To coordinate across shards, keep one of these per shard in a
-[`Sharded`](crate::Sharded) service.
+[`Sharded`](crate::Sharded) service, or use a
+[`shared_channel`](crate::sync::shared_channel).
 
 # Buffers
 
@@ -558,7 +605,6 @@ that was dropped may still have happened, in part or in full.
 - File support covers data: open, read, write, sync, remove. There are no
   calls for directories, renaming, truncating, preallocating or file
   metadata.
-- Channels are local to a shard. Across shards there is only
-  [`submit_to`](crate::submit_to), whose queue of pending calls is not
-  bounded.
+- A [`shared_channel`](crate::sync::shared_channel) has one sender and one
+  receiver. There is no cross-shard channel with several senders.
 - Only Linux on x86-64.

@@ -42,7 +42,7 @@ examples; `cargo doc --open` shows it together with the API reference.
 
 ## Examples
 
-There are 40 programs in `examples/`. Run one with
+There are 41 programs in `examples/`. Run one with
 `cargo run --release --example <name>`. Those marked *server* run until
 Ctrl-C; the others do their work and exit.
 
@@ -59,6 +59,7 @@ Ctrl-C; the others do their work and exit.
 | | `sharded_counter` | A `Sharded` service with one instance per shard |
 | | `kv_store` | Data split across shards by key hash |
 | | `parallel_primes` | Dividing a computation over all shards |
+| | `shared_channel` | Streaming values between shards with backpressure |
 | Coordination | `semaphore` | Limiting concurrency and budgeting memory |
 | | `rate_limiter` | A token bucket from a semaphore and a timer |
 | | `channel` | Backpressure between a producer and a consumer |
@@ -101,7 +102,9 @@ The servers listen on 127.0.0.1, ports 7000 to 7005.
   an orderly way on Ctrl-C or `SIGTERM`.
 - **Shards:** `submit_to` runs a closure on another shard over a lock-free
   queue dedicated to that pair of shards; `Sharded<T>` keeps one instance of
-  a service per shard.
+  a service per shard; `sync::shared_channel` streams values from one shard
+  to another. A shard that falls behind slows its senders down: calls in
+  progress between two shards are limited, and the channel is bounded.
 - **Scheduling groups:** classes of work with separate CPU and I/O shares.
   Preemption is cooperative (`maybe_yield`), and the check is two memory
   reads.
@@ -149,7 +152,7 @@ RUSTFLAGS=-Zsanitizer=thread cargo +nightly test -Zbuild-std \
     --target x86_64-unknown-linux-gnu --lib --test basic --test alloc
 ```
 
-- **Miri** runs the unit tests: the task type, the semaphore, channel and gate, the
+- **Miri** runs the unit tests: the task type, the semaphore, channels and gate, the
   shard-to-shard queue, the I/O scheduler's arithmetic and the allocator's
   size tables. It cannot run
   io_uring or the allocator's memory mapping.

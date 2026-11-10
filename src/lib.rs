@@ -5,8 +5,11 @@
 //! its own task queue, io_uring instance and timers. Tasks never migrate, so
 //! they do not need to be `Send`, and state owned by a shard needs no locks.
 //! Shards talk to each other only by message passing: [`submit_to`] runs a
-//! closure on another shard and returns its result, and [`Sharded`] keeps one
-//! instance of a service on every shard.
+//! closure on another shard and returns its result, [`Sharded`] keeps one
+//! instance of a service on every shard, and a
+//! [`shared_channel`](sync::shared_channel) carries a stream of values from
+//! one shard to another. All three slow the sender down when the receiving
+//! shard falls behind.
 //!
 //! ```no_run
 //! use starfish::{Runtime, Sharded};
@@ -84,6 +87,7 @@ mod ioqueue;
 mod reactor;
 mod runtime;
 mod sched;
+mod shared_channel;
 mod sharded;
 mod smp;
 mod spsc;

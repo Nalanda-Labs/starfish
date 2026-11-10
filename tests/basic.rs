@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use starfish::fs::{AlignedBuf, DmaFile, File, DMA_ALIGNMENT};
 use starfish::net::{TcpListener, TcpStream};
 use starfish::signal::Signals;
-use starfish::sync::{channel, Gate, Semaphore};
+use starfish::sync::{channel, shared_channel, Gate, Semaphore};
 use starfish::{shard_count, shard_id, sleep, spawn, submit_to, submit_to_all, timeout, yield_now};
 use starfish::{maybe_yield, Error, Runtime, SchedulingGroup, Sharded};
 use std::cell::RefCell;
@@ -1347,4 +1347,147 @@ fn signals_reach_every_listener_on_any_shard() {
             assert!(Signals::new(&[libc::SIGKILL]).is_err());
         })
         .unwrap();
+}
+
+#[test]
+fn calls_between_shards_are_limited() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Counts the calls running at once on the far shard.
+    #[derive(Default)]
+    struct Load {
+        running: AtomicUsize,
+        peak: AtomicUsize,
+        finished: AtomicUsize,
+    }
+
+    async fn work(load: Arc<Load>, millis: u64) {
+        let running = load.running.fetch_add(1, Ordering::SeqCst) + 1;
+        load.peak.fetch_max(running, Ordering::SeqCst);
+        sleep(Duration::from_millis(millis)).await;
+        load.running.fetch_sub(1, Ordering::SeqCst);
+        load.finished.fetch_add(1, Ordering::SeqCst);
+    }
+
+    rt(2)
+        .submit_limit(4)
+        .run(|| async {
+            // Far more calls than the limit: they all complete, four at a
+            // time.
+            let load = Arc::new(Load::default());
+            let calls: Vec<_> = (0..40)
+                .map(|_| {
+                    let load = load.clone();
+                    spawn(submit_to(1, move || work(load, 2)))
+                })
+                .collect();
+            for call in calls {
+                call.await.unwrap().unwrap();
+            }
+            assert_eq!(load.finished.load(Ordering::SeqCst), 40);
+            assert_eq!(load.peak.load(Ordering::SeqCst), 4);
+
+            // Giving up on a call does not free its place: the far shard
+            // is still working on it.
+            let load = Arc::new(Load::default());
+            let abandoned: Vec<_> = (0..4)
+                .map(|_| {
+                    let load = load.clone();
+                    spawn(submit_to(1, move || work(load, 60)))
+                })
+                .collect();
+            sleep(Duration::from_millis(10)).await;
+            assert_eq!(load.running.load(Ordering::SeqCst), 4);
+            for call in &abandoned {
+                call.abort();
+            }
+            let start = Instant::now();
+            let late = load.clone();
+            submit_to(1, move || work(late, 1)).await.unwrap();
+            assert!(start.elapsed() >= Duration::from_millis(30), "{:?}", start.elapsed());
+            assert_eq!(load.peak.load(Ordering::SeqCst), 4);
+            // The abandoned calls ran to the end all the same.
+            sleep(Duration::from_millis(50)).await;
+            assert_eq!(load.finished.load(Ordering::SeqCst), 5);
+
+            // The limit is per direction and per pair: shard 1 calls back
+            // while shard 0's calls to it are all in progress.
+            let nested: Vec<_> = (0..8)
+                .map(|i| spawn(submit_to(1, move || async move { submit_to(0, move || async move { i }).await })))
+                .collect();
+            let mut sum = 0;
+            for call in nested {
+                sum += call.await.unwrap().unwrap().unwrap();
+            }
+            assert_eq!(sum, 28);
+
+            // A wait for a place can be given up.
+            let load = Arc::new(Load::default());
+            for _ in 0..4 {
+                let load = load.clone();
+                spawn(submit_to(1, move || work(load, 30)));
+            }
+            yield_now().await;
+            let waiting = timeout(Duration::from_millis(5), submit_to(1, || async {})).await;
+            assert!(waiting.is_err());
+            submit_to(1, || async {}).await.unwrap();
+        })
+        .unwrap();
+}
+
+#[test]
+fn shared_channel_carries_a_stream_between_shards() {
+    const VALUES: u64 = 50_000;
+    let (sum, peak) = rt(3)
+        .run(|| async {
+            // Shard 1 produces as fast as it can; shard 2 consumes, pausing
+            // now and then. Four places in the queue are enough.
+            let (mut sender, mut receiver) = shared_channel(4);
+            let producer = spawn(submit_to(1, move || async move {
+                for value in 0..VALUES {
+                    sender.send(value).await.unwrap();
+                }
+            }));
+            let consumer = spawn(submit_to(2, move || async move {
+                let mut sum = 0;
+                let mut expected = 0;
+                while let Some(value) = receiver.recv().await {
+                    assert_eq!(value, expected);
+                    expected += 1;
+                    sum += value;
+                    if value % 5000 == 0 {
+                        sleep(Duration::from_millis(1)).await;
+                    }
+                }
+                (sum, expected)
+            }));
+            producer.await.unwrap().unwrap();
+            let (sum, count) = consumer.await.unwrap().unwrap();
+            assert_eq!(count, VALUES);
+
+            // The receiver goes away while the sender is blocked.
+            let (mut sender, receiver) = shared_channel(2);
+            let blocked = spawn(submit_to(1, move || async move {
+                let mut sent = 0u32;
+                while sender.send(sent).await.is_ok() {
+                    sent += 1;
+                }
+                sent
+            }));
+            sleep(Duration::from_millis(10)).await;
+            drop(receiver);
+            let sent = timeout(Duration::from_secs(5), blocked).await.unwrap().unwrap().unwrap();
+
+            // The sender goes away while the receiver waits.
+            let (sender, mut receiver) = shared_channel::<u32>(2);
+            let waiting = spawn(async move { receiver.recv().await });
+            yield_now().await;
+            submit_to(1, move || async move { drop(sender) }).await.unwrap();
+            assert_eq!(timeout(Duration::from_secs(5), waiting).await.unwrap().unwrap(), None);
+            (sum, sent)
+        })
+        .unwrap();
+    assert_eq!(sum, VALUES * (VALUES - 1) / 2);
+    assert!(peak <= 2, "only what fits in the queue can have been sent, not {peak}");
 }
