@@ -195,6 +195,8 @@ struct ShardParts {
     shared: Arc<ShardShared>,
     alien: Receiver<Message>,
     ring: IoUring,
+    /// The ring was created disabled, to be enabled by the shard's thread.
+    ring_disabled: bool,
     /// A second, tiny ring for the slice timer.
     preempt: IoUring,
     /// Memory of the shard's registered buffers, if configured.
@@ -300,6 +302,7 @@ impl Shard {
             shared,
             alien,
             ring,
+            ring_disabled,
             preempt,
             fixed,
             outgoing,
@@ -307,7 +310,7 @@ impl Shard {
         } = parts;
         let eventfd = shared.eventfd.as_raw_fd();
         let disk = IoScheduler::new(devices, GroupCache::new(runtime.groups.clone()), config.io_depth);
-        let reactor = Reactor::new(ring, preempt, eventfd, disk, config.task_quota);
+        let reactor = Reactor::new(ring, ring_disabled, preempt, eventfd, disk, config.task_quota);
         let run_queue = RunQueues::new(runtime.groups.clone());
         let calls = runtime
             .shards
@@ -661,6 +664,13 @@ impl Entered {
         });
         match installed {
             Ok(true) => {
+                // The guard exists from here on, so that a failure below
+                // still tears the shard down properly.
+                let entered = Entered(shard, None);
+                let shard = &entered.0;
+                if let Some(Err(err)) = shard.reactor.with(|reactor| reactor.enable()) {
+                    return Err(Error::Io(err));
+                }
                 shard.reactor.with(|reactor| reactor.publish());
                 if let Some(limit) = shard.config.memory_limit {
                     crate::alloc::set_limit(limit);
@@ -672,7 +682,9 @@ impl Entered {
                 } else {
                     None
                 };
-                Ok(Entered(shard, timer))
+                let mut entered = entered;
+                entered.1 = timer;
+                Ok(entered)
             }
             Ok(false) => Err(Error::AlreadyRunning),
             Err(_) => Err(Error::NoRuntime),
@@ -961,7 +973,7 @@ impl Runtime {
                 sleeping: AtomicBool::new(false),
                 eventfd: new_eventfd()?,
             });
-            let ring = IoUring::new(self.ring_entries)?;
+            let (ring, ring_disabled) = Reactor::create_ring(self.ring_entries)?;
             let fixed = match self.fixed_buffers {
                 Some((count, size)) => {
                     let region = Region::new(count, size)?;
@@ -977,6 +989,7 @@ impl Runtime {
                 shared: shard,
                 alien: receiver,
                 ring,
+                ring_disabled,
                 preempt: IoUring::new(4)?,
                 fixed,
                 outgoing: Vec::with_capacity(self.shards),

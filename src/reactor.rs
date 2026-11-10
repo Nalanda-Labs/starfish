@@ -88,6 +88,10 @@ thread_local! {
 /// its own, the kernel posts a completion there when it fires, and the
 /// shard only compares the two ends of that ring's completion queue.
 ///
+/// That ring is an ordinary one, so the kernel does interrupt the task to
+/// post the timer's completion. The main ring is set up so that it does
+/// not (see `Reactor::create_ring`).
+///
 /// Ordinary I/O completions deliberately do not count. They arrive on the
 /// main ring, and a slice that ended at every completion would run one
 /// task at a time under fast I/O.
@@ -135,6 +139,9 @@ pub(crate) struct Reactor {
     eventfd: RawFd,
     wake_buf: Box<[u8; 8]>,
     wake_armed: bool,
+    /// The ring was created disabled and has yet to be enabled by the
+    /// thread that will use it (see `Reactor::enable`).
+    disabled: bool,
     /// Closes sent to the kernel whose completions are still to come.
     closing: usize,
     /// `drain` has run: nothing will collect completions any more.
@@ -144,6 +151,7 @@ pub(crate) struct Reactor {
 impl Reactor {
     pub(crate) fn new(
         ring: IoUring,
+        disabled: bool,
         preempt: IoUring,
         eventfd: RawFd,
         disk: IoScheduler,
@@ -165,9 +173,48 @@ impl Reactor {
             eventfd,
             wake_buf: Box::new([0; 8]),
             wake_armed: false,
+            disabled,
             closing: 0,
             drained: false,
         }
+    }
+
+    /// Creates a shard's main ring. Returns it with whether it was created
+    /// disabled, in which case the shard's thread must call `enable`.
+    ///
+    /// A shard is the only thread that ever touches its ring, and it
+    /// collects completions at a point of its own choosing, once per turn
+    /// of its event loop. Telling the kernel so lets it skip its locking
+    /// and, above all, stop interrupting the running task every time an
+    /// operation completes: the completion work is left until the shard
+    /// asks for it. Both settings need Linux 6.1.
+    ///
+    /// The kernel ties such a ring to the thread that first uses it. This
+    /// one is created by the thread that starts the runtime, for another
+    /// thread to use, so it is created disabled and enabled by its user.
+    pub(crate) fn create_ring(entries: u32) -> io::Result<(IoUring, bool)> {
+        let tuned = IoUring::builder()
+            .setup_single_issuer()
+            .setup_defer_taskrun()
+            .setup_taskrun_flag()
+            .setup_r_disabled()
+            .build(entries);
+        match tuned {
+            Ok(ring) => Ok((ring, true)),
+            // An older kernel: do without.
+            Err(err) if err.raw_os_error() == Some(libc::EINVAL) => Ok((IoUring::new(entries)?, false)),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Enables a ring that was created disabled. Must be called on the
+    /// thread that will use the ring, before anything is submitted.
+    pub(crate) fn enable(&mut self) -> io::Result<()> {
+        if self.disabled {
+            self.ring.submitter().register_enable_rings()?;
+            self.disabled = false;
+        }
+        Ok(())
     }
 
     /// Makes this reactor's ring the one `completions_pending` looks at.
@@ -226,11 +273,14 @@ impl Reactor {
         ))
     }
 
-    /// Hands queued entries to the kernel without waiting.
+    /// Hands queued entries to the kernel without waiting, and has it post
+    /// the completions it has been holding back (see `create_ring`).
     fn flush(&mut self) -> io::Result<()> {
-        if self.ring.submission().is_empty() {
+        let submission = self.ring.submission();
+        if submission.is_empty() && !submission.taskrun() {
             return Ok(());
         }
+        drop(submission);
         match self.ring.submit() {
             Err(err) if !transient(&err) => Err(err),
             _ => Ok(()),
