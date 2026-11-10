@@ -43,7 +43,7 @@ wrong). `cargo doc --open` shows it together with the API reference.
 
 ## Examples
 
-There are 43 programs in `examples/`. Run one with
+There are 44 programs in `examples/`. Run one with
 `cargo run --release --example <name>`. Those marked *server* run until
 Ctrl-C; the others do their work and exit.
 
@@ -82,6 +82,7 @@ Ctrl-C; the others do their work and exit.
 | Files | `file_copy` | Reading and writing at offsets through the page cache |
 | | `line_count` | Reading a file line by line through a cursor |
 | | `direct_io` | Aligned block I/O with `DmaFile` |
+| | `wal` | A write-ahead log with checksummed records on direct I/O |
 | | `log_writer` | Many tasks appending to one file through a channel |
 | | `atomic_update` | Replacing a file safely: write, sync, rename |
 | | `iotune` | Measuring a device for `Runtime::io_properties` |
@@ -115,7 +116,8 @@ The servers listen on 127.0.0.1, ports 7000 to 7005.
   reads.
 - **Disk:** `fs::File` (page cache) and `fs::DmaFile` (direct I/O), with
   sizes, truncation, preallocation and syncing, plus directories, renaming,
-  listing and metadata. Dropping a file closes it without blocking the shard. Every
+  listing and metadata. `DmaStreamWriter` and `DmaStreamReader` write and
+  read a direct-I/O file in pieces of any size. Dropping a file closes it without blocking the shard. Every
   device has an I/O queue per shard that orders waiting requests by group
   shares. Declare a device's capacity (`Runtime::io_properties`, measured
   with `iotune::measure`) and all shards together stay within it.

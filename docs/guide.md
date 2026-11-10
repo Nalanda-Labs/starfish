@@ -27,6 +27,7 @@ the code.
 - [Unix-domain sockets](#unix-domain-sockets)
 - [Files](#files)
 - [Direct I/O](#direct-io)
+- [Streams on direct I/O](#streams-on-direct-io)
 - [Directories and file management](#directories-and-file-management)
 - [Registered buffers and zero-copy sends](#registered-buffers-and-zero-copy-sends)
 - [Scheduling groups](#scheduling-groups)
@@ -765,8 +766,8 @@ Both types live in [`io`](crate::io) and are re-exported from `net`.
 - Two writers on one file, each with its own cursor, overwrite each
   other. Appending from several tasks needs one writer that the others
   send to; the `log_writer` example does this.
-- A `Cursor` works on [`File`](crate::fs::File) only. Direct I/O needs
-  aligned, whole-block transfers and has no buffered interface.
+- A `Cursor` works on [`File`](crate::fs::File) only. For direct I/O,
+  see [Streams on direct I/O](#streams-on-direct-io).
 
 # UDP
 
@@ -989,6 +990,70 @@ async fn direct() -> std::io::Result<()> {
   device twice.
 - Mixing direct and page-cache access to the same file works but is slow
   and easy to get wrong. Pick one per file.
+
+# Streams on direct I/O
+
+Direct I/O transfers whole aligned blocks, but data rarely comes in
+blocks. [`DmaStreamWriter`](crate::fs::DmaStreamWriter) takes pieces of
+any size and writes a file from front to back;
+[`DmaStreamReader`](crate::fs::DmaStreamReader) reads one the same way.
+Both keep one aligned buffer and do the blocking-up themselves. This is
+what a write-ahead log or a file written once and read many times uses.
+
+```rust,no_run
+use starfish::fs::{DmaFile, DmaStreamReader, DmaStreamWriter};
+
+async fn log() -> std::io::Result<()> {
+    let file = DmaFile::create("/var/data/log").await?;
+    file.allocate(0, 64 << 20).await?;
+
+    let mut out = DmaStreamWriter::new(&file, 128 * 1024)?;
+    for n in 0..1000u32 {
+        out.write_all(&n.to_le_bytes()).await?;
+    }
+    out.sync().await?; // durable; the writer goes on
+    out.write_all(b"more").await?;
+    out.finish().await?; // durable, and the file has its true length
+
+    let mut input = DmaStreamReader::new(&file, 128 * 1024)?;
+    let mut number = [0u8; 4];
+    input.read_exact(&mut number).await?;
+    assert_eq!(u32::from_le_bytes(number), 0);
+    Ok(())
+}
+```
+
+The reader implements [`io::Read`](crate::io::Read), so a
+[`BufReader`](crate::io::BufReader) on top of it reads lines from a file
+opened for direct I/O. [`DmaStreamWriter::append`](crate::fs::DmaStreamWriter::append)
+continues a finished file. The `wal` example builds a log with checksummed
+records on these.
+
+**Caveats**
+
+- Only [`finish`](crate::fs::DmaStreamWriter::finish) gives the file its
+  true length. Until then the file is as long as its last whole block, or
+  as whatever was preallocated, with zeros after the data. After a crash,
+  a reader cannot tell from the file where the data ends: put a length
+  and a checksum in every record, as the `wal` example does.
+- `sync` writes the last, partial block padded with zeros and writes it
+  again in full later. Syncing after every small record therefore
+  rewrites the same block many times; group records into batches.
+- Dropping the writer writes nothing. What is in its buffer is lost, and
+  the file keeps a block-sized length.
+- If a write or read is dropped part-way (a `timeout`, an aborted task),
+  the stream's buffer is gone with it and every later call fails. Start
+  again with a new reader or writer.
+- One writer per file, from front to back. There is no seeking, and two
+  writers on one file overwrite each other.
+- `append` expects a file whose length is its true length, as `finish`
+  leaves it. On a file that still has padding or preallocated space, it
+  appends after that, not after the data.
+- The reader reads one buffer at a time, when the previous one is used
+  up. There is no read-ahead: a scan waits for the device once per
+  buffer, so use a large buffer for long scans.
+- Data passes through the stream's buffer, which is one copy more than
+  reading or writing blocks directly.
 
 # Directories and file management
 
@@ -1513,8 +1578,7 @@ has let go of it.
 
 - Networking uses the kernel's stack. There is no userspace TCP.
 - No TLS, no HTTP, no DNS resolution: addresses are `SocketAddr`s.
-- No buffered interface for direct I/O, and no calls for links or for
-  changing permissions.
+- No calls for links or for changing permissions.
 - A [`shared_channel`](crate::sync::shared_channel) has one sender and one
   receiver. There is no cross-shard channel with several senders.
 - No work stealing or load balancing between shards.

@@ -4,7 +4,8 @@
 //! [`File`] goes through the kernel page cache. [`DmaFile`] bypasses it
 //! (`O_DIRECT`) and reads and writes whole blocks through an
 //! [`AlignedBuf`], which is what a storage engine that manages its own
-//! cache wants.
+//! cache wants. [`DmaStreamWriter`] and [`DmaStreamReader`] do the
+//! blocking-up for data that is written and read from front to back.
 //!
 //! Reads, writes and syncs on both types pass through the shard's disk I/O
 //! scheduler. Each device has its own queue. A shard keeps a bounded number
@@ -988,5 +989,342 @@ impl DmaFile {
     /// Closes the file and reports the outcome; see [`File::close`].
     pub async fn close(self) -> io::Result<()> {
         close_fd(self.fd).await
+    }
+}
+
+fn interrupted() -> io::Error {
+    io::Error::other("an earlier operation on this stream was dropped before it finished")
+}
+
+/// Writes a [`DmaFile`] from start to end, taking data in pieces of any
+/// size.
+///
+/// Direct I/O only transfers whole, aligned blocks. The writer collects
+/// what it is given in an aligned buffer and writes the buffer out when it
+/// is full, so the caller can write records of any length. This is the
+/// tool for write-ahead logs and for files written once from front to
+/// back.
+///
+/// ```no_run
+/// use starfish::fs::{DmaFile, DmaStreamWriter};
+///
+/// # async fn example() -> std::io::Result<()> {
+/// let file = DmaFile::create("/var/data/log").await?;
+/// let mut log = DmaStreamWriter::new(&file, 128 * 1024)?;
+/// for n in 0..1000u32 {
+///     log.write_all(&n.to_le_bytes()).await?;
+/// }
+/// // Pads the last block, writes it, gives the file its true length and
+/// // makes it all durable.
+/// log.finish().await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Durability and length
+///
+/// Data is on the device only after [`sync`](Self::sync) or
+/// [`finish`](Self::finish). Until `finish`, the file's length on disk is
+/// a whole number of blocks (or whatever was preallocated), with zeros
+/// after the data: only `finish` sets the true length. A program that may
+/// be read after a crash must be able to tell where its data ends, for
+/// instance by a length or checksum in every record.
+///
+/// Dropping the writer writes nothing: what is in the buffer is lost.
+pub struct DmaStreamWriter<F> {
+    file: F,
+    /// `None` after an operation was dropped part-way.
+    buf: Option<AlignedBuf>,
+    /// Where in the file the buffer's first byte goes; a block boundary.
+    start: u64,
+    /// How much of the buffer holds data.
+    filled: usize,
+    block: usize,
+}
+
+impl<F: std::borrow::Borrow<DmaFile>> DmaStreamWriter<F> {
+    /// A writer that starts at the beginning of the file, with a buffer of
+    /// at least `buffer_size` bytes (rounded up to whole blocks). Larger
+    /// buffers mean fewer, larger writes.
+    pub fn new(file: F, buffer_size: usize) -> io::Result<DmaStreamWriter<F>> {
+        let block = file.borrow().disk_alignment().max(1);
+        let buf = file.borrow().alloc(buffer_size)?;
+        Ok(DmaStreamWriter {
+            file,
+            buf: Some(buf),
+            start: 0,
+            filled: 0,
+            block,
+        })
+    }
+
+    /// A writer that continues at the end of the file.
+    ///
+    /// The file must have its true length, as [`finish`](Self::finish)
+    /// leaves it. If that is not a whole number of blocks, the last,
+    /// partial block is read back so that it can be completed.
+    pub async fn append(file: F, buffer_size: usize) -> io::Result<DmaStreamWriter<F>> {
+        let mut writer = DmaStreamWriter::new(file, buffer_size)?;
+        let size = writer.file.borrow().size().await?;
+        let tail = usize::try_from(size.checked_rem(writer.block as u64).unwrap_or(0)).unwrap_or(0);
+        writer.start = size.saturating_sub(tail as u64);
+        if tail > 0 {
+            let buf = writer.buf.take().ok_or_else(interrupted)?;
+            let (result, buf) = writer.file.borrow().read_at(buf, writer.start).await;
+            writer.buf = Some(buf);
+            if result? < tail {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            writer.filled = tail;
+        }
+        Ok(writer)
+    }
+
+    /// How many bytes the stream holds so far: the file offset the next
+    /// byte will go to.
+    pub fn position(&self) -> u64 {
+        self.start.saturating_add(self.filled as u64)
+    }
+
+    /// The file being written.
+    pub fn get_ref(&self) -> &DmaFile {
+        self.file.borrow()
+    }
+
+    /// Adds all of `data` to the stream, writing the buffer to the file
+    /// each time it fills up.
+    pub async fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+        let mut rest = data;
+        while !rest.is_empty() {
+            let buf = self.buf.as_mut().ok_or_else(interrupted)?;
+            let capacity = buf.capacity();
+            let room = capacity.saturating_sub(self.filled);
+            let (now, later) = rest.split_at_checked(room.min(rest.len())).unwrap_or((rest, &[]));
+            // Everything up to the capacity is addressable once the
+            // length says so; what is beyond `filled` is overwritten here
+            // or padded before it is written.
+            buf.set_len(capacity);
+            let end = self.filled.saturating_add(now.len());
+            if let Some(target) = buf.get_mut(self.filled..end) {
+                target.copy_from_slice(now);
+            }
+            self.filled = end;
+            rest = later;
+            if self.filled >= capacity {
+                self.write_buffer(capacity).await?;
+                self.start = self.start.saturating_add(capacity as u64);
+                self.filled = 0;
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes the first `len` bytes of the buffer, a whole number of
+    /// blocks, at the buffer's place in the file.
+    async fn write_buffer(&mut self, len: usize) -> io::Result<()> {
+        let mut buf = self.buf.take().ok_or_else(interrupted)?;
+        buf.set_len(len);
+        let (result, buf) = self.file.borrow().write_at(buf, self.start).await;
+        self.buf = Some(buf);
+        if result? != len {
+            return Err(io::Error::new(io::ErrorKind::WriteZero, "the device is full"));
+        }
+        Ok(())
+    }
+
+    /// Writes out what is in the buffer, with the last block padded with
+    /// zeros. The buffer keeps its contents, so that the padded block is
+    /// written again, complete, once more data has arrived.
+    async fn write_tail(&mut self) -> io::Result<()> {
+        if self.filled == 0 {
+            return Ok(());
+        }
+        let padded = self.filled.checked_next_multiple_of(self.block).unwrap_or(self.filled);
+        let buf = self.buf.as_mut().ok_or_else(interrupted)?;
+        buf.set_len(padded);
+        if let Some(padding) = buf.get_mut(self.filled..) {
+            padding.fill(0);
+        }
+        self.write_buffer(padded).await
+    }
+
+    /// Makes everything written so far durable.
+    ///
+    /// The last block goes to the file padded with zeros, and the file's
+    /// length is not adjusted: see the notes on the type. The writer can
+    /// be used further afterwards.
+    pub async fn sync(&mut self) -> io::Result<()> {
+        self.write_tail().await?;
+        self.file.borrow().sync_data().await
+    }
+
+    /// Ends the stream: writes what is left, sets the file's length to
+    /// exactly what was written, makes it durable and gives the file back.
+    pub async fn finish(mut self) -> io::Result<F> {
+        self.write_tail().await?;
+        self.file.borrow().set_len(self.position()).await?;
+        self.file.borrow().sync_all().await?;
+        Ok(self.file)
+    }
+}
+
+impl<F: std::borrow::Borrow<DmaFile>> crate::io::Write for DmaStreamWriter<F> {
+    async fn write_whole(&mut self, buf: Vec<u8>) -> (io::Result<()>, Vec<u8>) {
+        (self.write_all(&buf).await, buf)
+    }
+}
+
+/// Reads a [`DmaFile`] from start to end, giving data out in pieces of
+/// any size.
+///
+/// It reads the file a buffer at a time, in whole aligned blocks as direct
+/// I/O demands, and copies out of the buffer. It also implements
+/// [`io::Read`](crate::io::Read), so a [`BufReader`](crate::io::BufReader)
+/// on top of it finds lines in a file read with direct I/O.
+///
+/// ```no_run
+/// use starfish::fs::{DmaFile, DmaStreamReader};
+///
+/// # async fn example() -> std::io::Result<()> {
+/// let file = DmaFile::open("/var/data/log").await?;
+/// let mut log = DmaStreamReader::new(&file, 128 * 1024)?;
+/// let mut number = [0u8; 4];
+/// while log.read_exact(&mut number).await.is_ok() {
+///     println!("{}", u32::from_le_bytes(number));
+/// }
+/// # Ok(())
+/// # }
+/// ```
+pub struct DmaStreamReader<F> {
+    file: F,
+    /// `None` after an operation was dropped part-way.
+    buf: Option<AlignedBuf>,
+    /// Where in the file the next buffer starts; a block boundary.
+    next: u64,
+    /// How much of the buffer has been given out.
+    consumed: usize,
+    /// Bytes to pass over in the first buffer, when the stream starts
+    /// inside a block.
+    skip: usize,
+    /// The end of the file has been reached.
+    ended: bool,
+    block: usize,
+}
+
+impl<F: std::borrow::Borrow<DmaFile>> DmaStreamReader<F> {
+    /// A reader that starts at the beginning of the file, with a buffer of
+    /// at least `buffer_size` bytes (rounded up to whole blocks).
+    pub fn new(file: F, buffer_size: usize) -> io::Result<DmaStreamReader<F>> {
+        DmaStreamReader::at(file, 0, buffer_size)
+    }
+
+    /// A reader that starts at `position`, which may be anywhere.
+    pub fn at(file: F, position: u64, buffer_size: usize) -> io::Result<DmaStreamReader<F>> {
+        let block = file.borrow().disk_alignment().max(1);
+        let buf = file.borrow().alloc(buffer_size)?;
+        let skip = usize::try_from(position.checked_rem(block as u64).unwrap_or(0)).unwrap_or(0);
+        Ok(DmaStreamReader {
+            file,
+            buf: Some(buf),
+            next: position.saturating_sub(skip as u64),
+            consumed: 0,
+            skip,
+            ended: false,
+            block,
+        })
+    }
+
+    /// The file offset of the next byte the reader will give out.
+    pub fn position(&self) -> u64 {
+        let buffered = self.buf.as_ref().map_or(0, |buf| buf.len());
+        // `next` is past the buffer; step back over what is unread.
+        self.next
+            .saturating_sub(buffered.saturating_sub(self.consumed) as u64)
+            .saturating_add(self.skip as u64)
+    }
+
+    /// The file being read.
+    pub fn get_ref(&self) -> &DmaFile {
+        self.file.borrow()
+    }
+
+    /// The bytes read from the file and not yet given out, after reading
+    /// more if there are none. Empty at the end of the file.
+    async fn fill(&mut self) -> io::Result<&[u8]> {
+        loop {
+            let buffered = self.buf.as_ref().ok_or_else(interrupted)?.len();
+            if self.consumed < buffered || self.ended {
+                break;
+            }
+            let buf = self.buf.take().ok_or_else(interrupted)?;
+            let (result, buf) = self.file.borrow().read_at(buf, self.next).await;
+            let read = match result {
+                Ok(read) => read,
+                Err(err) => {
+                    let mut buf = buf;
+                    buf.set_len(0);
+                    self.buf = Some(buf);
+                    self.consumed = 0;
+                    return Err(err);
+                }
+            };
+            self.buf = Some(buf);
+            self.next = self.next.saturating_add(read as u64);
+            // The first buffer may begin before the stream does.
+            self.consumed = self.skip.min(read);
+            self.skip = self.skip.saturating_sub(self.consumed);
+            // A read that stops short of a block boundary, or brings
+            // nothing, has reached the end of the file.
+            if read == 0 || read.checked_rem(self.block) != Some(0) {
+                self.ended = true;
+            }
+        }
+        let buf = self.buf.as_ref().ok_or_else(interrupted)?;
+        Ok(buf.get(self.consumed..).unwrap_or(&[]))
+    }
+
+    /// Reads some bytes into `out` and returns how many. `Ok(0)` means the
+    /// end of the file (or that `out` is empty).
+    pub async fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        let available = self.fill().await?;
+        let count = available.len().min(out.len());
+        if let (Some(target), Some(source)) = (out.get_mut(..count), available.get(..count)) {
+            target.copy_from_slice(source);
+        }
+        self.consumed = self.consumed.saturating_add(count);
+        Ok(count)
+    }
+
+    /// Fills all of `out`.
+    ///
+    /// # Errors
+    ///
+    /// `UnexpectedEof` if the file ends first; the bytes read up to then
+    /// are in `out`.
+    pub async fn read_exact(&mut self, out: &mut [u8]) -> io::Result<()> {
+        let mut rest = out;
+        while !rest.is_empty() {
+            let count = self.read(rest).await?;
+            if count == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            rest = rest.get_mut(count..).unwrap_or_default();
+        }
+        Ok(())
+    }
+}
+
+impl<F: std::borrow::Borrow<DmaFile>> crate::io::Read for DmaStreamReader<F> {
+    async fn read_some(&mut self, mut buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+        buf.clear();
+        let room = buf.capacity();
+        let available = match self.fill().await {
+            Ok(available) => available,
+            Err(err) => return (Err(err), buf),
+        };
+        let count = available.len().min(room);
+        buf.extend_from_slice(available.get(..count).unwrap_or(&[]));
+        self.consumed = self.consumed.saturating_add(count);
+        (Ok(count), buf)
     }
 }

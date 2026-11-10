@@ -2013,3 +2013,96 @@ fn unix_sockets_connect_processes_on_one_machine() {
         })
         .unwrap();
 }
+
+#[test]
+fn direct_io_streams_take_pieces_of_any_size() {
+    use starfish::fs::{DmaStreamReader, DmaStreamWriter};
+
+    let path = scratch("dma-stream");
+    rt(1)
+        .run({
+            let path = path.clone();
+            move || async move {
+                let file = DmaFile::create(&path).await.unwrap();
+                let block = file.disk_alignment() as u64;
+                // Preallocated, as a log would be.
+                file.allocate(0, 1 << 20).await.unwrap();
+
+                // Records of awkward sizes, through a buffer of two blocks.
+                let mut writer = DmaStreamWriter::new(&file, 2 * block as usize).unwrap();
+                let mut expected = Vec::new();
+                for n in 0..3000u32 {
+                    let record = format!("record {n} {}\n", "x".repeat((n % 37) as usize));
+                    writer.write_all(record.as_bytes()).await.unwrap();
+                    expected.extend_from_slice(record.as_bytes());
+                    assert_eq!(writer.position(), expected.len() as u64);
+                    if n == 1500 {
+                        // Durable so far; the length is still the
+                        // preallocated one.
+                        writer.sync().await.unwrap();
+                        assert_eq!(file.size().await.unwrap(), 1 << 20);
+                    }
+                }
+                assert!(!(expected.len() as u64).is_multiple_of(block), "the test wants a partial last block");
+                writer.finish().await.unwrap();
+                // Only now does the file end where the data does.
+                assert_eq!(file.size().await.unwrap(), expected.len() as u64);
+
+                // Read back in pieces that do not match anything.
+                let mut reader = DmaStreamReader::new(&file, 3 * block as usize).unwrap();
+                let mut read_back = Vec::new();
+                let mut piece = vec![0u8; 777];
+                loop {
+                    assert_eq!(reader.position(), read_back.len() as u64);
+                    let count = reader.read(&mut piece).await.unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    read_back.extend_from_slice(&piece[..count]);
+                }
+                assert!(read_back == expected);
+                assert_eq!(reader.read(&mut piece).await.unwrap(), 0);
+
+                // From the middle of a block, and to exactly the end.
+                let middle = expected.len() as u64 / 2 + 3;
+                let mut reader = DmaStreamReader::at(&file, middle, block as usize).unwrap();
+                assert_eq!(reader.position(), middle);
+                let mut rest = vec![0u8; expected.len() - middle as usize];
+                reader.read_exact(&mut rest).await.unwrap();
+                assert!(rest == expected[middle as usize..]);
+                let short = reader.read_exact(&mut [0u8; 1]).await.unwrap_err();
+                assert_eq!(short.kind(), std::io::ErrorKind::UnexpectedEof);
+
+                // Lines, by putting the line reader on top.
+                let mut lines = BufReader::new(DmaStreamReader::new(&file, 4 * block as usize).unwrap());
+                let mut count = 0;
+                while let Some(line) = lines.next_line().await.unwrap() {
+                    assert!(line.starts_with(&format!("record {count} ")), "{line:?}");
+                    count += 1;
+                }
+                assert_eq!(count, 3000);
+
+                // Appending completes the partial last block.
+                let mut writer = DmaStreamWriter::append(&file, 2 * block as usize).await.unwrap();
+                assert_eq!(writer.position(), expected.len() as u64);
+                assert_eq!(writer.get_ref().disk_alignment() as u64, block);
+                writer.write_all(b"appended\n").await.unwrap();
+                expected.extend_from_slice(b"appended\n");
+                writer.finish().await.unwrap();
+                assert_eq!(file.size().await.unwrap(), expected.len() as u64);
+                let mut reader = DmaStreamReader::new(&file, 64 * 1024).unwrap();
+                let mut all = vec![0u8; expected.len()];
+                reader.read_exact(&mut all).await.unwrap();
+                assert!(all == expected);
+
+                // An empty stream leaves an empty file, and reads as one.
+                let empty = DmaFile::create(&path).await.unwrap();
+                DmaStreamWriter::new(&empty, 1).unwrap().finish().await.unwrap();
+                assert_eq!(empty.size().await.unwrap(), 0);
+                let mut reader = DmaStreamReader::new(&empty, 1).unwrap();
+                assert_eq!(reader.read(&mut piece).await.unwrap(), 0);
+                starfish::fs::remove_file(&path).await.unwrap();
+            }
+        })
+        .unwrap();
+}
