@@ -2358,3 +2358,53 @@ fn interval_ticks_without_drifting_and_skips_what_it_missed() {
         })
         .unwrap();
 }
+
+#[test]
+fn a_shard_can_look_for_work_before_it_sleeps() {
+    rt(2)
+        .spin_before_sleep(Duration::from_micros(200))
+        .run(|| async {
+            // Everything still works: calls, timers, I/O and sleeping.
+            let mut sum = 0;
+            for i in 0..2000u64 {
+                sum += submit_to(1, move || async move { i }).await.unwrap();
+            }
+            assert_eq!(sum, 1999 * 2000 / 2);
+
+            let start = Instant::now();
+            sleep(Duration::from_millis(20)).await;
+            let slept = start.elapsed();
+            assert!(slept >= Duration::from_millis(20) && slept < Duration::from_millis(40), "{slept:?}");
+
+            let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let client = spawn(async move { TcpStream::connect(addr).await.unwrap() });
+            let server = listener.accept().await.unwrap();
+            let client = client.await.unwrap();
+            let (result, _) = client.write_all("ping").await;
+            result.unwrap();
+            let (result, buf) = server.read(Vec::with_capacity(16)).await;
+            assert_eq!(result.unwrap(), 4);
+            assert_eq!(buf, b"ping");
+
+            // The time spent looking is accounted for, and a shard that
+            // has nothing to do for long still goes to sleep.
+            let before = starfish::stats::shard().unwrap();
+            sleep(Duration::from_millis(50)).await;
+            let after = starfish::stats::shard().unwrap();
+            assert!(after.spinning > Duration::ZERO);
+            assert!(after.sleeps > before.sleeps);
+            let spun = after.spinning - before.spinning;
+            assert!(spun < Duration::from_millis(10), "spun {spun:?} of a 50 ms sleep");
+        })
+        .unwrap();
+
+    // Without it, no time is spent that way.
+    let spinning = rt(1)
+        .run(|| async {
+            sleep(Duration::from_millis(5)).await;
+            starfish::stats::shard().unwrap().spinning
+        })
+        .unwrap();
+    assert_eq!(spinning, Duration::ZERO);
+}

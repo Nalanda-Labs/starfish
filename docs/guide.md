@@ -100,6 +100,7 @@ fn main() -> starfish::Result<()> {
 | `ring_entries` | 1024 | Submission queue size of each shard's io_uring |
 | `task_quota` | 500 µs | Length of a time slice |
 | `submit_limit` | 1024 | Calls one shard may have in progress on another |
+| `spin_before_sleep` | zero | How long an idle shard looks for work before sleeping |
 | `io_depth` | 64 | Requests per device a shard keeps in the kernel |
 | `io_properties` | none | Measured capacity of a storage device |
 | `io_latency_goal` | 1.5 × `task_quota` | Work queued inside such a device |
@@ -380,7 +381,8 @@ async fn shards() -> starfish::Result<()> {
 
 - A call costs far more than a local function call: an allocation for the
   closure, a task on the other shard, and a wake-up through the kernel
-  when that shard is asleep. Batch small pieces of work, or use a
+  when that shard is asleep (see
+  [Idle shards](#idle-shards-and-spin_before_sleep) below). Batch small pieces of work, or use a
   [`shared_channel`](crate::sync::shared_channel) for a stream.
 - Dropping the returned future stops the wait, not the call. The closure
   still runs to the end on the other shard; only its result is discarded.
@@ -396,6 +398,43 @@ async fn shards() -> starfish::Result<()> {
 - The closure runs in the caller's scheduling group.
 - The number of calls in progress is limited; see
   [Backpressure between shards](#backpressure-between-shards).
+
+## Idle shards and `spin_before_sleep`
+
+A shard with nothing to do sleeps in the kernel, and whoever next has
+something for it has to wake it there. That costs microseconds, where
+handing work to a busy shard costs a fraction of one. It is why a call to
+an idle shard takes several times as long as a call to a busy one.
+
+[`Runtime::spin_before_sleep`](crate::Runtime::spin_before_sleep) makes an
+idle shard keep looking for work for a while before it sleeps. Measured on
+one machine:
+
+| | No spin | 100 µs spin |
+|---|---|---|
+| Calls to another shard, one after another | 2.3 µs each | 0.9 µs |
+| `kvdb` reads, 1 connection | 39k/s, median 23 µs | 80k/s, median 10 µs |
+| `kvdb` reads, 8 connections | 362k/s, 99% within 79 µs | 502k/s, 99% within 28 µs |
+| `kvdb` reads, 64 or more connections | 1.25M/s | the same |
+
+**Caveats**
+
+- It trades CPU for latency. After every burst of work a shard runs at
+  full power for the spin time doing nothing. In the `kvdb` runs above the
+  server used 60% more CPU time with the spin than without.
+- It helps at light and moderate load only. A shard that always has work
+  never sleeps anyway, which is why the busiest rows do not change.
+- A spin longer than the gaps between pieces of work means the shards
+  never sleep: every CPU the process has shows 100% whatever the load.
+  That confuses monitoring and autoscaling that go by CPU use, and wastes
+  power. [`ShardStats::spinning`](crate::stats::ShardStats::spinning) says
+  how much time went that way.
+- On a machine shared with other programs, a spinning shard takes CPU
+  from them and gains nothing while descheduled. This is for dedicated
+  cores.
+- A spin shorter than the gap does little: the shard is asleep again by
+  the time the next work arrives. Tens to a few hundred microseconds is
+  the useful range.
 
 # Services with an instance per shard
 
@@ -1618,9 +1657,10 @@ fn report() -> starfish::Result<()> {
   the `shard_stats` example does.
 - Counters run from the start of the runtime and are never reset. For a
   rate, take two readings and subtract.
-- `busy` is time spent running tasks and `idle` is time asleep. Time the
-  event loop spends on its own work is in neither, so the two do not add
-  up to the wall clock.
+- `busy` is time spent running tasks, `idle` is time asleep and
+  `spinning` is time spent looking for work before sleeping. Time the
+  event loop spends on its own work is in none of them, so they do not
+  add up to the wall clock.
 - A group appears in `groups` only on shards where it has run, and a
   device in `devices` only on shards that have used it.
 - There is no built-in exporter. Formatting and publishing the numbers

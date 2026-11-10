@@ -23,6 +23,7 @@ pub(crate) struct Counters {
     pub(crate) tasks_polled: Cell<u64>,
     pub(crate) busy_nanos: Cell<u64>,
     pub(crate) idle_nanos: Cell<u64>,
+    pub(crate) spin_nanos: Cell<u64>,
     pub(crate) messages_sent: Cell<u64>,
     pub(crate) messages_received: Cell<u64>,
     pub(crate) stalls: Cell<u64>,
@@ -54,6 +55,9 @@ pub struct ShardStats {
     pub busy: Duration,
     /// Time spent asleep.
     pub idle: Duration,
+    /// Time spent looking for work without sleeping
+    /// ([`Runtime::spin_before_sleep`](crate::Runtime::spin_before_sleep)).
+    pub spinning: Duration,
     /// Messages sent to other shards.
     pub messages_sent: u64,
     /// Messages received from other shards and from threads outside the
@@ -115,6 +119,7 @@ pub fn shard() -> Result<ShardStats> {
         sleeps: counters.sleeps.get(),
         busy: Duration::from_nanos(counters.busy_nanos.get()),
         idle: Duration::from_nanos(counters.idle_nanos.get()),
+        spinning: Duration::from_nanos(counters.spin_nanos.get()),
         messages_sent: counters.messages_sent.get(),
         messages_received: counters.messages_received.get(),
         stalls: counters.stalls.get(),

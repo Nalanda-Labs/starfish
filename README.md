@@ -117,7 +117,10 @@ The servers listen on 127.0.0.1, ports 7000 to 7006.
   a service per shard; `sync::shared_channel` streams values from one shard
   to another, and `sync::shared_mpsc` from several shards to one. A shard
   that falls behind slows its senders down: calls in progress between two
-  shards are limited, and the channels are bounded.
+  shards are limited, and the channels are bounded. An idle shard can be
+  told to look for work for a while before it sleeps
+  (`Runtime::spin_before_sleep`), which makes calls to it faster at the
+  price of CPU time.
 - **Scheduling groups:** classes of work with separate CPU and I/O shares.
   Preemption is cooperative (`maybe_yield`), and the check is two memory
   reads.

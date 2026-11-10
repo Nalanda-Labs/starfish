@@ -680,5 +680,14 @@ async fn app(directory: PathBuf) -> starfish::Result<()> {
 
 fn main() -> starfish::Result<()> {
     let directory = std::env::args_os().nth(1).unwrap_or_else(|| "kvdb-data".into());
-    Runtime::new().run(move || app(directory.into()))?
+    // Most requests are passed to another shard. With `KVDB_SPIN` set to a
+    // number of microseconds, an idle shard looks for work that long before
+    // it sleeps, which shortens such requests at the price of CPU time.
+    let spin = std::env::var("KVDB_SPIN")
+        .ok()
+        .and_then(|micros| micros.parse().ok())
+        .unwrap_or(0);
+    Runtime::new()
+        .spin_before_sleep(Duration::from_micros(spin))
+        .run(move || app(directory.into()))?
 }

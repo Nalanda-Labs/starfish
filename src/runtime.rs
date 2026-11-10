@@ -516,7 +516,15 @@ impl Shard {
                 return Ok(());
             }
 
-            let runnable = self.run_queue.with(|queue| !queue.is_empty()).unwrap_or(false);
+            let mut runnable = self.run_queue.with(|queue| !queue.is_empty()).unwrap_or(false);
+            if !runnable && !self.config.spin.is_zero() {
+                // Nothing to do. Before paying for a sleep and a wake-up
+                // through the kernel, look around for a little while.
+                runnable = self.spin()?;
+                if self.stop.get() {
+                    return Ok(());
+                }
+            }
             let completed = if runnable {
                 self.reactor.with(|reactor| reactor.poll())
             } else {
@@ -562,6 +570,43 @@ impl Shard {
                 None => {}
             }
         }
+    }
+
+    /// Keeps looking for work, without sleeping, for at most the configured
+    /// time. Returns whether there is now a task to run.
+    ///
+    /// While a shard is here, others that send it something do not have to
+    /// wake it through the kernel, and it notices completions and messages
+    /// within nanoseconds instead of microseconds.
+    fn spin(&self) -> io::Result<bool> {
+        let start = Instant::now();
+        let found = loop {
+            self.drain_inbox();
+            self.flush_outgoing();
+            match self.reactor.with(|reactor| reactor.poll()) {
+                Some(Ok(completions)) => {
+                    for waker in completions.wakers {
+                        wake_quietly(waker);
+                    }
+                    for buffer in completions.garbage {
+                        drop_quietly(buffer);
+                    }
+                }
+                Some(Err(err)) => return Err(err),
+                None => {}
+            }
+            self.fire_timers();
+            let runnable = self.run_queue.with(|queue| !queue.is_empty()).unwrap_or(false);
+            if runnable || self.stop.get() {
+                break runnable;
+            }
+            if start.elapsed() >= self.config.spin {
+                break false;
+            }
+            std::hint::spin_loop();
+        };
+        stats::add(&self.stats.spin_nanos, stats::nanos(start.elapsed()));
+        Ok(found)
     }
 
     /// Records a slice that ran past the stall threshold and tells the
@@ -747,6 +792,7 @@ struct ShardConfig {
     on_stall: Option<fn(&StallReport)>,
     memory_limit: Option<usize>,
     submit_limit: usize,
+    spin: Duration,
 }
 
 /// Configures and runs a runtime.
@@ -785,6 +831,7 @@ impl Runtime {
                 on_stall: None,
                 memory_limit: None,
                 submit_limit: 1024,
+                spin: Duration::ZERO,
             },
             io_properties: Vec::new(),
             io_latency_goal: None,
@@ -914,6 +961,27 @@ impl Runtime {
     /// and the calls of a [`Sharded`](crate::Sharded) service.
     pub fn submit_limit(mut self, calls: usize) -> Runtime {
         self.config.submit_limit = calls.max(1);
+        self
+    }
+
+    /// Sets how long a shard with nothing to do keeps looking for work
+    /// before it goes to sleep. Default zero: it sleeps at once.
+    ///
+    /// A sleeping shard has to be woken through the kernel, which costs a
+    /// couple of microseconds on each side, so a call to an idle shard
+    /// takes several times as long as one to a busy shard. A shard that is
+    /// still looking when the work arrives picks it up at once. A value
+    /// around the gap between pieces of work, typically 50 to 200
+    /// microseconds, removes most of that cost at light and moderate
+    /// load.
+    ///
+    /// The price is CPU time: after every burst of work a shard spends
+    /// this long at full power doing nothing. With a value as long as the
+    /// gaps between work, shards never sleep and the process uses all its
+    /// CPUs whatever the load. Time spent this way is reported as
+    /// [`ShardStats::spinning`](crate::stats::ShardStats::spinning).
+    pub fn spin_before_sleep(mut self, spin: Duration) -> Runtime {
+        self.config.spin = spin;
         self
     }
 
