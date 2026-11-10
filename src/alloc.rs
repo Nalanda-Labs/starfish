@@ -42,8 +42,6 @@ const AREA: usize = 1 << AREA_SHIFT;
 const AREA_PAGES: usize = AREA >> PAGE_SHIFT;
 /// One heap per shard a runtime may have.
 const MAX_HEAPS: usize = 1024;
-const REGION: usize = AREA << 10;
-const _: () = assert!(REGION == AREA * MAX_HEAPS);
 
 const HEADER_BYTES: usize = 64 << 10;
 const DESC_BYTES: usize = AREA_PAGES * std::mem::size_of::<PageDesc>();
@@ -196,6 +194,10 @@ fn class_of(size: usize) -> usize {
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 /// Start of the reserved address range; zero until reserved.
 static REGION_BASE: AtomicUsize = AtomicUsize::new(0);
+/// Length of the reserved range in bytes. Written before `REGION_BASE`.
+static REGION_LEN: AtomicUsize = AtomicUsize::new(0);
+/// Serialises the one-time reservation.
+static RESERVING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Which areas have an owning thread right now.
 static CLAIMED: [AtomicBool; MAX_HEAPS] = [const { AtomicBool::new(false) }; MAX_HEAPS];
 /// Which areas have an initialised header.
@@ -214,46 +216,58 @@ fn current_heap() -> *mut Heap {
 fn owner_of(ptr: *mut u8) -> Option<*mut Heap> {
     let base = REGION_BASE.load(Ordering::Relaxed);
     let offset = (ptr as usize).wrapping_sub(base);
-    if base == 0 || offset >= REGION {
+    if base == 0 || offset >= REGION_LEN.load(Ordering::Relaxed) {
         return None;
     }
     let area = offset >> AREA_SHIFT << AREA_SHIFT;
     Some(base.wrapping_add(area) as *mut Heap)
 }
 
+/// Reserves the address range, once. Returns its start, or 0 if no
+/// address space could be had.
+///
+/// It asks for room for `MAX_HEAPS` heaps and settles for half as many,
+/// repeatedly, where the process's address space is restricted (a resource
+/// limit, or a sanitizer's own layout).
 fn reserve_region() -> usize {
     let base = REGION_BASE.load(Ordering::Acquire);
     if base != 0 {
         return base;
     }
-    // Reserve a little more than needed so that the part used can start on
-    // a 2 MiB boundary, which is what huge pages need.
-    let length = REGION.wrapping_add(GROW_BYTES);
-    // SAFETY: an anonymous mapping at an address of the kernel's choosing.
-    // PROT_NONE and NORESERVE make it a pure address-space reservation.
-    let mapped = unsafe {
-        libc::mmap(
-            ptr::null_mut(),
-            length,
-            libc::PROT_NONE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-            -1,
-            0,
-        )
-    };
-    if mapped == libc::MAP_FAILED {
-        return 0;
+    let _guard = RESERVING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let base = REGION_BASE.load(Ordering::Acquire);
+    if base != 0 {
+        return base;
     }
-    let aligned = (mapped as usize).wrapping_add(GROW_BYTES - 1) & !(GROW_BYTES - 1);
-    match REGION_BASE.compare_exchange(0, aligned, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => aligned,
-        Err(existing) => {
-            // Another thread reserved first; give ours back.
-            // SAFETY: unmapping exactly the mapping made above.
-            unsafe { libc::munmap(mapped, length) };
-            existing
+    let mut heaps = MAX_HEAPS;
+    while heaps > 0 {
+        let region = heaps << AREA_SHIFT;
+        // A little more than needed, so that the part used can start on a
+        // 2 MiB boundary, which is what huge pages need.
+        let length = region.wrapping_add(GROW_BYTES);
+        // SAFETY: an anonymous mapping at an address of the kernel's
+        // choosing. PROT_NONE and NORESERVE make it a pure address-space
+        // reservation.
+        let mapped = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                length,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if mapped != libc::MAP_FAILED {
+            let aligned = (mapped as usize).wrapping_add(GROW_BYTES - 1) & !(GROW_BYTES - 1);
+            // The length first: whoever sees the base must see its extent.
+            REGION_LEN.store(region, Ordering::Release);
+            REGION_BASE.store(aligned, Ordering::Release);
+            return aligned;
         }
+        heaps >>= 1;
     }
+    0
 }
 
 /// Makes `len` bytes at `addr` (inside the reservation) usable.
@@ -726,7 +740,8 @@ pub(crate) fn enter() -> Option<Entered> {
     if base == 0 {
         return None;
     }
-    let slot = CLAIMED.iter().position(|claimed| {
+    let heaps = REGION_LEN.load(Ordering::Acquire) >> AREA_SHIFT;
+    let slot = CLAIMED.iter().take(heaps).position(|claimed| {
         claimed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()

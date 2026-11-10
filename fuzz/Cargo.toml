@@ -1,0 +1,23 @@
+[package]
+name = "starfish-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "GPL-3.0-or-later"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+starfish = { path = ".." }
+
+[[bin]]
+name = "alloc_ops"
+path = "fuzz_targets/alloc_ops.rs"
+test = false
+doc = false
+bench = false
+
+# Not part of the parent package's build.
+[workspace]

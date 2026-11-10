@@ -551,3 +551,128 @@ mod tests {
         assert_eq!((stats[0].dispatched, stats[0].queued, stats[0].in_flight), (77, 0, 0));
     }
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing
+)]
+mod model_tests {
+    use super::*;
+    use crate::sched::GroupTable;
+    use std::collections::HashSet;
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self, below: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % below as u64) as usize
+        }
+    }
+
+    /// Random interleavings of submitting, withdrawing, dispatching and
+    /// completing requests on two devices, checked against a plain model
+    /// of what is waiting and what is in the kernel.
+    #[test]
+    fn random_operations_keep_the_books_straight() {
+        let seeds = if cfg!(miri) { 3 } else { 300 };
+        for seed in 1..=seeds {
+            let mut rng = Rng((seed as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let table = Arc::new(GroupTable::new());
+            let classes: Vec<usize> = (0..4)
+                .map(|i| table.create_for_test("class", 1 + rng.next(2000) as u32 * (i + 1)))
+                .collect();
+            let depth = 1 + rng.next(6);
+            // One device is metered so tightly that requests have to wait
+            // for capacity as well as for depth.
+            let mut devices = HashMap::new();
+            let metered = IoProperties {
+                write_iops: Some(2_000_000),
+                ..Default::default()
+            };
+            devices.insert(1, Arc::new(DeviceGroup::new(metered, Duration::from_nanos(1))));
+            let mut scheduler =
+                IoScheduler::new(Arc::new(DeviceTable::new(devices)), GroupCache::new(table), depth);
+
+            let mut waiting: HashMap<usize, (u64, usize)> = HashMap::new();
+            let mut in_kernel: HashMap<usize, u64> = HashMap::new();
+            let mut finished: HashSet<usize> = HashSet::new();
+            let mut next_key = 0;
+            let mut batch = Vec::new();
+
+            let mut dispatch = |scheduler: &mut IoScheduler,
+                                waiting: &mut HashMap<usize, (u64, usize)>,
+                                in_kernel: &mut HashMap<usize, u64>| {
+                scheduler.take_ready(&mut batch);
+                for request in batch.drain(..) {
+                    let (device, _) = waiting.remove(&request.key).expect("dispatched once, and only if waiting");
+                    assert_eq!(device, request.device);
+                    in_kernel.insert(request.key, device);
+                }
+                for device in [0u64, 1] {
+                    let flying = in_kernel.values().filter(|&&d| d == device).count();
+                    assert!(flying <= depth, "seed {seed}: {flying} in flight at depth {depth}");
+                }
+            };
+
+            for _ in 0..if cfg!(miri) { 60 } else { 600 } {
+                match rng.next(10) {
+                    0..=4 => {
+                        let device = rng.next(2) as u64;
+                        // Sometimes a group the scheduler has never heard of.
+                        let class = if rng.next(20) == 0 { 99 } else { classes[rng.next(4)] };
+                        let filed = scheduler.enqueue(
+                            next_key,
+                            device,
+                            class,
+                            Direction::Write,
+                            rng.next(1 << 20) as u64,
+                            io_uring::opcode::Nop::new().build(),
+                        );
+                        assert!(filed == class || (class == 99 && filed == DEFAULT_GROUP));
+                        waiting.insert(next_key, (device, filed));
+                        next_key += 1;
+                    }
+                    5 => {
+                        if let Some((&key, &(device, class))) = waiting.iter().next() {
+                            scheduler.remove(device, class, key);
+                            waiting.remove(&key);
+                            finished.insert(key);
+                        }
+                    }
+                    6 | 7 => dispatch(&mut scheduler, &mut waiting, &mut in_kernel),
+                    _ => {
+                        if let Some((&key, &device)) = in_kernel.iter().next() {
+                            scheduler.completed(device);
+                            in_kernel.remove(&key);
+                            assert!(finished.insert(key), "completed twice");
+                        }
+                    }
+                }
+                let queued: usize = scheduler.stats().iter().map(|stats| stats.queued).sum();
+                assert_eq!(queued, waiting.len(), "seed {seed}");
+                let flying: usize = scheduler.stats().iter().map(|stats| stats.in_flight).sum();
+                assert_eq!(flying, in_kernel.len(), "seed {seed}");
+            }
+
+            // Everything left drains; nothing is lost or duplicated.
+            let mut rounds = 0;
+            while !waiting.is_empty() || !in_kernel.is_empty() {
+                dispatch(&mut scheduler, &mut waiting, &mut in_kernel);
+                for (key, device) in in_kernel.drain() {
+                    scheduler.completed(device);
+                    assert!(finished.insert(key));
+                }
+                rounds += 1;
+                assert!(rounds < 1_000_000, "seed {seed}: requests are stuck");
+            }
+            assert_eq!(finished.len(), next_key);
+            assert!(scheduler.retry_at().is_none());
+        }
+    }
+}
