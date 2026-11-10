@@ -18,7 +18,26 @@ use crate::fs::{remove_file, DmaFile};
 use crate::ioqueue::{Direction, IoProperties};
 use crate::{shard_id, spawn, submit_to_all};
 
-/// How to run a measurement.
+/// How to run a measurement: how large a file to work in, how long each
+/// phase lasts, how hard to load the device, and the request sizes.
+///
+/// The defaults suit a first measurement of an ordinary SSD. `Options` is
+/// meant to be built from them:
+///
+/// ```
+/// use starfish::iotune::Options;
+/// use std::time::Duration;
+///
+/// let options = Options {
+///     phase: Duration::from_secs(10),
+///     ..Options::default()
+/// };
+/// assert_eq!(options.depth, 64);
+/// ```
+///
+/// Shorter phases and smaller files finish sooner and measure worse: what a
+/// device can do depends on what it was doing a moment before, and short
+/// runs catch it at unrepresentative moments.
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
     /// Size of the scratch file. It should be much larger than the
@@ -35,6 +54,8 @@ pub struct Options {
 }
 
 impl Default for Options {
+    /// A 1 GiB file, 5 seconds per phase, 64 requests in flight, 4 KiB random
+    /// and 1 MiB sequential requests.
     fn default() -> Options {
         Options {
             file_size: 1 << 30,
@@ -46,6 +67,10 @@ impl Default for Options {
     }
 }
 
+/// The four parts of a measurement, in the order they give useful
+/// figures: fill the file, read it in order, read it at random, write it at
+/// random. Reads come before the random writes because a device that has
+/// just taken a burst of small writes may be slow for a while afterwards.
 #[derive(Clone, Copy)]
 enum Phase {
     /// Sequential writes; also covers the whole region at least once, so
@@ -56,7 +81,9 @@ enum Phase {
     RandomRead,
 }
 
-/// The work of one shard, fixed before the first phase.
+/// The work of one shard, fixed before the first phase: the size of its
+/// own stretch of the file, the two request sizes, how many requests it
+/// keeps in flight, and how long a phase lasts.
 #[derive(Clone, Copy)]
 struct Plan {
     /// Bytes of the file each shard works in.
@@ -67,19 +94,24 @@ struct Plan {
     phase: Duration,
 }
 
+/// What one worker, or one shard, got done in a phase: how many requests,
+/// and how many bytes they covered.
 #[derive(Clone, Copy, Default)]
 struct Tally {
     requests: u64,
     bytes: u64,
 }
 
-/// One shard's result for one phase, as rates.
+/// One shard's result for one phase, as rates. Shards' rates add up to
+/// the device's.
 #[derive(Clone, Copy, Default)]
 struct Rates {
     requests_per_sec: u64,
     bytes_per_sec: u64,
 }
 
+/// A count over a duration, as a rate per second. A duration of zero is
+/// taken as one nanosecond, so the result is defined, if meaningless.
 fn per_second(count: u64, elapsed: Duration) -> u64 {
     let nanos = elapsed.as_nanos().max(1);
     let rate = u128::from(count)
@@ -89,18 +121,23 @@ fn per_second(count: u64, elapsed: Duration) -> u64 {
     u64::try_from(rate).unwrap_or(u64::MAX)
 }
 
+/// `value` rounded up to a multiple of `to`.
 fn round_up(value: u64, to: u64) -> u64 {
     value.checked_next_multiple_of(to.max(1)).unwrap_or(value)
 }
 
+/// `value` rounded down to a multiple of `to`.
 fn round_down(value: u64, to: u64) -> u64 {
     value.saturating_sub(value.checked_rem(to.max(1)).unwrap_or(0))
 }
 
-/// xorshift64*: cheap, and random enough to spread requests over a file.
+/// xorshift64*: a pseudo-random number generator, cheap and random enough
+/// to spread requests over a file. Not for anything that needs
+/// unpredictability. Its state must not be zero.
 struct Rng(u64);
 
 impl Rng {
+    /// The next number in the sequence.
     fn next(&mut self) -> u64 {
         self.0 ^= self.0 >> 12;
         self.0 ^= self.0 << 25;
@@ -109,7 +146,12 @@ impl Rng {
     }
 }
 
-/// Runs one phase on the current shard.
+/// Runs one phase on the current shard: starts the shard's workers, each
+/// of which issues requests one after another until the phase's time is up,
+/// and returns the shard's rates.
+///
+/// Each shard works in its own stretch of the file, so the shards do not
+/// read or write the same blocks.
 async fn run_phase(path: PathBuf, phase: Phase, plan: Plan) -> io::Result<Rates> {
     let shard = shard_id()? as u64;
     let base = shard.saturating_mul(plan.region);
@@ -224,6 +266,9 @@ async fn run_everywhere(path: &Path, phase: Phase, plan: Plan) -> io::Result<Rat
     Ok(total)
 }
 
+/// Runs the four phases in order and puts their figures together: the
+/// sequential phases give the bandwidths and the random ones the request
+/// rates.
 async fn run_phases(path: &Path, plan: Plan) -> io::Result<IoProperties> {
     let write = run_everywhere(path, Phase::Fill, plan).await?;
     let read = run_everywhere(path, Phase::SequentialRead, plan).await?;

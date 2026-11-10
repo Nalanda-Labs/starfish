@@ -16,6 +16,8 @@ use io_uring::squeue;
 use crate::sched::{virtual_cost, GroupCache, DEFAULT_GROUP};
 use crate::stats::DeviceStats;
 
+/// Nanoseconds in a second, wide enough for the products formed when a
+/// rate is turned into a time.
 const NANOS_PER_SEC: u128 = 1_000_000_000;
 /// Cost of a request, in bytes on top of its size, on a device with no
 /// configured capacity. It only orders requests between groups.
@@ -41,12 +43,16 @@ pub struct IoProperties {
     pub write_bytes_per_sec: Option<u64>,
 }
 
+/// Whether a request reads or writes. The two are charged at their own
+/// rates, since devices are seldom equally fast at both.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Direction {
     Read,
     Write,
 }
 
+/// A duration as whole nanoseconds, or the largest `u64` if it does not
+/// fit.
 fn nanos(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
@@ -71,6 +77,15 @@ pub(crate) struct DeviceGroup {
 }
 
 impl DeviceGroup {
+    /// The shared state for a device with the given capacity.
+    ///
+    /// `latency_goal` is how much work, measured in the time the device needs
+    /// for it, may be inside the device at once: the size of the bucket. A small
+    /// goal keeps the device's own queue short, so that a request sent ahead of
+    /// others by priority does not then wait behind them inside the device.
+    ///
+    /// A capacity with no rate given at all describes an unmetered device, which
+    /// admits everything.
     pub(crate) fn new(props: IoProperties, latency_goal: Duration) -> DeviceGroup {
         // A rate of zero cannot be honoured; treat it as not given.
         let rate = |rate: Option<u64>| rate.filter(|&rate| rate > 0);
@@ -91,11 +106,16 @@ impl DeviceGroup {
         }
     }
 
+    /// The state for a device whose capacity was not configured: nothing is
+    /// metered and every request is admitted at once.
     pub(crate) fn unmetered() -> DeviceGroup {
         DeviceGroup::new(IoProperties::default(), Duration::ZERO)
     }
 
-    /// Nanoseconds of device time a request is expected to take.
+    /// Nanoseconds of device time a request is expected to take: one
+    /// request's worth at the IOPS rate, plus its bytes at the bandwidth rate,
+    /// for its direction. A rate that was not given contributes nothing. At
+    /// least one, so that no request is free.
     fn device_time(&self, direction: Direction, bytes: u64) -> u64 {
         let (iops, bandwidth) = match direction {
             Direction::Read => (self.props.read_iops, self.props.read_bytes_per_sec),
@@ -117,8 +137,13 @@ impl DeviceGroup {
     }
 
     /// The cost of a request as `(tokens, fair)`: what it takes from the
-    /// device's bucket, and what it counts for when sharing the device
-    /// between groups.
+    /// device's bucket, and what it counts for when sharing the device between
+    /// groups.
+    ///
+    /// On a metered device both are the device time it needs. On an unmetered
+    /// one it takes nothing from the bucket, and for sharing it counts by its
+    /// size plus a fixed amount per request, so that many small requests are not
+    /// free compared with one large one.
     pub(crate) fn cost(&self, direction: Direction, bytes: u64) -> (u64, u64) {
         if self.metered {
             let time = self.device_time(direction, bytes);
@@ -128,6 +153,12 @@ impl DeviceGroup {
         }
     }
 
+    /// Credits the bucket with the time that has passed since it was last
+    /// filled, up to its capacity.
+    ///
+    /// Several shards call this at once. The one that moves the "filled up to"
+    /// mark forward is the one that credits the interval it moved it by, so no
+    /// stretch of time is ever credited twice.
     fn refill(&self, now: Instant) {
         let now = nanos(now.saturating_duration_since(self.epoch));
         // Whoever advances the watermark owns the interval it advanced by,
@@ -152,8 +183,13 @@ impl DeviceGroup {
         }
     }
 
-    /// Tries to admit a request costing `tokens`. Returns `None` if it may
-    /// go now, or how long to wait before asking again.
+    /// Tries to admit a request costing `tokens`. Returns `None` if it may go
+    /// now, or how long to wait before asking again.
+    ///
+    /// A request is admitted whenever the balance is positive, whatever its
+    /// cost, and then takes the balance down by its full cost, possibly below
+    /// zero. Later requests wait until time has paid the debt off. That admits
+    /// requests larger than the bucket while keeping the long-run rate exact.
     fn acquire(&self, tokens: u64, now: Instant) -> Option<Duration> {
         if !self.metered {
             return None;
@@ -179,18 +215,21 @@ impl DeviceGroup {
     }
 }
 
-/// The devices whose capacity was configured, by device number.
+/// The devices whose capacity was configured, by device number. Built once
+/// when the runtime starts and shared, read-only, by all shards.
 pub(crate) struct DeviceTable {
     devices: HashMap<u64, Arc<DeviceGroup>>,
 }
 
 impl DeviceTable {
+    /// A table of the configured devices.
     pub(crate) fn new(devices: HashMap<u64, Arc<DeviceGroup>>) -> DeviceTable {
         DeviceTable { devices }
     }
 
-    /// The shared state of a device. A device without configured capacity
-    /// is unmetered, which needs no sharing between shards.
+    /// The shared state of a device. A device without configured capacity is
+    /// unmetered, which needs no sharing between shards, so each shard simply
+    /// gets a fresh unmetered state for it.
     fn get(&self, device: u64) -> Arc<DeviceGroup> {
         match self.devices.get(&device) {
             Some(group) => group.clone(),
@@ -199,6 +238,11 @@ impl DeviceTable {
     }
 }
 
+/// A request waiting for its turn at a device: the prepared io_uring
+/// entry, where it belongs, what it costs, and when it started waiting.
+///
+/// `key` is the reactor's slot number for the operation, which is also how a
+/// request is found again if its future is dropped while it still waits.
 pub(crate) struct QueuedRequest {
     pub(crate) key: usize,
     pub(crate) device: u64,
@@ -209,13 +253,18 @@ pub(crate) struct QueuedRequest {
     enqueued: Instant,
 }
 
+/// One scheduling group's waiting requests for one device, in the order
+/// they were made, with the group's virtual time on that device: the device
+/// time it has had, divided by its I/O shares.
 #[derive(Default)]
 struct IoClass {
     queue: VecDeque<QueuedRequest>,
     vtime: u64,
 }
 
-/// One shard's requests for one device.
+/// One shard's requests for one device: a queue per scheduling group, the
+/// order in which the groups are to be served, how many requests are in the
+/// kernel, and the running totals for the statistics.
 struct IoQueue {
     device: Arc<DeviceGroup>,
     /// Indexed by scheduling group.
@@ -238,6 +287,7 @@ struct IoQueue {
 }
 
 impl IoQueue {
+    /// An empty queue for `device`.
     fn new(device: Arc<DeviceGroup>) -> IoQueue {
         IoQueue {
             device,
@@ -254,6 +304,10 @@ impl IoQueue {
         }
     }
 
+    /// Files a request under its scheduling group.
+    ///
+    /// A group that had nothing waiting starts from the current virtual time,
+    /// so that a group cannot save up a claim on the device by staying idle.
     fn enqueue(&mut self, class: usize, request: QueuedRequest) {
         self.waiting = self.waiting.saturating_add(1);
         if class >= self.classes.len() {
@@ -311,6 +365,8 @@ impl IoQueue {
         }
     }
 
+    /// Withdraws a waiting request, by its slot number. Used when the future
+    /// that made the request is dropped before the request reaches the kernel.
     fn remove(&mut self, class: usize, key: usize) {
         let Some(entry) = self.classes.get_mut(class) else { return };
         let before = entry.queue.len();
@@ -321,6 +377,7 @@ impl IoQueue {
         }
     }
 
+    /// Forgets every waiting request. Used at shutdown.
     fn clear(&mut self) {
         for entry in &mut self.classes {
             entry.queue.clear();
@@ -331,7 +388,9 @@ impl IoQueue {
     }
 }
 
-/// All of one shard's disk queues.
+/// All of one shard's disk queues, one per device it has used, and what
+/// they share: the device table, the shard's view of the scheduling groups,
+/// and the limit on requests in the kernel per device.
 pub(crate) struct IoScheduler {
     devices: Arc<DeviceTable>,
     queues: HashMap<u64, IoQueue>,
@@ -345,6 +404,9 @@ pub(crate) struct IoScheduler {
 }
 
 impl IoScheduler {
+    /// A scheduler with no queues yet; a device's queue is made the first
+    /// time the shard uses the device. `depth` is how many requests per device
+    /// the shard keeps in the kernel, and is at least one.
     pub(crate) fn new(devices: Arc<DeviceTable>, groups: GroupCache, depth: usize) -> IoScheduler {
         IoScheduler {
             devices,
@@ -356,7 +418,9 @@ impl IoScheduler {
         }
     }
 
-    /// Queues a request and returns the group it was filed under.
+    /// Queues a request and returns the group it was filed under, which is
+    /// `class` unless that group does not exist, in which case it is the default
+    /// group.
     pub(crate) fn enqueue(
         &mut self,
         key: usize,
@@ -388,7 +452,9 @@ impl IoScheduler {
         class
     }
 
-    /// Collects into `out` the requests that may go to the kernel now.
+    /// Collects into `out` the requests that may go to the kernel now, from
+    /// every device's queue, and notes when to look again if some are held back
+    /// only by device capacity.
     pub(crate) fn take_ready(&mut self, out: &mut Vec<QueuedRequest>) {
         if self.waiting == 0 {
             self.retry_at = None;
@@ -408,7 +474,8 @@ impl IoScheduler {
         self.waiting = self.waiting.saturating_sub(taken);
     }
 
-    /// A request previously taken with `take_ready` has left the kernel.
+    /// Records that a request previously taken with `take_ready` has left the
+    /// kernel, which makes room for another under the per-device limit.
     pub(crate) fn completed(&mut self, device: u64) {
         if let Some(queue) = self.queues.get_mut(&device) {
             queue.in_flight = queue.in_flight.saturating_sub(1);
@@ -429,6 +496,8 @@ impl IoScheduler {
         self.retry_at
     }
 
+    /// Forgets every waiting request, on every device. Used at shutdown;
+    /// requests already in the kernel are the reactor's to wait for.
     pub(crate) fn clear(&mut self) {
         for queue in self.queues.values_mut() {
             queue.clear();
@@ -437,6 +506,7 @@ impl IoScheduler {
         self.retry_at = None;
     }
 
+    /// The state of every device queue, ordered by device number.
     pub(crate) fn stats(&self) -> Vec<DeviceStats> {
         let mut stats: Vec<DeviceStats> = self
             .queues
