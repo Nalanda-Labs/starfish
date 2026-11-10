@@ -43,7 +43,7 @@ wrong). `cargo doc --open` shows it together with the API reference.
 
 ## Examples
 
-There are 42 programs in `examples/`. Run one with
+There are 43 programs in `examples/`. Run one with
 `cargo run --release --example <name>`. Those marked *server* run until
 Ctrl-C; the others do their work and exit.
 
@@ -71,6 +71,7 @@ Ctrl-C; the others do their work and exit.
 | | `io_timeout` | Time limits on accept, read and connect |
 | | `dispatcher` | Accepting on one shard, serving on others |
 | | `udp_ping` | Datagrams between two UDP sockets |
+| | `unix_socket` | A Unix-domain server shared by all shards, with caller identity |
 | | `fixed_buffers` | Registered buffers and zero-copy sends |
 | | `echo` | *Server.* Echo with a connection limit and orderly shutdown |
 | | `http_hello` | *Server.* A minimal HTTP/1.1 responder on every shard |
@@ -118,7 +119,8 @@ The servers listen on 127.0.0.1, ports 7000 to 7005.
   device has an I/O queue per shard that orders waiting requests by group
   shares. Declare a device's capacity (`Runtime::io_properties`, measured
   with `iotune::measure`) and all shards together stay within it.
-- **Network:** `net::TcpListener`, `TcpStream`, `UdpSocket`. Networking
+- **Network:** `net::TcpListener`, `TcpStream`, `UdpSocket`, and
+  `UnixListener`/`UnixStream` for local connections. Networking
   uses the kernel stack; there is no userspace TCP stack.
 - **Buffered I/O:** `io::BufReader` and `io::BufWriter` for lines and
   length-framed data, over TCP streams and, through `fs::Cursor`, files.

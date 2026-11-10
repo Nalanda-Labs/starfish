@@ -1938,3 +1938,78 @@ fn files_are_read_and_written_in_order_through_a_cursor() {
         })
         .unwrap();
 }
+
+#[test]
+fn unix_sockets_connect_processes_on_one_machine() {
+    use starfish::net::{UnixListener, UnixStream};
+
+    let path = scratch("socket");
+    rt(3)
+        .run({
+            let path = path.clone();
+            move || async move {
+                let listener = UnixListener::bind(&path).unwrap();
+                // A path holds one socket; a second bind is refused, and so
+                // is one over the file a listener leaves behind.
+                let taken = UnixListener::bind(&path).err().unwrap();
+                assert_eq!(taken.kind(), std::io::ErrorKind::AddrInUse);
+                let nobody = UnixStream::connect(scratch("no-such-socket")).await.err().unwrap();
+                assert_eq!(nobody.kind(), std::io::ErrorKind::NotFound);
+
+                // Every shard accepts on the same socket through its own
+                // handle, and says which shard it is.
+                let mut acceptors = Vec::new();
+                for shard in 0..3 {
+                    let listener = listener.try_clone().unwrap();
+                    acceptors.push(spawn(submit_to(shard, move || async move {
+                        let stream = listener.accept().await.unwrap();
+                        let me = stream.peer_credentials().unwrap();
+                        // SAFETY: plain system calls.
+                        let (pid, uid) = unsafe { (libc::getpid(), libc::getuid()) };
+                        assert_eq!((me.process, me.user), (pid, uid));
+
+                        let mut lines = BufReader::new(&stream).limit(1024);
+                        let mut out = BufWriter::new(&stream);
+                        while let Some(line) = lines.next_line().await.unwrap() {
+                            out.write_all(format!("shard {shard}: {line}\n").as_bytes()).await.unwrap();
+                            out.flush().await.unwrap();
+                        }
+                    })));
+                }
+                drop(listener);
+                sleep(Duration::from_millis(10)).await;
+
+                let mut served_by = Vec::new();
+                for client in 0..3 {
+                    let stream = UnixStream::connect(&path).await.unwrap();
+                    let (result, _) = stream.write_all(format!("hello {client}\n")).await;
+                    result.unwrap();
+                    let (result, reply) = stream.read(Vec::with_capacity(64)).await;
+                    result.unwrap();
+                    let reply = String::from_utf8(reply).unwrap();
+                    assert!(reply.ends_with(&format!(": hello {client}\n")), "{reply:?}");
+                    served_by.push(reply[..7].to_owned());
+                    // A plain write, and the end of the conversation.
+                    let (result, _) = stream.write("again\n").await;
+                    assert_eq!(result.unwrap(), 6);
+                    let (result, reply) = stream.read(Vec::with_capacity(64)).await;
+                    result.unwrap();
+                    assert!(reply.ends_with(b": again\n"));
+                    stream.shutdown(std::net::Shutdown::Write).unwrap();
+                    let (result, _) = stream.read(Vec::with_capacity(64)).await;
+                    assert_eq!(result.unwrap(), 0);
+                }
+                for acceptor in acceptors {
+                    acceptor.await.unwrap().unwrap();
+                }
+                // Three connections, three shards, each served once.
+                served_by.sort();
+                assert_eq!(served_by, ["shard 0", "shard 1", "shard 2"]);
+
+                // The socket file outlives its listeners.
+                assert!(starfish::fs::metadata(&path).await.is_ok());
+                starfish::fs::remove_file(&path).await.unwrap();
+            }
+        })
+        .unwrap();
+}

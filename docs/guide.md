@@ -24,6 +24,7 @@ the code.
 - [TCP](#tcp)
 - [Buffered reading and writing](#buffered-reading-and-writing)
 - [UDP](#udp)
+- [Unix-domain sockets](#unix-domain-sockets)
 - [Files](#files)
 - [Direct I/O](#direct-io)
 - [Directories and file management](#directories-and-file-management)
@@ -805,6 +806,67 @@ async fn udp_echo() -> std::io::Result<()> {
   datagrams from anyone else are discarded by the kernel from then on.
 - As with TCP, `SO_REUSEPORT` cannot be turned off.
 
+# Unix-domain sockets
+
+[`UnixListener`](crate::net::UnixListener) and
+[`UnixStream`](crate::net::UnixStream) connect processes on the same
+machine through a path in the filesystem. A `UnixStream` reads and writes
+like a `TcpStream`, works with the buffered reader and writer, and can
+tell who is on the other end.
+
+```rust,no_run
+use starfish::net::UnixListener;
+use starfish::{shard_count, spawn, submit_to};
+
+async fn serve(path: &str) -> starfish::Result<()> {
+    // A file left by an earlier run would make `bind` fail.
+    let _ = starfish::fs::remove_file(path).await;
+    let listener = UnixListener::bind(path)?;
+    // One socket, a handle for every shard.
+    for shard in 0..shard_count()? {
+        let listener = listener.try_clone()?;
+        spawn(submit_to(shard, move || async move {
+            while let Ok(stream) = listener.accept().await {
+                spawn(async move {
+                    if let Ok(caller) = stream.peer_credentials() {
+                        println!("connection from user {}", caller.user);
+                    }
+                    // ... serve `stream` ...
+                });
+            }
+        }));
+    }
+    Ok(())
+}
+```
+
+**Caveats**
+
+- A path can have only one listening socket. There is no listener per
+  shard as with TCP: every shard accepts on a handle to the same socket
+  ([`try_clone`](crate::net::UnixListener::try_clone)), or one shard
+  accepts and hands connections out.
+- The kernel gives each connection to one of the shards waiting in
+  `accept`, with no regard for how busy they are. A shard that is not
+  waiting gets nothing.
+- `bind` fails with `AddrInUse` if anything is at the path, including the
+  socket file of an earlier run. The file is not removed when the
+  listener is dropped, even on a clean exit. Remove it before binding and
+  after shutting down.
+- Who may connect is decided by the file's permissions and those of the
+  directories above it. A socket in a world-writable directory with
+  default permissions is open to every user on the machine;
+  [`peer_credentials`](crate::net::UnixStream::peer_credentials) says who
+  did connect.
+- The credentials are those of the process that called `connect`, at
+  that moment. A process that received the socket from another, or
+  changed user afterwards, still shows the original ones.
+- Paths are limited to about 100 bytes by the kernel. Longer ones are
+  refused.
+- Only stream sockets and filesystem paths: no datagram sockets, no
+  abstract (path-less) addresses, and no passing of file descriptors.
+- There are no zero-copy sends on Unix sockets.
+
 # Files
 
 Files have no cursor: every read and write names its offset, so
@@ -1451,7 +1513,6 @@ has let go of it.
 
 - Networking uses the kernel's stack. There is no userspace TCP.
 - No TLS, no HTTP, no DNS resolution: addresses are `SocketAddr`s.
-- No Unix-domain sockets.
 - No buffered interface for direct I/O, and no calls for links or for
   changing permissions.
 - A [`shared_channel`](crate::sync::shared_channel) has one sender and one

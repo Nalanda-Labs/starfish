@@ -1,4 +1,4 @@
-//! TCP and UDP sockets, on the kernel's network stack.
+//! TCP, UDP and Unix-domain sockets, on the kernel's network stack.
 //!
 //! A socket is not tied to a shard: each call submits to the ring of the
 //! shard it is made on, so a connection can be handed to another shard with
@@ -33,6 +33,106 @@ fn clamp_len(len: usize) -> u32 {
     u32::try_from(len).unwrap_or(u32::MAX)
 }
 
+/// Reads from a stream socket into `buf` from its start.
+async fn stream_read<B: IoBufMut>(fd: RawFd, mut buf: B) -> (io::Result<usize>, B) {
+    let fd = types::Fd(fd);
+    let len = clamp_len(buf.capacity());
+    let ptr = buf.as_mut_ptr();
+    let sqe = match buf.fixed_index() {
+        Some(index) => opcode::ReadFixed::new(fd, ptr, len, index).build(),
+        None => opcode::Recv::new(fd, ptr, len).build(),
+    };
+    // SAFETY: the pointer targets memory the buffer keeps valid and in
+    // place for as long as the op holds the buffer (`IoBufMut`).
+    let (result, mut buf) = unsafe { Op::new(sqe, buf) }.await;
+    match result {
+        Ok(n) => {
+            let n = (n as usize).min(buf.capacity());
+            // SAFETY: the kernel initialised the first `n` bytes, and
+            // `n` is within the capacity.
+            unsafe { buf.set_len(n) };
+            (Ok(n), buf)
+        }
+        Err(err) => (Err(err), buf),
+    }
+}
+
+/// Sends some of `buf`, from `offset` on, to a stream socket.
+async fn stream_send_from<B: IoBuf>(fd: RawFd, buf: B, offset: usize) -> (io::Result<usize>, B) {
+    let offset = offset.min(buf.len());
+    let len = clamp_len(buf.len().saturating_sub(offset));
+    // Stays inside the buffer: `offset <= len`.
+    let ptr = buf.as_ptr().wrapping_add(offset);
+    let sqe = opcode::Send::new(types::Fd(fd), ptr, len).flags(libc::MSG_NOSIGNAL).build();
+    // SAFETY: the pointer targets memory the buffer keeps valid and in
+    // place for as long as the op holds the buffer (`IoBuf`).
+    let (result, buf) = unsafe { Op::new(sqe, buf) }.await;
+    (result.map(|n| n as usize), buf)
+}
+
+/// Sends all of `buf` to a stream socket.
+async fn stream_write_all<B: IoBuf>(fd: RawFd, mut buf: B) -> (io::Result<()>, B) {
+    let mut written = 0usize;
+    while written < buf.len() {
+        let (result, returned) = stream_send_from(fd, buf, written).await;
+        buf = returned;
+        match result {
+            Ok(0) => return (Err(io::ErrorKind::WriteZero.into()), buf),
+            Ok(n) => written = written.saturating_add(n),
+            Err(err) => return (Err(err), buf),
+        }
+    }
+    (Ok(()), buf)
+}
+
+/// Waits for the next connection on a listening socket.
+async fn accept_fd(listener: RawFd) -> io::Result<OwnedFd> {
+    let sqe = opcode::Accept::new(types::Fd(listener), std::ptr::null_mut(), std::ptr::null_mut())
+        .flags(libc::SOCK_CLOEXEC)
+        .build();
+    // SAFETY: the entry carries no pointers.
+    let (result, ()) = unsafe { Op::new(sqe, ()) }.result_is_fd().await;
+    let fd = RawFd::try_from(result?).map_err(|_| io::Error::other("invalid file descriptor"))?;
+    // SAFETY: the kernel returned a new fd that nothing else owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Connects a socket to `addr`.
+async fn connect_fd(fd: &OwnedFd, addr: SockAddr) -> io::Result<()> {
+    // Boxed so the address the kernel reads does not move with the future.
+    let addr = Box::new(addr);
+    let sqe = opcode::Connect::new(types::Fd(fd.as_raw_fd()), addr.as_ptr().cast(), addr.len()).build();
+    // SAFETY: the pointer targets the boxed address held as op data.
+    let (result, _addr) = unsafe { Op::new(sqe, addr) }.await;
+    result.map(|_| ())
+}
+
+/// Makes the buffered reader and writer work on a kind of stream, held by
+/// value, by reference or in an `Rc`.
+macro_rules! buffered_stream {
+    ($stream:ty) => {
+        buffered_stream!(@impl $stream, $stream);
+        buffered_stream!(@impl $stream, &$stream);
+        buffered_stream!(@impl $stream, std::rc::Rc<$stream>);
+    };
+    (@impl $stream:ty, $holder:ty) => {
+        impl crate::io::Read for $holder {
+            async fn read_some(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+                <$stream>::read(self, buf).await
+            }
+        }
+
+        impl crate::io::Write for $holder {
+            async fn write_whole(&mut self, buf: Vec<u8>) -> (io::Result<()>, Vec<u8>) {
+                <$stream>::write_all(self, buf).await
+            }
+        }
+    };
+}
+
+buffered_stream!(TcpStream);
+buffered_stream!(UnixStream);
+
 /// A listening TCP socket.
 pub struct TcpListener {
     fd: OwnedFd,
@@ -61,19 +161,8 @@ impl TcpListener {
     /// Dropping the future cancels the wait. A connection that arrives at
     /// that very moment is closed, not handed to a later call.
     pub async fn accept(&self) -> io::Result<TcpStream> {
-        let sqe = opcode::Accept::new(
-            types::Fd(self.fd.as_raw_fd()),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-        .flags(libc::SOCK_CLOEXEC)
-        .build();
-        // SAFETY: the entry carries no pointers.
-        let (result, ()) = unsafe { Op::new(sqe, ()) }.result_is_fd().await;
-        let fd = RawFd::try_from(result?).map_err(|_| io::Error::other("invalid file descriptor"))?;
-        // SAFETY: the kernel returned a new fd that nothing else owns.
         Ok(TcpStream {
-            fd: unsafe { OwnedFd::from_raw_fd(fd) },
+            fd: accept_fd(self.fd.as_raw_fd()).await?,
         })
     }
 }
@@ -88,13 +177,7 @@ impl TcpStream {
     pub async fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
         let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
         let fd: OwnedFd = socket.into();
-        // Boxed so the address the kernel reads does not move with the future.
-        let addr = Box::new(SockAddr::from(addr));
-        let sqe = opcode::Connect::new(types::Fd(fd.as_raw_fd()), addr.as_ptr().cast(), addr.len())
-            .build();
-        // SAFETY: the pointer targets the boxed address held as op data.
-        let (result, _addr) = unsafe { Op::new(sqe, addr) }.await;
-        result?;
+        connect_fd(&fd, SockAddr::from(addr)).await?;
         Ok(TcpStream { fd })
     }
 
@@ -103,60 +186,18 @@ impl TcpStream {
     ///
     /// `Ok(0)` means the peer closed the connection (or the buffer has no
     /// capacity).
-    pub async fn read<B: IoBufMut>(&self, mut buf: B) -> (io::Result<usize>, B) {
-        let fd = types::Fd(self.fd.as_raw_fd());
-        let len = clamp_len(buf.capacity());
-        let ptr = buf.as_mut_ptr();
-        let sqe = match buf.fixed_index() {
-            Some(index) => opcode::ReadFixed::new(fd, ptr, len, index).build(),
-            None => opcode::Recv::new(fd, ptr, len).build(),
-        };
-        // SAFETY: the pointer targets memory the buffer keeps valid and in
-        // place for as long as the op holds the buffer (`IoBufMut`).
-        let (result, mut buf) = unsafe { Op::new(sqe, buf) }.await;
-        match result {
-            Ok(n) => {
-                let n = (n as usize).min(buf.capacity());
-                // SAFETY: the kernel initialised the first `n` bytes, and
-                // `n` is within the capacity.
-                unsafe { buf.set_len(n) };
-                (Ok(n), buf)
-            }
-            Err(err) => (Err(err), buf),
-        }
+    pub async fn read<B: IoBufMut>(&self, buf: B) -> (io::Result<usize>, B) {
+        stream_read(self.fd.as_raw_fd(), buf).await
     }
 
     /// Writes some prefix of `buf` and returns how many bytes were sent.
     pub async fn write<B: IoBuf>(&self, buf: B) -> (io::Result<usize>, B) {
-        self.send_from(buf, 0).await
+        stream_send_from(self.fd.as_raw_fd(), buf, 0).await
     }
 
     /// Writes all of `buf`.
-    pub async fn write_all<B: IoBuf>(&self, mut buf: B) -> (io::Result<()>, B) {
-        let mut written = 0usize;
-        while written < buf.len() {
-            let (result, returned) = self.send_from(buf, written).await;
-            buf = returned;
-            match result {
-                Ok(0) => return (Err(io::ErrorKind::WriteZero.into()), buf),
-                Ok(n) => written = written.saturating_add(n),
-                Err(err) => return (Err(err), buf),
-            }
-        }
-        (Ok(()), buf)
-    }
-
-    async fn send_from<B: IoBuf>(&self, buf: B, offset: usize) -> (io::Result<usize>, B) {
-        let fd = types::Fd(self.fd.as_raw_fd());
-        let offset = offset.min(buf.len());
-        let len = clamp_len(buf.len().saturating_sub(offset));
-        // Stays inside the buffer: `offset <= len`.
-        let ptr = buf.as_ptr().wrapping_add(offset);
-        let sqe = opcode::Send::new(fd, ptr, len).flags(libc::MSG_NOSIGNAL).build();
-        // SAFETY: the pointer targets memory the buffer keeps valid and in
-        // place for as long as the op holds the buffer (`IoBuf`).
-        let (result, buf) = unsafe { Op::new(sqe, buf) }.await;
-        (result.map(|n| n as usize), buf)
+    pub async fn write_all<B: IoBuf>(&self, buf: B) -> (io::Result<()>, B) {
+        stream_write_all(self.fd.as_raw_fd(), buf).await
     }
 
     /// Sends some prefix of `buf` without copying it: the network stack
@@ -383,14 +424,128 @@ impl UdpSocket {
     }
 }
 
-impl<S: std::borrow::Borrow<TcpStream>> crate::io::Read for S {
-    async fn read_some(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
-        TcpStream::read(self.borrow(), buf).await
+/// A listening Unix-domain socket: connections from other processes on
+/// the same machine, addressed by a path in the filesystem.
+///
+/// Unlike a TCP port, a path can have only one listening socket, so the
+/// per-shard listeners of a TCP server are not possible. Instead, give
+/// every shard a handle to the same socket with
+/// [`try_clone`](Self::try_clone); each connection then goes to one of the
+/// shards waiting in [`accept`](Self::accept).
+pub struct UnixListener {
+    fd: OwnedFd,
+}
+
+impl UnixListener {
+    /// Creates the socket file at `path` and listens on it.
+    ///
+    /// # Errors
+    ///
+    /// `AddrInUse` if anything exists at `path`, including the socket file
+    /// of an earlier run: the file is not removed when the listener is
+    /// dropped. A server normally removes a stale file before binding.
+    pub fn bind(path: impl AsRef<std::path::Path>) -> io::Result<UnixListener> {
+        let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+        socket.set_cloexec(true)?;
+        socket.bind(&SockAddr::unix(path)?)?;
+        socket.listen(1024)?;
+        Ok(UnixListener { fd: socket.into() })
+    }
+
+    /// Another handle to the same listening socket, for another shard.
+    pub fn try_clone(&self) -> io::Result<UnixListener> {
+        Ok(UnixListener {
+            fd: self.fd.try_clone()?,
+        })
+    }
+
+    /// Waits for the next connection.
+    ///
+    /// Dropping the future cancels the wait. A connection that arrives at
+    /// that very moment is closed, not handed to a later call.
+    pub async fn accept(&self) -> io::Result<UnixStream> {
+        Ok(UnixStream {
+            fd: accept_fd(self.fd.as_raw_fd()).await?,
+        })
     }
 }
 
-impl<S: std::borrow::Borrow<TcpStream>> crate::io::Write for S {
-    async fn write_whole(&mut self, buf: Vec<u8>) -> (io::Result<()>, Vec<u8>) {
-        TcpStream::write_all(self.borrow(), buf).await
+/// A connected Unix-domain socket. It reads and writes like a
+/// [`TcpStream`], works with [`BufReader`] and [`BufWriter`], and can be
+/// moved to another shard.
+pub struct UnixStream {
+    fd: OwnedFd,
+}
+
+impl UnixStream {
+    /// Connects to the socket at `path`.
+    pub async fn connect(path: impl AsRef<std::path::Path>) -> io::Result<UnixStream> {
+        let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+        socket.set_cloexec(true)?;
+        let fd: OwnedFd = socket.into();
+        connect_fd(&fd, SockAddr::unix(path)?).await?;
+        Ok(UnixStream { fd })
     }
+
+    /// Reads into `buf` from its start, replacing its contents: on success
+    /// the buffer holds exactly the bytes received, at most its capacity.
+    ///
+    /// `Ok(0)` means the peer closed the connection (or the buffer has no
+    /// capacity).
+    pub async fn read<B: IoBufMut>(&self, buf: B) -> (io::Result<usize>, B) {
+        stream_read(self.fd.as_raw_fd(), buf).await
+    }
+
+    /// Writes some prefix of `buf` and returns how many bytes were sent.
+    pub async fn write<B: IoBuf>(&self, buf: B) -> (io::Result<usize>, B) {
+        stream_send_from(self.fd.as_raw_fd(), buf, 0).await
+    }
+
+    /// Writes all of `buf`.
+    pub async fn write_all<B: IoBuf>(&self, buf: B) -> (io::Result<()>, B) {
+        stream_write_all(self.fd.as_raw_fd(), buf).await
+    }
+
+    /// Shuts down the read half, the write half or both.
+    pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        SockRef::from(&self.fd).shutdown(how)
+    }
+
+    /// The process on the other end: its process, user and group ids, as
+    /// they were when it connected. This is how a server on a Unix socket
+    /// knows who is calling, without any password.
+    pub fn peer_credentials(&self) -> io::Result<PeerCredentials> {
+        let mut credentials = libc::ucred { pid: 0, uid: 0, gid: 0 };
+        let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: the kernel writes at most `length` bytes into a live
+        // structure of exactly that size.
+        let failed = unsafe {
+            libc::getsockopt(
+                self.fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                std::ptr::addr_of_mut!(credentials).cast(),
+                &mut length,
+            ) != 0
+        };
+        if failed {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(PeerCredentials {
+            process: credentials.pid,
+            user: credentials.uid,
+            group: credentials.gid,
+        })
+    }
+}
+
+/// Who is on the other end of a [`UnixStream`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerCredentials {
+    /// Process id.
+    pub process: i32,
+    /// User id.
+    pub user: u32,
+    /// Group id.
+    pub group: u32,
 }

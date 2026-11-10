@@ -46,6 +46,10 @@
 //! A task that is no longer wanted is cancelled with [`JoinHandle::abort`],
 //! and [`signal::termination`] tells the program when it is asked to stop.
 //!
+//! Sockets are in [`net`] (TCP, UDP and Unix-domain) and files in [`fs`]
+//! (through the page cache or with direct I/O, plus directories). [`io`]
+//! has a buffered reader and writer for both.
+//!
 //! I/O uses owned buffers: a call takes the buffer by value and hands it back
 //! with the result, because the kernel keeps writing to it even if the future
 //! is dropped.
