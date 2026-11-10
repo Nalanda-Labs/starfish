@@ -13,7 +13,7 @@ jobs:
     name: Lint and test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Kernel
         run: uname -r
       - name: Clippy (includes the no-panic lints)
@@ -31,7 +31,7 @@ jobs:
     name: Miri (unsafe code without io_uring)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install nightly with Miri
         run: rustup toolchain install nightly --profile minimal --component miri
       - name: Unit tests under Miri
@@ -43,7 +43,7 @@ jobs:
     name: Fuzz the allocator (2 minutes)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install nightly and cargo-fuzz
         run: |
           rustup toolchain install nightly --profile minimal
