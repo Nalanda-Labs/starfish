@@ -31,8 +31,11 @@
 //! - A log record carries its length and a checksum. After a crash the
 //!   log ends in padding or a torn record; replay stops at the first
 //!   record that does not check out.
-//! - When a log has grown large, the committer writes the live data to a
-//!   new file and renames it over the old one.
+//! - When a log has grown large it is compacted. A background task, in a
+//!   scheduling group with a tenth of the weight of request handling,
+//!   writes a snapshot of the live data to a new file while the committer
+//!   keeps taking writes and remembers them. The committer then adds
+//!   those to the new file and renames it over the old one.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -41,11 +44,12 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
-use starfish::fs::{create_dir_all, rename, DmaFile, DmaStreamReader, DmaStreamWriter, File};
+use starfish::fs::{create_dir_all, remove_file, rename, DmaFile, DmaStreamReader, DmaStreamWriter, File};
 use starfish::io::{BufReader, BufWriter};
 use starfish::net::{TcpListener, TcpStream};
 use starfish::sync::{channel, oneshot, Gate, OneshotSender, Receiver, Semaphore, Sender};
-use starfish::{shard_count, shard_id, signal, spawn, timeout, JoinHandle, Runtime, Sharded};
+use starfish::{maybe_yield, shard_count, shard_id, signal, spawn, timeout};
+use starfish::{JoinHandle, Runtime, SchedulingGroup, Sharded};
 
 const PORT: u16 = 7006;
 /// Connections each shard serves at a time.
@@ -56,7 +60,8 @@ const LOG_BUFFER: usize = 256 * 1024;
 /// Log space reserved ahead of the data, so appends do not wait for the
 /// filesystem to find room.
 const PREALLOCATE: u64 = 32 << 20;
-/// A log this long is rewritten to hold only live data.
+/// A log this long is rewritten to hold only live data, unless the
+/// environment variable `KVDB_COMPACT_AFTER` gives another length.
 const COMPACT_AFTER: u64 = 24 << 20;
 /// Changes written and synced together at most.
 const MAX_BATCH: usize = 4096;
@@ -125,6 +130,9 @@ enum LogRequest {
     Compact {
         done: OneshotSender<bool>,
     },
+    /// From the task that wrote a snapshot: the new log, ready to be
+    /// brought up to date and put in place.
+    Compacted(std::io::Result<DmaStreamWriter<DmaFile>>),
 }
 
 /// One shard's part of the database.
@@ -137,6 +145,10 @@ struct Partition {
     commits: Cell<u64>,
     batches: Cell<u64>,
     compactions: Cell<u64>,
+    /// A log longer than this is rewritten to hold only live data.
+    compact_after: u64,
+    /// The scheduling group that compaction's writing runs in.
+    background: SchedulingGroup,
     // The network side of the shard.
     connections: Semaphore,
     serving: Gate,
@@ -192,9 +204,11 @@ async fn sync_directory(directory: &Path) -> std::io::Result<()> {
 }
 
 impl Partition {
-    fn new(shard: usize) -> Partition {
+    fn new(shard: usize, compact_after: u64, background: SchedulingGroup) -> Partition {
         Partition {
             shard,
+            compact_after,
+            background,
             map: RefCell::default(),
             log: RefCell::new(None),
             committer: Cell::new(None),
@@ -211,6 +225,8 @@ impl Partition {
     /// Returns how many keys were recovered.
     async fn open(self: Rc<Self>, directory: PathBuf) -> std::io::Result<usize> {
         let path = log_path(&directory, self.shard);
+        // A compaction that a crash interrupted left a half-written file.
+        let _ = remove_file(new_log_path(&directory, self.shard)).await;
         let file = DmaFile::open_with(&path, libc::O_RDWR | libc::O_CREAT, 0o644).await?;
         let (map, valid) = replay(&file).await?;
         let keys = map.len();
@@ -252,35 +268,52 @@ impl Partition {
     }
 }
 
-/// Writes the shard's live data to a new log and puts it in place of the
-/// old one. Nothing else touches the map meanwhile: this runs in the
-/// committer, between batches.
-async fn compact_log(partition: &Partition, directory: &Path) -> std::io::Result<DmaStreamWriter<DmaFile>> {
-    let path = log_path(directory, partition.shard);
-    let temporary = path.with_extension("log.new");
-    let file = DmaFile::create(&temporary).await?;
-    let mut writer = DmaStreamWriter::new(file, LOG_BUFFER)?;
+fn new_log_path(directory: &Path, shard: usize) -> PathBuf {
+    log_path(directory, shard).with_extension("log.new")
+}
 
-    // A copy, so that no borrow of the map is held across the writes.
-    let live: Vec<(String, String)> = partition
-        .map
-        .borrow()
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
-    let mut record = Vec::new();
-    for (key, value) in live {
-        record.clear();
-        encode(&Change::Set { key, value }, &mut record);
-        writer.write_all(&record).await?;
+/// The first half of a compaction: writes a copy of the shard's data, as
+/// it was at one moment, to a new log file, and reports to the committer.
+///
+/// It runs as a task of its own, in the background scheduling group, so
+/// the committer goes on taking writes meanwhile and requests keep their
+/// priority for the CPU and for the disk.
+async fn write_snapshot(live: Vec<(String, String)>, path: PathBuf, report: Sender<LogRequest>) {
+    let written = async {
+        let file = DmaFile::create(&path).await?;
+        let mut writer = DmaStreamWriter::new(file, LOG_BUFFER)?;
+        let mut record = Vec::new();
+        for (key, value) in live {
+            record.clear();
+            encode(&Change::Set { key, value }, &mut record);
+            writer.write_all(&record).await?;
+            maybe_yield().await;
+        }
+        Ok(writer)
     }
-    let end = writer.position();
-    // Durable and of its true length before it takes the old log's name.
-    let file = writer.finish().await?;
-    rename(&temporary, &path).await?;
+    .await;
+    let _ = report.send(LogRequest::Compacted(written)).await;
+}
+
+/// The second half: brings the new log up to date with the changes made
+/// since the snapshot, makes it durable, and puts it in the old log's
+/// place. The committer does this between two batches, so nothing changes
+/// underneath it.
+async fn switch_logs(
+    partition: &Partition,
+    directory: &Path,
+    mut fresh: DmaStreamWriter<DmaFile>,
+    since_snapshot: &[u8],
+) -> std::io::Result<DmaStreamWriter<DmaFile>> {
+    fresh.write_all(since_snapshot).await?;
+    // On the device before it takes the old log's name: from the rename
+    // on, this file is all there is.
+    fresh.sync().await?;
+    rename(new_log_path(directory, partition.shard), log_path(directory, partition.shard)).await?;
     sync_directory(directory).await?;
+    fresh.get_ref().allocate(0, fresh.position() + PREALLOCATE).await?;
     partition.compactions.set(partition.compactions.get() + 1);
-    append_to(file, end).await
+    Ok(fresh)
 }
 
 /// The committer: the one task that writes a shard's log.
@@ -291,6 +324,14 @@ async fn commit_loop(
     mut inbox: Receiver<LogRequest>,
 ) {
     let mut record = Vec::new();
+    // While a snapshot is being written: the records of every change made
+    // since it was taken, to be added to the new log.
+    let mut since_snapshot: Option<Vec<u8>> = None;
+    // Clients waiting to hear how the compaction went.
+    let mut waiting: Vec<OneshotSender<bool>> = Vec::new();
+    // The log length at which the next compaction starts by itself.
+    let mut compact_at = partition.compact_after;
+
     while let Some(first) = inbox.recv().await {
         // Everything that queued up while the last batch was being synced
         // goes into this one.
@@ -309,6 +350,9 @@ async fn commit_loop(
                 record.clear();
                 encode(change, &mut record);
                 stored &= writer.write_all(&record).await.is_ok();
+                if let Some(records) = &mut since_snapshot {
+                    records.extend_from_slice(&record);
+                }
                 changes += 1;
             }
         }
@@ -319,30 +363,69 @@ async fn commit_loop(
         }
 
         // Durable: now the changes may be seen, and answered.
-        let mut compactions = Vec::new();
+        let mut requested = false;
+        let mut snapshot = None;
         for request in batch {
             match request {
                 LogRequest::Commit { change, done } => {
                     let outcome = stored.then(|| apply(&mut partition.map.borrow_mut(), change));
                     let _ = done.send(outcome);
                 }
-                LogRequest::Compact { done } => compactions.push(done),
+                LogRequest::Compact { done } => {
+                    requested = true;
+                    waiting.push(done);
+                }
+                LogRequest::Compacted(written) => snapshot = Some(written),
             }
         }
 
-        if !compactions.is_empty() || writer.position() > COMPACT_AFTER {
-            let compacted = match compact_log(&partition, &directory).await {
+        // A snapshot has been written: switch to the new log.
+        if let Some(written) = snapshot {
+            let records = since_snapshot.take().unwrap_or_default();
+            let switched = match written {
+                Ok(fresh) => switch_logs(&partition, &directory, fresh, &records).await,
+                Err(err) => Err(err),
+            };
+            let compacted = match switched {
                 Ok(fresh) => {
+                    // The next one when the log has doubled, so that a
+                    // large database is not compacted over and over.
+                    compact_at = partition.compact_after.max(fresh.position() * 2);
                     writer = fresh;
                     true
                 }
                 Err(err) => {
                     eprintln!("shard {}: compaction failed: {err}", partition.shard);
+                    compact_at = writer.position() + partition.compact_after;
                     false
                 }
             };
-            for done in compactions {
+            for done in waiting.drain(..) {
                 let _ = done.send(compacted);
+            }
+        }
+
+        // Start a compaction, if one is wanted and none is under way.
+        if since_snapshot.is_none() && (requested || writer.position() > compact_at) {
+            // The way back to this task, for the snapshot's report. There
+            // is none once the server is shutting down.
+            let report = partition.log.borrow().clone();
+            if let Some(report) = report {
+                // A copy of the data as of this batch. Copying holds the
+                // shard up for a moment; writing it out does not.
+                let live: Vec<(String, String)> = partition
+                    .map
+                    .borrow()
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect();
+                since_snapshot = Some(Vec::new());
+                let path = new_log_path(&directory, partition.shard);
+                partition.background.spawn(write_snapshot(live, path, report));
+            } else {
+                for done in waiting.drain(..) {
+                    let _ = done.send(false);
+                }
             }
         }
     }
@@ -506,8 +589,14 @@ async fn app(directory: PathBuf) -> starfish::Result<()> {
     let shards = shard_count()?;
     check_layout(&directory, shards).await?;
 
+    let compact_after = std::env::var("KVDB_COMPACT_AFTER")
+        .ok()
+        .and_then(|length| length.parse().ok())
+        .unwrap_or(COMPACT_AFTER);
+    // A tenth of the weight of request handling, for CPU and for disk.
+    let background = SchedulingGroup::create("compaction", 100)?;
     let database = Database {
-        partitions: Sharded::start(Partition::new).await?,
+        partitions: Sharded::start(move |shard| Partition::new(shard, compact_after, background)).await?,
         shards,
     };
 

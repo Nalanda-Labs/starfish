@@ -209,13 +209,15 @@ and one request at a time per connection:
 | Reads, 512 connections | 1.10M | 465 us | 819 us |
 | Durable writes, 8 connections | 6.0k | 1.2 ms | 3.2 ms |
 | Durable writes, 512 connections | 118k | 3.9 ms | 8.9 ms |
-| Durable writes, 2048 connections | 394k | 4.9 ms | 11.3 ms |
+| Durable writes, 2048 connections | 413–446k | 4.2–4.6 ms | 9.4–10.1 ms |
 | 9 reads to 1 write, 512 connections | 919k | 115 us | 6.1 ms |
 
 A write is answered only after it has been synced to the device (a consumer
 NVMe drive here), which takes about a millisecond; throughput grows with
 the number of connections because writes that arrive together share one
-sync. One run of five seconds each.
+sync. The slowest 0.1% of writes take about 32 ms, because now and then
+the drive takes 10 to 30 ms over a sync. One run of five seconds each,
+four for the last write row.
 
 These are first indications, not a study. Each median is of five runs of
 four seconds (three runs for spawning), on one machine, with the load

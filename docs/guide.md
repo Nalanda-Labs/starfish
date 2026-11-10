@@ -1678,7 +1678,7 @@ has let go of it.
 
 # A complete example
 
-`examples/kvdb.rs` puts most of this together in under 600 lines: a
+`examples/kvdb.rs` puts most of this together in about 650 lines: a
 key-value server that survives being killed. It is the place to see how
 the pieces fit.
 
@@ -1695,9 +1695,10 @@ the pieces fit.
 - On start, each shard replays its log
   ([`DmaStreamReader`](crate::fs::DmaStreamReader) with read-ahead) up to
   the first record whose checksum fails.
-- A log that has grown large is rewritten with only the live data and
-  renamed over the old one ([`rename`](crate::fs::rename), then a sync of
-  the directory).
+- A log that has grown large is compacted: a background task in its own
+  [`SchedulingGroup`](crate::SchedulingGroup) writes the live data to a
+  new file, which is then renamed over the old one
+  ([`rename`](crate::fs::rename), then a sync of the directory).
 - Connections are limited by a [`Semaphore`](crate::sync::Semaphore) and
   framed with [`BufReader`](crate::io::BufReader) and
   [`BufWriter`](crate::io::BufWriter).
@@ -1711,12 +1712,22 @@ the pieces fit.
   which shard owns a key. The server records the number and refuses to
   start with another. Any design that splits data by shard needs this.
 - A map in a `RefCell` cannot stay borrowed across an await, so the
-  compaction copies the live data before writing it out.
+  compaction copies the live data before writing it out. The copy holds
+  the shard up for as long as it takes; a large database would want a
+  map that can be walked in steps.
 - A change must be applied to the map by the task that writes the log,
   after the sync and before the answer. Applying it in the request's own
   task, after being answered, lets a compaction in between lose it.
-- While a shard compacts, its writes wait. That shows as the slowest
-  requests taking tens of milliseconds.
+- Compaction is split in two so that writes do not wait for it. A task
+  in a low-priority [scheduling group](#scheduling-groups) writes a
+  snapshot of the data to a new file, while the log's writer carries on
+  and remembers what it writes; the writer then adds that to the new
+  file and switches. Handing the finished file back is done by sending
+  the writer a message on its own channel, since there is no `select`.
+- The slowest writes take tens of milliseconds, and it is the device:
+  now and then a sync takes 10 to 30 ms, on every shard at the same
+  moment. Moving compaction to the background did not change that. A
+  guess about where time goes is worth less than a measurement.
 - Waiting for another task's single answer came up at once, and the
   first version used a [`channel`](crate::sync::channel) of capacity one
   per request. That is what [`oneshot`](crate::sync::oneshot) is for.
