@@ -1,1 +1,5 @@
 /target
+# Scratch files of examples that were interrupted
+.starfish-example-*
+.starfish-bench-disk
+.starfish-iotune-*

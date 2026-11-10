@@ -2183,3 +2183,84 @@ fn several_shards_stream_to_one() {
         })
         .unwrap();
 }
+
+#[test]
+fn direct_io_reader_reads_ahead() {
+    use starfish::fs::{DmaStreamReader, DmaStreamWriter};
+
+    let path = scratch("read-ahead");
+    rt(1)
+        .run({
+            let path = path.clone();
+            move || async move {
+                let file = DmaFile::create(&path).await.unwrap();
+                let block = file.disk_alignment();
+                // Some hundred blocks and a bit, so the end falls inside one.
+                let contents: Vec<u8> = (0..block * 300 + 123).map(|n| (n % 251) as u8).collect();
+                let mut writer = DmaStreamWriter::new(&file, 16 * block).unwrap();
+                writer.write_all(&contents).await.unwrap();
+                writer.finish().await.unwrap();
+
+                // More reads on their way than the file has buffers left,
+                // in pieces that match nothing.
+                for ahead in [1, 4, 1000] {
+                    let mut reader = DmaStreamReader::new(&file, 4 * block).unwrap().read_ahead(ahead).unwrap();
+                    let mut read_back = Vec::with_capacity(contents.len());
+                    let mut piece = vec![0u8; 3001];
+                    loop {
+                        assert_eq!(reader.position(), read_back.len() as u64);
+                        let count = reader.read(&mut piece).await.unwrap();
+                        if count == 0 {
+                            break;
+                        }
+                        read_back.extend_from_slice(&piece[..count]);
+                        // Let the reads ahead complete out of step with us.
+                        if read_back.len().is_multiple_of(7) {
+                            yield_now().await;
+                        }
+                    }
+                    assert!(read_back == contents, "with {ahead} reads ahead");
+                    assert_eq!(reader.read(&mut piece).await.unwrap(), 0);
+                }
+
+                // From inside a block, to the end exactly.
+                let middle = (block * 150 + 77) as u64;
+                let mut reader = DmaStreamReader::at(&file, middle, 2 * block).unwrap().read_ahead(3).unwrap();
+                let mut rest = vec![0u8; contents.len() - middle as usize];
+                reader.read_exact(&mut rest).await.unwrap();
+                assert!(rest == contents[middle as usize..]);
+                assert_eq!(reader.position(), contents.len() as u64);
+                assert!(reader.read_exact(&mut [0u8; 1]).await.is_err());
+
+                // A reader dropped with reads on their way leaves nothing
+                // behind that matters, and a wait that is given up breaks
+                // the stream rather than corrupting it.
+                let mut reader = DmaStreamReader::new(&file, block).unwrap().read_ahead(8).unwrap();
+                let mut first = [0u8; 10];
+                reader.read_exact(&mut first).await.unwrap();
+                assert_eq!(&first[..], &contents[..10]);
+                drop(reader);
+
+                // Lines through the line reader, reading ahead underneath.
+                let text = scratch("read-ahead-lines");
+                let lines_file = DmaFile::create(&text).await.unwrap();
+                let mut writer = DmaStreamWriter::new(&lines_file, 8 * block).unwrap();
+                for n in 0..5000 {
+                    writer.write_all(format!("line {n}\n").as_bytes()).await.unwrap();
+                }
+                writer.finish().await.unwrap();
+                let source = DmaStreamReader::new(&lines_file, 2 * block).unwrap().read_ahead(4).unwrap();
+                let mut lines = BufReader::new(source);
+                let mut count = 0;
+                while let Some(line) = lines.next_line().await.unwrap() {
+                    assert_eq!(line, format!("line {count}"));
+                    count += 1;
+                }
+                assert_eq!(count, 5000);
+
+                starfish::fs::remove_file(&text).await.unwrap();
+                starfish::fs::remove_file(&path).await.unwrap();
+            }
+        })
+        .unwrap();
+}

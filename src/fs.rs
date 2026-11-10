@@ -893,6 +893,27 @@ impl DmaFile {
         AlignedBuf::with_alignment(capacity, self.memory_alignment.max(self.disk_alignment))
     }
 
+    /// Starts a read of as many whole blocks as fit in `buf`, at `offset`,
+    /// without waiting for it. The request is on its way to the device
+    /// (through the I/O scheduler) when this returns.
+    fn start_read(&self, buf: AlignedBuf, offset: u64) -> std::result::Result<Op<AlignedBuf>, (io::Error, AlignedBuf)> {
+        let spare = buf.capacity().checked_rem(self.disk_alignment).unwrap_or(0);
+        let len = buf.capacity().saturating_sub(spare);
+        let ptr = buf.raw_ptr();
+        match self.check(ptr, offset, len) {
+            Ok(len) => {
+                let sqe = opcode::Read::new(types::Fd(self.fd.as_raw_fd()), ptr, len)
+                    .offset(offset)
+                    .build();
+                // SAFETY: the pointer targets the buffer's own allocation,
+                // which does not move with the buffer and lives as long as
+                // the op holds it, and `len` is within its capacity.
+                Ok(unsafe { Op::new_disk(sqe, buf, self.device, Direction::Read, u64::from(len)) })
+            }
+            Err(err) => Err((err, buf)),
+        }
+    }
+
     fn check(&self, ptr: *const u8, offset: u64, len: usize) -> io::Result<u32> {
         if !is_multiple(ptr as usize as u64, self.memory_alignment) {
             return Err(invalid("buffer memory is not aligned for this file"));
@@ -1182,6 +1203,10 @@ impl<F: std::borrow::Borrow<DmaFile>> crate::io::Write for DmaStreamWriter<F> {
 /// [`io::Read`](crate::io::Read), so a [`BufReader`](crate::io::BufReader)
 /// on top of it finds lines in a file read with direct I/O.
 ///
+/// With [`read_ahead`](Self::read_ahead), the reader asks the device for
+/// the next buffers while the caller is still working on the current one,
+/// so that a scan does not stop and wait at every buffer's end.
+///
 /// ```no_run
 /// use starfish::fs::{DmaFile, DmaStreamReader};
 ///
@@ -1197,18 +1222,30 @@ impl<F: std::borrow::Borrow<DmaFile>> crate::io::Write for DmaStreamWriter<F> {
 /// ```
 pub struct DmaStreamReader<F> {
     file: F,
-    /// `None` after an operation was dropped part-way.
-    buf: Option<AlignedBuf>,
-    /// Where in the file the next buffer starts; a block boundary.
-    next: u64,
-    /// How much of the buffer has been given out.
+    /// The buffer being given out. `None` before the first read and while
+    /// its memory is with the kernel.
+    current: Option<AlignedBuf>,
+    /// How much of `current` has been given out.
     consumed: usize,
+    /// Reads on their way, oldest first, each with its place in the file.
+    pending: std::collections::VecDeque<(u64, Op<AlignedBuf>)>,
+    /// Buffers not in use.
+    spare: Vec<AlignedBuf>,
+    /// Where the next read to be started begins; a block boundary.
+    next: u64,
+    /// The file offset of the next byte to give out.
+    position: u64,
     /// Bytes to pass over in the first buffer, when the stream starts
     /// inside a block.
     skip: usize,
+    /// How many reads to keep on their way beyond the one being waited for.
+    ahead: usize,
     /// The end of the file has been reached.
     ended: bool,
+    /// A read was dropped while it was being waited for.
+    broken: bool,
     block: usize,
+    buffer_size: usize,
 }
 
 impl<F: std::borrow::Borrow<DmaFile>> DmaStreamReader<F> {
@@ -1221,26 +1258,44 @@ impl<F: std::borrow::Borrow<DmaFile>> DmaStreamReader<F> {
     /// A reader that starts at `position`, which may be anywhere.
     pub fn at(file: F, position: u64, buffer_size: usize) -> io::Result<DmaStreamReader<F>> {
         let block = file.borrow().disk_alignment().max(1);
-        let buf = file.borrow().alloc(buffer_size)?;
+        let first = file.borrow().alloc(buffer_size)?;
         let skip = usize::try_from(position.checked_rem(block as u64).unwrap_or(0)).unwrap_or(0);
         Ok(DmaStreamReader {
             file,
-            buf: Some(buf),
-            next: position.saturating_sub(skip as u64),
+            current: None,
             consumed: 0,
+            pending: std::collections::VecDeque::new(),
+            spare: vec![first],
+            next: position.saturating_sub(skip as u64),
+            position,
             skip,
+            ahead: 0,
             ended: false,
+            broken: false,
             block,
+            buffer_size,
         })
+    }
+
+    /// Keeps `buffers` further reads on their way to the device while the
+    /// current buffer is being used, so that a scan from front to back
+    /// rarely has to wait. The reader then holds `buffers + 1` buffers.
+    ///
+    /// Worth it for long sequential scans. For a reader that takes a
+    /// little and stops, it reads data nobody asked for.
+    pub fn read_ahead(mut self, buffers: usize) -> io::Result<DmaStreamReader<F>> {
+        // Up to 64: beyond that it is the device's queue that is being
+        // filled, not time that is being saved.
+        self.ahead = buffers.min(64);
+        while self.spare.len() <= self.ahead {
+            self.spare.push(self.file.borrow().alloc(self.buffer_size)?);
+        }
+        Ok(self)
     }
 
     /// The file offset of the next byte the reader will give out.
     pub fn position(&self) -> u64 {
-        let buffered = self.buf.as_ref().map_or(0, |buf| buf.len());
-        // `next` is past the buffer; step back over what is unread.
-        self.next
-            .saturating_sub(buffered.saturating_sub(self.consumed) as u64)
-            .saturating_add(self.skip as u64)
+        self.position
     }
 
     /// The file being read.
@@ -1248,39 +1303,98 @@ impl<F: std::borrow::Borrow<DmaFile>> DmaStreamReader<F> {
         self.file.borrow()
     }
 
+    /// Starts reads until as many are on their way as there should be.
+    fn start_reads(&mut self) -> io::Result<()> {
+        while self.pending.len() <= self.ahead {
+            let Some(buf) = self.spare.pop() else { break };
+            let step = buf.capacity() as u64;
+            match self.file.borrow().start_read(buf, self.next) {
+                Ok(op) => {
+                    self.pending.push_back((self.next, op));
+                    self.next = self.next.saturating_add(step);
+                }
+                Err((err, buf)) => {
+                    self.spare.push(buf);
+                    return Err(err);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Waits for the oldest read on its way. Returns where in the file it
+    /// was and how much it brought, with the data in `current`.
+    async fn finish_read(&mut self) -> io::Result<Option<(u64, usize)>> {
+        let Some((offset, op)) = self.pending.pop_front() else { return Ok(None) };
+        // If this future is dropped at the await, the read and its buffer
+        // go with it and the stream has a hole.
+        self.broken = true;
+        let (result, mut buf) = op.await;
+        self.broken = false;
+        match result {
+            Ok(read) => {
+                let read = (read as usize).min(buf.capacity());
+                buf.set_len(read);
+                self.current = Some(buf);
+                Ok(Some((offset, read)))
+            }
+            Err(err) => {
+                self.spare.push(buf);
+                Err(err)
+            }
+        }
+    }
+
     /// The bytes read from the file and not yet given out, after reading
     /// more if there are none. Empty at the end of the file.
     async fn fill(&mut self) -> io::Result<&[u8]> {
         loop {
-            let buffered = self.buf.as_ref().ok_or_else(interrupted)?.len();
+            if self.broken {
+                return Err(interrupted());
+            }
+            let buffered = self.current.as_ref().map_or(0, |buf| buf.len());
             if self.consumed < buffered || self.ended {
                 break;
             }
-            let buf = self.buf.take().ok_or_else(interrupted)?;
-            let (result, buf) = self.file.borrow().read_at(buf, self.next).await;
-            let read = match result {
-                Ok(read) => read,
-                Err(err) => {
-                    let mut buf = buf;
-                    buf.set_len(0);
-                    self.buf = Some(buf);
-                    self.consumed = 0;
-                    return Err(err);
-                }
+            // The buffer that has been used up is free for the next read.
+            if let Some(used) = self.current.take() {
+                self.spare.push(used);
+            }
+            self.consumed = 0;
+            self.start_reads()?;
+            let Some((offset, read)) = self.finish_read().await? else {
+                return Err(interrupted());
             };
-            self.buf = Some(buf);
-            self.next = self.next.saturating_add(read as u64);
+            let capacity = self.current.as_ref().map_or(0, |buf| buf.capacity());
             // The first buffer may begin before the stream does.
             self.consumed = self.skip.min(read);
             self.skip = self.skip.saturating_sub(self.consumed);
-            // A read that stops short of a block boundary, or brings
-            // nothing, has reached the end of the file.
             if read == 0 || read.checked_rem(self.block) != Some(0) {
+                // Short of a block boundary, or nothing at all: the end of
+                // the file. The reads beyond it are of no use.
                 self.ended = true;
+                self.pending.clear();
+            } else if read < capacity {
+                // A short read that is not the end. The reads already on
+                // their way assumed a full one and are in the wrong place:
+                // let them finish, discard them, and carry on from here.
+                while let Some((_, op)) = self.pending.pop_front() {
+                    self.broken = true;
+                    let (_, buf) = op.await;
+                    self.broken = false;
+                    self.spare.push(buf);
+                }
+                self.next = offset.saturating_add(read as u64);
             }
         }
-        let buf = self.buf.as_ref().ok_or_else(interrupted)?;
-        Ok(buf.get(self.consumed..).unwrap_or(&[]))
+        let current = self.current.as_ref().map_or(&[][..], |buf| &**buf);
+        Ok(current.get(self.consumed..).unwrap_or(&[]))
+    }
+
+    /// Marks `count` bytes of the current buffer as given out.
+    fn advance(&mut self, count: usize) {
+        self.consumed = self.consumed.saturating_add(count);
+        self.position = self.position.saturating_add(count as u64);
     }
 
     /// Reads some bytes into `out` and returns how many. `Ok(0)` means the
@@ -1291,7 +1405,7 @@ impl<F: std::borrow::Borrow<DmaFile>> DmaStreamReader<F> {
         if let (Some(target), Some(source)) = (out.get_mut(..count), available.get(..count)) {
             target.copy_from_slice(source);
         }
-        self.consumed = self.consumed.saturating_add(count);
+        self.advance(count);
         Ok(count)
     }
 
@@ -1324,7 +1438,7 @@ impl<F: std::borrow::Borrow<DmaFile>> crate::io::Read for DmaStreamReader<F> {
         };
         let count = available.len().min(room);
         buf.extend_from_slice(available.get(..count).unwrap_or(&[]));
-        self.consumed = self.consumed.saturating_add(count);
+        self.advance(count);
         (Ok(count), buf)
     }
 }
