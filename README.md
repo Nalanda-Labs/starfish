@@ -169,18 +169,26 @@ capacity) and can fail on a heavily loaded machine.
 
 ## Benchmarks
 
-`examples/bench_echo.rs`, `bench_spawn.rs` and `bench_disk.rs`. On the one
-machine they have been run on (24 cores, loopback, load generator sharing
-the cores):
+`examples/bench_echo.rs`, `bench_spawn.rs` and `bench_disk.rs`. The first
+two compare with Tokio and with Monoio, another thread-per-core runtime on
+io_uring. On the one machine they have been run on (24 cores, loopback,
+load generator sharing the cores), as the range of medians from two sets of
+runs:
 
-| | starfish | Tokio |
-|---|---|---|
-| Echo, 1 thread, 64 connections | about 330k requests/s | about 250–320k |
-| Echo, 4 threads, 64 connections | about 1.0M requests/s | about 450–620k |
-| Spawn a task and await it | about 57 ns | about 110–125 ns |
+| | starfish | Monoio | Tokio |
+|---|---|---|---|
+| Echo, 1 thread, 64 connections (requests/s) | 347–353k | 347–354k | 372–379k |
+| Echo, 4 threads, 64 connections (requests/s) | 1.09–1.12M | 1.08M | 0.59–0.62M |
+| Spawn a task and await it (ns) | 52 | 38–39 | 107–109 |
 
-These are first indications, not a study: single runs of a few seconds, one
-machine, no comparison with Seastar, Monoio or Glommio.
+Read as: level with Monoio on the echo test, slower than Monoio at spawning
+tasks, behind Tokio on one thread and well ahead of it on four.
+
+These are first indications, not a study. Each median is of five runs of
+four seconds (three runs for spawning), on one machine, with the load
+generator on the same threads as the server. There is no comparison with
+Seastar, and none with Glommio, whose current release does not build with a
+recent C compiler.
 
 ## License
 

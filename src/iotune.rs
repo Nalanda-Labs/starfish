@@ -5,7 +5,7 @@
 //! The measurement writes a scratch file in the directory given and loads
 //! the device from every shard at once with direct I/O, bypassing the I/O
 //! scheduler, in four phases: sequential writes and reads for bandwidth,
-//! then small random writes and reads for IOPS. Run it once per device on
+//! then small random reads and writes for IOPS. Run it once per device on
 //! an otherwise idle machine and store the result.
 
 use std::cell::Cell;
@@ -227,8 +227,11 @@ async fn run_everywhere(path: &Path, phase: Phase, plan: Plan) -> io::Result<Rat
 async fn run_phases(path: &Path, plan: Plan) -> io::Result<IoProperties> {
     let write = run_everywhere(path, Phase::Fill, plan).await?;
     let read = run_everywhere(path, Phase::SequentialRead, plan).await?;
-    let random_write = run_everywhere(path, Phase::RandomWrite, plan).await?;
+    // Both read phases come before the random writes. A device that has
+    // just taken a burst of small writes may spend the next seconds
+    // tidying up, and reads measured then come out many times too low.
     let random_read = run_everywhere(path, Phase::RandomRead, plan).await?;
+    let random_write = run_everywhere(path, Phase::RandomWrite, plan).await?;
     Ok(IoProperties {
         read_iops: Some(random_read.requests_per_sec.max(1)),
         read_bytes_per_sec: Some(read.bytes_per_sec.max(1)),

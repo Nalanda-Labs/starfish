@@ -1054,6 +1054,9 @@ fn main() -> starfish::Result<()> {
 - `measure` needs a filesystem with `O_DIRECT`, a gigabyte of free space
   by default, and an otherwise idle machine. It loads the device as hard
   as it can; do not run it next to a live service.
+- Short measurements of small files are unreliable: a device's rates
+  depend on what it was doing a moment before. Keep the default phase
+  length and file size, or raise them, and measure more than once.
 - Only data requests are scheduled. Opening, closing, renaming and
   the other management calls go straight to the kernel.
 - A request that has been handed to the kernel can no longer be
