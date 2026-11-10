@@ -553,6 +553,8 @@ pub fn yield_now() -> impl Future<Output = ()> {
     YieldNow(false)
 }
 
+debug_impl!(<T> JoinHandle<T>, "finished" => |handle| handle.is_finished());
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic, clippy::arithmetic_side_effects)]
 mod tests {

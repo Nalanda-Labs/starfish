@@ -247,3 +247,5 @@ pub async fn termination() -> io::Result<i32> {
     let mut signals = Signals::new(&[libc::SIGINT, libc::SIGTERM])?;
     Ok(signals.next().await)
 }
+
+debug_impl!(Signals, "signals" => |signals| signals.seen.iter().map(|(signal, _)| *signal).collect::<Vec<_>>());

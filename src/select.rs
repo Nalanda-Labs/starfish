@@ -137,6 +137,8 @@ pub fn interval(period: Duration) -> Interval {
     }
 }
 
+debug_impl!(Interval, "period" => |interval| interval.period);
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic, clippy::arithmetic_side_effects)]
 mod tests {

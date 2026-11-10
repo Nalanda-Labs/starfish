@@ -82,8 +82,25 @@
     clippy::unwrap_in_result,
     clippy::panic_in_result_fn
 )]
-// Everything public is documented.
-#![warn(missing_docs)]
+// Everything public is documented, and can be printed for debugging.
+#![warn(missing_docs, missing_debug_implementations)]
+
+/// Implements `Debug` for types whose insides would mean nothing to a
+/// reader: prints the type's name and, where given, a few telling values.
+macro_rules! debug_impl {
+    ($(<$($generic:ident),+>)? $name:ident $(<$($arg:ident),+>)? $(, $field:literal => |$this:ident| $value:expr)*) => {
+        impl$(<$($generic),+>)? std::fmt::Debug for $name$(<$($arg),+>)? {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                let mut out = f.debug_struct(stringify!($name));
+                $(
+                    let $this = self;
+                    out.field($field, &$value);
+                )*
+                out.finish_non_exhaustive()
+            }
+        }
+    };
+}
 
 #[cfg(doc)]
 #[doc = include_str!("../docs/guide.md")]

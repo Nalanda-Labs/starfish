@@ -805,6 +805,7 @@ pub(crate) fn poll() {
 
 /// Memory use of one shard's heap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Stats {
     /// Bytes in live allocations, counted at the size actually reserved
     /// for each (its size class, or whole pages).
@@ -867,6 +868,8 @@ pub fn on_pressure(reclaim: impl Fn() + 'static) -> crate::Result<()> {
     });
     Ok(())
 }
+
+debug_impl!(ShardAlloc);
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::arithmetic_side_effects, clippy::indexing_slicing)]

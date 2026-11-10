@@ -407,6 +407,7 @@ unsafe impl IoBufMut for FixedBuf {
 }
 
 /// Future returned by [`FixedBuf::acquire`].
+#[must_use = "no buffer is taken unless this is awaited"]
 pub struct Acquire {
     /// This task's place in the queue, once it had to wait.
     waiter: Option<u64>,
@@ -466,3 +467,6 @@ impl Drop for Acquire {
         drop(waker);
     }
 }
+
+debug_impl!(FixedBuf, "index" => |buf| buf.index, "len" => |buf| buf.len);
+debug_impl!(Acquire);

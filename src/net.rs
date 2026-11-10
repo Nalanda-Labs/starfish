@@ -541,6 +541,7 @@ impl UnixStream {
 
 /// Who is on the other end of a [`UnixStream`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PeerCredentials {
     /// Process id.
     pub process: i32,
@@ -549,3 +550,9 @@ pub struct PeerCredentials {
     /// Group id.
     pub group: u32,
 }
+
+debug_impl!(TcpListener, "fd" => |socket| socket.fd.as_raw_fd());
+debug_impl!(TcpStream, "fd" => |socket| socket.fd.as_raw_fd());
+debug_impl!(UdpSocket, "fd" => |socket| socket.fd.as_raw_fd());
+debug_impl!(UnixListener, "fd" => |socket| socket.fd.as_raw_fd());
+debug_impl!(UnixStream, "fd" => |socket| socket.fd.as_raw_fd());

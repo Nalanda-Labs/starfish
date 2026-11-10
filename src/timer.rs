@@ -56,6 +56,7 @@ impl Timers {
 }
 
 /// Future returned by [`sleep`].
+#[must_use = "a sleep does nothing unless it is awaited"]
 pub struct Sleep {
     /// `None` if the deadline is too far away to represent: sleeps forever.
     deadline: Option<Instant>,
@@ -150,3 +151,5 @@ pub async fn timeout<F: Future>(
     })
     .await
 }
+
+debug_impl!(Sleep, "deadline" => |sleep| sleep.deadline);

@@ -40,6 +40,7 @@ pub(crate) fn nanos(duration: Duration) -> u64 {
 
 /// The event loop of one shard.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ShardStats {
     /// The shard's index.
     pub shard: usize,
@@ -72,6 +73,7 @@ pub struct ShardStats {
 
 /// One scheduling group on one shard.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct GroupStats {
     /// The name the group was created with.
     pub name: String,
@@ -89,6 +91,7 @@ pub struct GroupStats {
 
 /// One device's queue on one shard.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DeviceStats {
     /// The device number of the filesystem.
     pub device: u64,
@@ -149,6 +152,7 @@ pub fn devices() -> Result<Vec<DeviceStats>> {
 /// What the runtime tells [`Runtime::on_stall`](crate::Runtime::on_stall)
 /// about a task that did not yield.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct StallReport {
     /// The index of the shard that stalled.
     pub shard: usize,

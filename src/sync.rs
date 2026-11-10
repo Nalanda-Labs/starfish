@@ -193,6 +193,7 @@ impl Semaphore {
 }
 
 /// Permits taken from a [`Semaphore`]. Dropping it gives them back.
+#[must_use = "the permits are given back as soon as this is dropped"]
 pub struct Permit {
     state: Rc<Local<SemaphoreState>>,
     permits: usize,
@@ -439,6 +440,7 @@ impl Gate {
 }
 
 /// Keeps a [`Gate`] from finishing its [`close`](Gate::close).
+#[must_use = "the gate is left as soon as this is dropped"]
 pub struct GateGuard {
     state: Rc<Local<GateState>>,
 }
@@ -944,6 +946,17 @@ impl<T> fmt::Display for TrySendError<T> {
 }
 
 impl<T> std::error::Error for TrySendError<T> {}
+
+debug_impl!(Semaphore, "available" => |semaphore| semaphore.available(), "closed" => |semaphore| semaphore.is_closed());
+debug_impl!(Permit, "permits" => |permit| permit.permits);
+debug_impl!(Acquire, "permits" => |acquire| acquire.permits);
+debug_impl!(Gate, "active" => |gate| gate.active(), "closed" => |gate| gate.is_closed());
+debug_impl!(GateGuard);
+debug_impl!(GateClose);
+debug_impl!(<T> Sender<T>, "closed" => |sender| sender.is_closed());
+debug_impl!(<T> Receiver<T>, "queued" => |receiver| receiver.len());
+debug_impl!(<T> OneshotSender<T>, "closed" => |sender| sender.is_closed());
+debug_impl!(<T> OneshotReceiver<T>);
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic, clippy::arithmetic_side_effects)]

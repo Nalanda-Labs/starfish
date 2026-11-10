@@ -1442,3 +1442,10 @@ impl<F: std::borrow::Borrow<DmaFile>> crate::io::Read for DmaStreamReader<F> {
         (Ok(count), buf)
     }
 }
+
+debug_impl!(File, "fd" => |file| file.fd.as_raw_fd());
+debug_impl!(DmaFile, "fd" => |file| file.fd.as_raw_fd(), "disk_alignment" => |file| file.disk_alignment);
+debug_impl!(AlignedBuf, "len" => |buf| buf.len, "capacity" => |buf| buf.capacity);
+debug_impl!(<F> Cursor<F>, "position" => |cursor| cursor.position);
+debug_impl!(<F> DmaStreamWriter<F>, "position" => |writer| writer.start.saturating_add(writer.filled as u64));
+debug_impl!(<F> DmaStreamReader<F>, "position" => |reader| reader.position);

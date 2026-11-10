@@ -2408,3 +2408,39 @@ fn a_shard_can_look_for_work_before_it_sleeps() {
         .unwrap();
     assert_eq!(spinning, Duration::ZERO);
 }
+
+#[test]
+fn public_types_can_be_printed_for_debugging() {
+    use starfish::sync::oneshot;
+
+    let runtime = format!("{:?}", rt(2));
+    assert!(runtime.starts_with("Runtime {") && runtime.contains("shards: 2"), "{runtime}");
+    rt(1)
+        .run(|| async {
+            let semaphore = Semaphore::new(3);
+            let permit = semaphore.acquire(2).await.unwrap();
+            assert_eq!(format!("{semaphore:?}"), "Semaphore { available: 1, closed: false, .. }");
+            assert_eq!(format!("{permit:?}"), "Permit { permits: 2, .. }");
+
+            let gate = Gate::new();
+            let guard = gate.enter().unwrap();
+            assert_eq!(format!("{gate:?}"), "Gate { active: 1, closed: false, .. }");
+            assert_eq!(format!("{guard:?}"), "GateGuard { .. }");
+
+            let (sender, receiver) = channel::<u8>(4);
+            sender.try_send(1).unwrap();
+            assert_eq!(format!("{receiver:?}"), "Receiver { queued: 1, .. }");
+            assert_eq!(format!("{sender:?}"), "Sender { closed: false, .. }");
+            let (answer, waiting) = oneshot::<u8>();
+            assert_eq!(format!("{answer:?} {waiting:?}"), "OneshotSender { closed: false, .. } OneshotReceiver { .. }");
+
+            let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            assert!(format!("{listener:?}").starts_with("TcpListener { fd: "));
+            let task = spawn(async {});
+            assert_eq!(format!("{task:?}"), "JoinHandle { finished: false, .. }");
+            task.await.unwrap();
+            assert!(format!("{:?}", starfish::stats::shard().unwrap()).contains("spinning"));
+            assert!(format!("{:?}", sleep(Duration::from_secs(1))).starts_with("Sleep { deadline: Some("));
+        })
+        .unwrap();
+}

@@ -181,6 +181,12 @@ RUSTFLAGS=-Zsanitizer=thread cargo +nightly test -Zbuild-std \
   io_uring or the allocator's memory mapping.
 - **The thread sanitizer** runs the integration tests.
 - **Fuzzing:** `cargo +nightly fuzz run alloc_ops` (needs `cargo-fuzz`).
+- **Soak test:** `python3 scripts/kvdb_soak.py [rounds]` runs the `kvdb`
+  example under load, kills it at random moments, restarts it and checks
+  that every write it acknowledged is still there. It exercises most of
+  the library together: sockets, cross-shard calls, direct I/O, logs,
+  compaction and recovery. One hundred rounds (80 kills, 20 orderly
+  stops) passed on the one machine it was run on.
 
 Some integration tests assert on timing (CPU and disk shares, device
 capacity) and can fail on a heavily loaded machine.

@@ -783,7 +783,7 @@ impl Drop for StopOnDrop {
 /// cleanly instead of exhausting memory.
 const MAX_SHARDS: usize = 1024;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct ShardConfig {
     task_quota: Duration,
     io_depth: usize,
@@ -796,6 +796,8 @@ struct ShardConfig {
 }
 
 /// Configures and runs a runtime.
+#[derive(Debug)]
+#[must_use = "a runtime does nothing until `run` is called"]
 pub struct Runtime {
     shards: usize,
     pin: bool,

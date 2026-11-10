@@ -347,3 +347,6 @@ impl<S: Write> BufWriter<S> {
         result
     }
 }
+
+debug_impl!(<S> BufReader<S>, "buffered" => |reader| reader.buf.len().saturating_sub(reader.pos));
+debug_impl!(<S> BufWriter<S>, "buffered" => |writer| writer.buf.len());

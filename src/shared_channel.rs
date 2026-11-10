@@ -519,6 +519,11 @@ impl<T> Drop for SharedMpscReceiver<T> {
     }
 }
 
+debug_impl!(<T> SharedSender<T>);
+debug_impl!(<T> SharedReceiver<T>);
+debug_impl!(<T> SharedMpscSender<T>);
+debug_impl!(<T> SharedMpscReceiver<T>, "senders" => |receiver| receiver.lanes.len());
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
