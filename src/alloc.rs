@@ -853,8 +853,10 @@ pub(crate) fn over_limit() -> bool {
 /// Registers a function that frees memory, such as evicting from a cache,
 /// to be called on the current shard while its heap is over the limit set
 /// with [`Runtime::memory_limit`](crate::Runtime::memory_limit). It is
-/// called from the event loop, between tasks, and repeatedly for as long
-/// as the heap stays over the limit.
+/// called from the event loop, between tasks, as soon as the heap is found
+/// over the limit. If that does not bring the heap back under it, the
+/// function is called again every so often for as long as the heap stays
+/// over.
 pub fn on_pressure(reclaim: impl Fn() + 'static) -> crate::Result<()> {
     let shard = crate::runtime::current()?;
     let mut reclaim: Option<std::rc::Rc<dyn Fn()>> = Some(std::rc::Rc::new(reclaim));

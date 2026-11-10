@@ -3,8 +3,8 @@
 //! With the per-shard allocator installed, a shard knows how much memory
 //! it holds. Past the configured limit, the runtime calls the functions
 //! registered with `on_pressure`, between tasks, until the shard is back
-//! under the limit. The limit is a request, checked every so often, so the
-//! heap overshoots it a little before the cache is asked to shrink.
+//! under the limit. The limit is checked between tasks, so the heap goes a
+//! little over it before the cache is asked to shrink.
 //!
 //! Run with `cargo run --release --example memory_pressure`.
 

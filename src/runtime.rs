@@ -86,6 +86,9 @@ pub(crate) enum Message {
     Stop,
 }
 
+/// How many turns of the event loop pass before the application is asked
+/// for memory again, after a request that left the heap over its limit.
+const RECLAIM_BACKOFF: u64 = 64;
 /// How many messages fit in the queue between two shards before the
 /// sender has to hold further ones back.
 const SMP_QUEUE_LENGTH: usize = 128;
@@ -254,6 +257,9 @@ pub(crate) struct Shard {
     alien: Receiver<Message>,
     /// Reused by `drain_inbox`.
     received: Cell<Vec<Message>>,
+    /// The turn of the event loop before which the application is not
+    /// asked for memory again, after a request that did not help.
+    reclaim_after: Cell<u64>,
     stop: Cell<bool>,
 }
 
@@ -326,6 +332,7 @@ impl Shard {
             incoming: Local::new(incoming),
             alien,
             received: Cell::new(Vec::new()),
+            reclaim_after: Cell::new(0),
             stop: Cell::new(false),
         }
     }
@@ -581,9 +588,11 @@ impl Shard {
     /// Asks the application to free memory while this shard's heap is over
     /// its limit.
     fn reclaim_memory(&self) {
-        // Not on every turn: a reclaimer that has nothing left to give
-        // should not be asked thousands of times a second.
-        if self.stats.loops.get() & 63 != 0 || !crate::alloc::over_limit() {
+        if !crate::alloc::over_limit() {
+            return;
+        }
+        let turn = self.stats.loops.get();
+        if turn < self.reclaim_after.get() {
             return;
         }
         let reclaimers = self.reclaimers.with(|reclaimers| reclaimers.clone());
@@ -591,6 +600,11 @@ impl Shard {
             if let Err(payload) = catch_unwind(AssertUnwindSafe(|| reclaim())) {
                 discard_panic(payload);
             }
+        }
+        // Still over the limit: the application had nothing left to give.
+        // It should not be asked again thousands of times a second.
+        if crate::alloc::over_limit() {
+            self.reclaim_after.set(turn.saturating_add(RECLAIM_BACKOFF));
         }
     }
 
