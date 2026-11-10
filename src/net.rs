@@ -15,6 +15,7 @@
 use std::io;
 use std::net::{Shutdown, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::rc::Rc;
 
 use io_uring::{opcode, types};
 use socket2::{Domain, Protocol, SockAddr, SockRef, Socket, Type};
@@ -33,8 +34,39 @@ fn clamp_len(len: usize) -> u32 {
     u32::try_from(len).unwrap_or(u32::MAX)
 }
 
+/// What a datagram receive brought: its length if it fitted the buffer.
+///
+/// The receive asks the kernel for the datagram's true length, which may
+/// be more than the buffer could hold. The buffer is left holding what did
+/// fit either way.
+///
+/// # Safety
+///
+/// The kernel must have initialised the first `min(received, capacity)`
+/// bytes of `buf`.
+unsafe fn datagram_received<B: IoBufMut>(buf: &mut B, received: usize) -> io::Result<usize> {
+    let capacity = buf.capacity();
+    buf.set_len(received.min(capacity));
+    if received > capacity {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("a datagram of {received} bytes was cut to the buffer's {capacity}"),
+        ));
+    }
+    Ok(received)
+}
+
+fn no_room() -> io::Error {
+    // A read of nothing would return `Ok(0)`, which means "the peer has
+    // closed" to every caller.
+    io::Error::new(io::ErrorKind::InvalidInput, "read buffer has no room")
+}
+
 /// Reads from a stream socket into `buf` from its start.
 async fn stream_read<B: IoBufMut>(fd: RawFd, mut buf: B) -> (io::Result<usize>, B) {
+    if buf.capacity() == 0 {
+        return (Err(no_room()), buf);
+    }
     let fd = types::Fd(fd);
     let len = clamp_len(buf.capacity());
     let ptr = buf.as_mut_ptr();
@@ -120,6 +152,12 @@ macro_rules! buffered_stream {
             async fn read_some(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
                 <$stream>::read(self, buf).await
             }
+
+            fn start_read(&mut self, buf: Vec<u8>) -> std::result::Result<crate::io::PendingRead, Vec<u8>> {
+                // Holds the descriptor's number, not the stream: whoever
+                // keeps this future keeps the stream as well.
+                Ok(Box::pin(stream_read(self.fd.as_raw_fd(), buf)))
+            }
         }
 
         impl crate::io::Write for $holder {
@@ -147,7 +185,9 @@ impl TcpListener {
         socket.set_reuse_port(true)?;
         socket.bind(&addr.into())?;
         socket.listen(1024)?;
-        Ok(TcpListener { fd: socket.into() })
+        Ok(TcpListener {
+            fd: socket.into(),
+        })
     }
 
     /// The address the listener is bound to. After binding to port 0, this
@@ -184,8 +224,12 @@ impl TcpStream {
     /// Reads into `buf` from its start, replacing its contents: on success
     /// the buffer holds exactly the bytes received, at most its capacity.
     ///
-    /// `Ok(0)` means the peer closed the connection (or the buffer has no
-    /// capacity).
+    /// `Ok(0)` means the peer closed the connection.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` if the buffer has no capacity, as `Vec::new()` has
+    /// none: there would be no telling that from a closed connection.
     pub async fn read<B: IoBufMut>(&self, buf: B) -> (io::Result<usize>, B) {
         stream_read(self.fd.as_raw_fd(), buf).await
     }
@@ -212,6 +256,10 @@ impl TcpStream {
     ///
     /// Avoiding the copy pays off for large payloads, roughly from 10 KiB
     /// up. For small messages [`write`](Self::write) is faster.
+    ///
+    /// The kernel may accept less than the whole buffer, and the buffer is
+    /// gone either way; [`send_all_zc`](Self::send_all_zc) sends all of
+    /// it.
     pub async fn send_zc(&self, buf: FixedBuf) -> io::Result<usize> {
         let fd = types::Fd(self.fd.as_raw_fd());
         let len = clamp_len(buf.len());
@@ -223,6 +271,37 @@ impl TcpStream {
         // the reactor keeps until the kernel releases it.
         let sent = unsafe { HeldOp::new(sqe, buf) }.await?;
         Ok(sent as usize)
+    }
+
+    /// Sends all of `buf` without copying it, in as many steps as it
+    /// takes. Like [`send_zc`](Self::send_zc), it returns once the data is
+    /// queued, and the buffer goes back to the pool when the peer has
+    /// acknowledged all of it.
+    pub async fn send_all_zc(&self, buf: FixedBuf) -> io::Result<()> {
+        let fd = types::Fd(self.fd.as_raw_fd());
+        let index = IoBuf::fixed_index(&buf);
+        let start = IoBuf::as_ptr(&buf);
+        let total = buf.len();
+        // Every step's send keeps the buffer until the kernel is done
+        // with that step, so the buffer is shared between them.
+        let buf = Rc::new(buf);
+        let mut sent = 0usize;
+        while sent < total {
+            let len = clamp_len(total.saturating_sub(sent));
+            // Stays inside the buffer: `sent < total`.
+            let sqe = opcode::SendZc::new(fd, start.wrapping_add(sent), len)
+                .buf_index(index)
+                .flags(libc::MSG_NOSIGNAL)
+                .build();
+            // SAFETY: the pointer targets the buffer's registered memory,
+            // which the reactor keeps, through its share of the buffer,
+            // until the kernel releases it.
+            match unsafe { HeldOp::new(sqe, buf.clone()) }.await? {
+                0 => return Err(io::ErrorKind::WriteZero.into()),
+                accepted => sent = sent.saturating_add(accepted as usize),
+            }
+        }
+        Ok(())
     }
 
     /// The address of the other end of the connection.
@@ -338,7 +417,9 @@ impl UdpSocket {
         socket.set_reuse_address(true)?;
         socket.set_reuse_port(true)?;
         socket.bind(&addr.into())?;
-        Ok(UdpSocket { fd: socket.into() })
+        Ok(UdpSocket {
+            fd: socket.into(),
+        })
     }
 
     /// The address the socket is bound to. After binding to port 0, this
@@ -374,19 +455,30 @@ impl UdpSocket {
     }
 
     /// Receives one datagram into `buf` from its start, replacing its
-    /// contents, and reports who sent it. A datagram longer than the
-    /// buffer's capacity is cut short.
+    /// contents, and reports who sent it.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidData` if the datagram was longer than the buffer's
+    /// capacity. The buffer comes back holding the part that fitted; the
+    /// rest is gone. `InvalidInput` if the buffer has no capacity.
     pub async fn recv_from<B: IoBufMut>(&self, mut buf: B) -> (io::Result<(usize, SocketAddr)>, B) {
+        if buf.capacity() == 0 {
+            return (Err(no_room()), buf);
+        }
         let datagram = DatagramBox::new(buf.as_mut_ptr(), buf.capacity());
-        let sqe = opcode::RecvMsg::new(types::Fd(self.fd.as_raw_fd()), datagram.header()).build();
+        // With this flag the kernel reports the datagram's true length,
+        // even when that is more than it could store.
+        let sqe = opcode::RecvMsg::new(types::Fd(self.fd.as_raw_fd()), datagram.header())
+            .flags(libc::MSG_TRUNC as u32)
+            .build();
         // SAFETY: as in `send_to`.
         let (result, (mut buf, datagram)) = unsafe { Op::new(sqe, (buf, datagram)) }.await;
         let received = result.and_then(|n| {
-            let n = (n as usize).min(buf.capacity());
-            // SAFETY: the kernel initialised the first `n` bytes, and `n`
-            // is within the capacity.
-            unsafe { buf.set_len(n) };
-            Ok((n, datagram.address()?))
+            // SAFETY: the kernel initialised as much of the datagram as
+            // fitted.
+            let length = unsafe { datagram_received(&mut buf, n as usize) }?;
+            Ok((length, datagram.address()?))
         });
         (received, buf)
     }
@@ -404,23 +496,22 @@ impl UdpSocket {
     }
 
     /// Receives one datagram from the connected peer into `buf` from its
-    /// start, replacing its contents.
+    /// start, replacing its contents. Fails as
+    /// [`recv_from`](Self::recv_from) does if the datagram does not fit.
     pub async fn recv<B: IoBufMut>(&self, mut buf: B) -> (io::Result<usize>, B) {
+        if buf.capacity() == 0 {
+            return (Err(no_room()), buf);
+        }
         let len = clamp_len(buf.capacity());
-        let sqe = opcode::Recv::new(types::Fd(self.fd.as_raw_fd()), buf.as_mut_ptr(), len).build();
+        let sqe = opcode::Recv::new(types::Fd(self.fd.as_raw_fd()), buf.as_mut_ptr(), len)
+            .flags(libc::MSG_TRUNC)
+            .build();
         // SAFETY: the pointer targets memory the buffer keeps valid and in
         // place for as long as the op holds the buffer (`IoBufMut`).
         let (result, mut buf) = unsafe { Op::new(sqe, buf) }.await;
-        match result {
-            Ok(n) => {
-                let n = (n as usize).min(buf.capacity());
-                // SAFETY: the kernel initialised the first `n` bytes, and
-                // `n` is within the capacity.
-                unsafe { buf.set_len(n) };
-                (Ok(n), buf)
-            }
-            Err(err) => (Err(err), buf),
-        }
+        // SAFETY: the kernel initialised as much of the datagram as fitted.
+        let received = result.and_then(|n| unsafe { datagram_received(&mut buf, n as usize) });
+        (received, buf)
     }
 }
 
@@ -449,7 +540,9 @@ impl UnixListener {
         socket.set_cloexec(true)?;
         socket.bind(&SockAddr::unix(path)?)?;
         socket.listen(1024)?;
-        Ok(UnixListener { fd: socket.into() })
+        Ok(UnixListener {
+            fd: socket.into(),
+        })
     }
 
     /// Another handle to the same listening socket, for another shard.
@@ -490,8 +583,12 @@ impl UnixStream {
     /// Reads into `buf` from its start, replacing its contents: on success
     /// the buffer holds exactly the bytes received, at most its capacity.
     ///
-    /// `Ok(0)` means the peer closed the connection (or the buffer has no
-    /// capacity).
+    /// `Ok(0)` means the peer closed the connection.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` if the buffer has no capacity, as `Vec::new()` has
+    /// none: there would be no telling that from a closed connection.
     pub async fn read<B: IoBufMut>(&self, buf: B) -> (io::Result<usize>, B) {
         stream_read(self.fd.as_raw_fd(), buf).await
     }

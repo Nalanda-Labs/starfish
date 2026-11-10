@@ -9,8 +9,8 @@
 //!
 //! - The [`Header`]'s reference count, queued flag, shard, key, group and
 //!   vtable are atomic or never change. Any thread may read them.
-//! - The state, the abort request, the join waker, the future and the
-//!   output belong to the shard that spawned the task. Only that thread
+//! - The state, the abort request, the join waker, the panic message, the
+//!   future and the output belong to the shard that spawned the task. Only that thread
 //!   reads or writes them.
 //!
 //! A future or output must never be dropped on a foreign thread, since
@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crate::error::{Error, Result};
-use crate::runtime::{discard_panic, try_current, wake_quietly, Message, ShardShared};
+use crate::runtime::{discard_panic, panic_message, try_current, wake_quietly, Message, ShardShared};
 
 /// The future has not finished.
 const RUNNING: u8 = 0;
@@ -60,6 +60,8 @@ struct Header {
     abort: Cell<bool>,
     /// The task awaiting this one's `JoinHandle`.
     join_waker: Cell<Option<Waker>>,
+    /// What the future's panic said, until the handle collects it.
+    panic: Cell<Option<String>>,
     shard: Arc<ShardShared>,
     /// The task's slot in its shard's task table.
     key: usize,
@@ -198,6 +200,7 @@ impl Task {
                 polling: Cell::new(false),
                 abort: Cell::new(false),
                 join_waker: Cell::new(None),
+                panic: Cell::new(None),
                 shard,
                 key,
                 group,
@@ -267,6 +270,7 @@ impl Task {
                 }
             }
             Err(payload) => {
+                header.panic.set(panic_message(&*payload));
                 discard_panic(payload);
                 if header.state.get() == RUNNING {
                     header.state.set(PANICKED);
@@ -470,7 +474,9 @@ impl<T> Future for JoinHandle<T> {
                 // was made for this task's future type.
                 Poll::Ready(Ok(unsafe { take(task.0) }))
             }
-            PANICKED => Poll::Ready(Err(Error::Panicked)),
+            PANICKED => Poll::Ready(Err(Error::Panicked {
+                message: header.panic.take(),
+            })),
             _ => Poll::Ready(Err(Error::Canceled)),
         }
     }
@@ -684,7 +690,7 @@ mod tests {
         });
         assert!(unsafe { task.run() });
         assert_eq!(drops.get(), 1);
-        assert!(matches!(poll_once(&mut handle), Poll::Ready(Err(Error::Panicked))));
+        assert!(matches!(poll_once(&mut handle), Poll::Ready(Err(Error::Panicked { .. }))));
         // Running it again is harmless.
         assert!(unsafe { task.run() });
         assert_eq!(drops.get(), 1);

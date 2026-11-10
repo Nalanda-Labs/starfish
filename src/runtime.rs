@@ -69,6 +69,36 @@ pub(crate) fn discard_panic(payload: Box<dyn Any + Send>) {
     }
 }
 
+/// The text a panic carried, if it carried text.
+pub(crate) fn panic_message(payload: &(dyn Any + Send)) -> Option<String> {
+    match payload.downcast_ref::<&'static str>() {
+        Some(text) => Some((*text).to_owned()),
+        None => payload.downcast_ref::<String>().cloned(),
+    }
+}
+
+/// Makes a future and runs it to the end, turning a panic, in the making
+/// or in the running, into an error that holds the panic's message.
+pub(crate) async fn catch_panic<F: Future>(make: impl FnOnce() -> F) -> std::result::Result<F::Output, Option<String>> {
+    let caught = |payload: Box<dyn Any + Send>| {
+        let message = panic_message(&*payload);
+        discard_panic(payload);
+        message
+    };
+    let future = catch_unwind(AssertUnwindSafe(make)).map_err(caught)?;
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|cx| {
+        // After a panic the future is never polled again; it is dropped
+        // when this function returns.
+        match catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx))) {
+            Ok(std::task::Poll::Ready(output)) => std::task::Poll::Ready(Ok(output)),
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Err(payload) => std::task::Poll::Ready(Err(caught(payload))),
+        }
+    })
+    .await
+}
+
 /// Calls a waker that may not be ours, containing a panic from it.
 pub(crate) fn wake_quietly(waker: Waker) {
     if let Err(payload) = catch_unwind(AssertUnwindSafe(move || waker.wake())) {
@@ -1150,19 +1180,21 @@ impl Runtime {
         let shard = Rc::new(Shard::new(parts0, runtime.clone(), config, devices));
         let entered = Entered::new(shard)?;
 
+        // `main` itself need not outlive this call, so it is called here;
+        // only the future it makes moves into the task.
         let future = match catch_unwind(AssertUnwindSafe(main)) {
             Ok(future) => future,
             Err(payload) => {
+                let message = panic_message(&*payload);
                 discard_panic(payload);
-                return Err(Error::Panicked);
+                return Err(Error::Panicked { message });
             }
         };
         let output = Rc::new(Cell::new(None));
         let slot = output.clone();
         let main = async move {
             let _stop = StopOnDrop;
-            let value = future.await;
-            slot.set(Some(value));
+            slot.set(Some(catch_panic(|| future).await));
         };
         drop(entered.0.spawn_task(DEFAULT_GROUP, main, true));
         let ran = entered.0.run();
@@ -1173,8 +1205,12 @@ impl Runtime {
         if let Some(err) = runtime.take_failure() {
             return Err(Error::Io(err));
         }
-        // The main task ended without a value only if it panicked.
-        output.take().ok_or(Error::Panicked)
+        match output.take() {
+            Some(Ok(value)) => Ok(value),
+            Some(Err(message)) => Err(Error::Panicked { message }),
+            // The main task ended without getting that far.
+            None => Err(Error::Panicked { message: None }),
+        }
     }
 }
 

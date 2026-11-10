@@ -62,7 +62,8 @@
 //!
 //! The runtime itself does not panic: every failure is reported as an
 //! [`Error`]. A panic in user code is caught at the task boundary. The task
-//! is dropped, whoever awaits it gets [`Error::Panicked`], and every other
+//! is dropped, whoever awaits it gets [`Error::Panicked`] with the panic's
+//! message, and every other
 //! task and shard keeps running. (This relies on unwinding, so it does not
 //! apply to programs built with `panic = "abort"`.)
 

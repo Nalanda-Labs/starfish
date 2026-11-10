@@ -16,7 +16,7 @@ async fn app() -> starfish::Result<()> {
         1
     });
     match task.await {
-        Err(Error::Panicked) => println!("the task panicked; this shard carries on"),
+        Err(Error::Panicked { .. }) => println!("the task panicked; this shard carries on"),
         other => println!("unexpected: {other:?}"),
     }
 
@@ -28,7 +28,7 @@ async fn app() -> starfish::Result<()> {
     })
     .await;
     match remote {
-        Err(Error::Panicked) => println!("the call to shard 1 panicked"),
+        Err(Error::Panicked { .. }) => println!("the call to shard 1 panicked"),
         other => println!("unexpected: {other:?}"),
     }
     let alive = submit_to(1, || async { shard_id() }).await??;

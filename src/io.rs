@@ -24,6 +24,11 @@
 
 use std::future::Future;
 use std::io;
+use std::pin::Pin;
+
+/// A read that has been started and does not borrow what it reads from;
+/// see [`Read::start_read`].
+pub type PendingRead = Pin<Box<dyn Future<Output = (io::Result<usize>, Vec<u8>)>>>;
 
 /// A source of bytes that is read in order: a TCP stream, or a file
 /// through a [`Cursor`](crate::fs::Cursor).
@@ -37,6 +42,18 @@ pub trait Read {
     /// `Ok(0)` means there is nothing more (or the buffer has no
     /// capacity).
     fn read_some(&mut self, buf: Vec<u8>) -> impl Future<Output = (io::Result<usize>, Vec<u8>)>;
+
+    /// Starts a read whose future does not borrow the source, or hands
+    /// the buffer back if this source cannot do that.
+    ///
+    /// A source whose reads take data away for good, as a socket's do,
+    /// should provide this. [`BufReader`] then keeps the read it has
+    /// started when its caller stops waiting, and what arrives is there
+    /// for the next call, where a read that was dropped would take its
+    /// data with it. The default says "cannot".
+    fn start_read(&mut self, buf: Vec<u8>) -> std::result::Result<PendingRead, Vec<u8>> {
+        Err(buf)
+    }
 }
 
 /// A destination for bytes that are written in order: a TCP stream, or a
@@ -83,11 +100,17 @@ fn invalid_data(message: &'static str) -> io::Error {
 ///
 /// # Cancellation
 ///
-/// Dropping one of the reading futures while it waits for the network may
-/// lose the bytes that were arriving at that moment. After a
-/// [`timeout`](crate::timeout) on a read, the position in the stream is
-/// unknown and the connection should be closed. On a file, the reader
-/// would likewise skip or repeat data: start again with a new cursor.
+/// A read that is given up, by [`timeout`](crate::timeout) or
+/// [`select`](crate::select) or an aborted task, loses nothing with
+/// [`fill_buf`](Self::fill_buf), [`read`](Self::read),
+/// [`read_line`](Self::read_line) and [`next_line`](Self::next_line): the
+/// reader keeps the read it had started and the part of a line it had
+/// collected, and the next call carries on from there.
+///
+/// [`read_until`](Self::read_until) appends to a buffer of the caller's,
+/// so it carries on only if it is called again with that same buffer.
+/// [`read_exact`](Self::read_exact) cannot be resumed: it does not record
+/// how much of its output it had filled.
 pub struct BufReader<S> {
     stream: S,
     /// What the last read from the stream delivered.
@@ -96,6 +119,10 @@ pub struct BufReader<S> {
     pos: usize,
     capacity: usize,
     limit: usize,
+    /// A read that was started and whose caller may have stopped waiting.
+    pending: Option<PendingRead>,
+    /// The part of a line collected so far by `read_line`.
+    partial: Vec<u8>,
 }
 
 impl<S: Read> BufReader<S> {
@@ -112,6 +139,8 @@ impl<S: Read> BufReader<S> {
             pos: 0,
             capacity: capacity.max(1),
             limit: usize::MAX,
+            pending: None,
+            partial: Vec::new(),
         }
     }
 
@@ -153,16 +182,33 @@ impl<S: Read> BufReader<S> {
     /// stopped sending. Follow with [`consume`](Self::consume).
     pub async fn fill_buf(&mut self) -> io::Result<&[u8]> {
         if self.pos >= self.buf.len() {
-            let mut buf = std::mem::take(&mut self.buf);
-            buf.clear();
-            self.pos = 0;
-            // Also restores the buffer after a read that was dropped.
-            if buf.capacity() < self.capacity {
-                buf.reserve_exact(self.capacity);
+            if self.pending.is_none() {
+                let mut buf = std::mem::take(&mut self.buf);
+                buf.clear();
+                self.pos = 0;
+                // Also restores the buffer after a read that was dropped.
+                if buf.capacity() < self.capacity {
+                    buf.reserve_exact(self.capacity);
+                }
+                match self.stream.start_read(buf) {
+                    Ok(pending) => self.pending = Some(pending),
+                    Err(buf) => {
+                        let (result, buf) = self.stream.read_some(buf).await;
+                        self.buf = buf;
+                        result?;
+                        return Ok(self.buffer());
+                    }
+                }
             }
-            let (result, buf) = self.stream.read_some(buf).await;
-            self.buf = buf;
-            result?;
+            if let Some(pending) = self.pending.as_mut() {
+                // If the caller stops waiting here, the read stays in
+                // `self.pending` and the next call picks it up.
+                let (result, buf) = pending.as_mut().await;
+                self.pending = None;
+                self.buf = buf;
+                self.pos = 0;
+                result?;
+            }
         }
         Ok(self.buffer())
     }
@@ -238,8 +284,30 @@ impl<S: Read> BufReader<S> {
     /// `InvalidData` if the line is not valid UTF-8 or is longer than the
     /// [`limit`](Self::limit). The line is consumed all the same.
     pub async fn read_line(&mut self, line: &mut String) -> io::Result<usize> {
-        let mut bytes = Vec::new();
-        let count = self.read_until(b'\n', &mut bytes).await?;
+        // Collected in the reader, not in a local variable: if the caller
+        // stops waiting part-way, the next call carries on.
+        loop {
+            self.fill_buf().await?;
+            let available = self.buf.get(self.pos..).unwrap_or(&[]);
+            if available.is_empty() {
+                break; // the peer has stopped sending
+            }
+            let (count, found) = match available.iter().position(|byte| *byte == b'\n') {
+                Some(index) => (index.saturating_add(1), true),
+                None => (available.len(), false),
+            };
+            if self.partial.len().saturating_add(count) > self.limit {
+                self.partial.clear();
+                return Err(invalid_data("line is longer than the reader's limit"));
+            }
+            self.partial.extend_from_slice(available.get(..count).unwrap_or(available));
+            self.pos = self.pos.saturating_add(count).min(self.buf.len());
+            if found {
+                break;
+            }
+        }
+        let bytes = std::mem::take(&mut self.partial);
+        let count = bytes.len();
         let text = String::from_utf8(bytes).map_err(|_| invalid_data("line is not valid UTF-8"))?;
         line.push_str(&text);
         Ok(count)

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Poll, Waker};
 
 use crate::error::{Error, Result};
-use crate::runtime::{current, try_current, wake_quietly, Message};
+use crate::runtime::{catch_panic, current, try_current, wake_quietly, Message};
 use crate::sched::DEFAULT_GROUP;
 use crate::sync::Permit;
 
@@ -51,7 +51,7 @@ impl<T> Drop for ReplySender<T> {
     fn drop(&mut self) {
         if !self.done {
             let reason = if std::thread::panicking() {
-                Error::Panicked
+                Error::Panicked { message: None }
             } else {
                 Error::Canceled
             };
@@ -130,8 +130,9 @@ impl<T: Send + 'static> Drop for Call<T> {
 /// # Errors
 ///
 /// - [`Error::InvalidShard`] if `shard` is not a valid shard index.
-/// - [`Error::Panicked`] if `f` or its future panicked on the target shard.
-///   The target shard keeps running.
+/// - [`Error::Panicked`] if `f` or its future panicked, with the panic's
+///   message. The shard it ran on keeps running, and so does the caller,
+///   whether that is another shard or the caller's own.
 /// - [`Error::Canceled`] if the target shard shut down first.
 /// - [`Error::NoRuntime`] if called outside a runtime.
 pub async fn submit_to<F, Fut, T>(shard: usize, f: F) -> Result<T>
@@ -154,8 +155,9 @@ where
         }
     };
     let Some(here) = here else {
-        // Already on the right shard: run in place.
-        return Ok(f().await);
+        // Already on the right shard: run in place. A panic is reported
+        // the same way as one on another shard would be.
+        return catch_panic(f).await.map_err(|message| Error::Panicked { message });
     };
 
     // Wait for a place among the calls in progress on that shard.
@@ -181,8 +183,8 @@ where
         // reports `Canceled`.
         if let Some(shard) = try_current() {
             let call = async move {
-                let value = f().await;
-                sender.finish(Ok(value));
+                let outcome = catch_panic(f).await;
+                sender.finish(outcome.map_err(|message| Error::Panicked { message }));
             };
             drop(shard.spawn_task(group, call, true));
         }

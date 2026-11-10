@@ -669,6 +669,26 @@ impl Reactor {
     }
 }
 
+/// Closes a file's descriptor without blocking the shard, where there is
+/// one: the close goes through the shard's ring and nobody waits for it.
+/// Elsewhere, or if the ring will not take it, it is closed on the spot.
+///
+/// This is for files, whose close can block. Sockets are closed with the
+/// ordinary system call: theirs does not block, and going through the
+/// ring made opening and closing connections measurably slower (about 4%
+/// on the connection benchmark).
+pub(crate) fn close_fd(fd: RawFd) {
+    let queued = try_current()
+        .and_then(|shard| shard.reactor.with(|reactor| reactor.close_detached(fd)))
+        .unwrap_or(false);
+    if !queued {
+        // SAFETY: the caller owns the descriptor and gives it up here.
+        unsafe {
+            libc::close(fd);
+        }
+    }
+}
+
 fn to_result(result: i32) -> io::Result<u32> {
     if result < 0 {
         Err(io::Error::from_raw_os_error(result.saturating_neg()))

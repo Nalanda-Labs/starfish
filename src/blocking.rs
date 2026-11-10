@@ -16,7 +16,7 @@ use std::task::{Poll, Waker};
 use std::time::Duration;
 
 use crate::error::{Error, Result};
-use crate::runtime::{discard_panic, wake_quietly};
+use crate::runtime::{discard_panic, panic_message, wake_quietly};
 
 /// Most threads the pool runs at once; further jobs wait for one.
 const MAX_THREADS: usize = 256;
@@ -96,8 +96,8 @@ fn submit(job: Job) -> Result<()> {
 }
 
 struct Slot<T> {
-    /// `Some(None)` if the work panicked.
-    outcome: Option<Option<T>>,
+    /// `Some(Err(message))` if the work panicked.
+    outcome: Option<std::result::Result<T, Option<String>>>,
     waker: Option<Waker>,
 }
 
@@ -147,10 +147,11 @@ where
     let theirs = slot.clone();
     submit(Box::new(move || {
         let outcome = match catch_unwind(AssertUnwindSafe(work)) {
-            Ok(value) => Some(value),
+            Ok(value) => Ok(value),
             Err(payload) => {
+                let message = panic_message(&*payload);
                 discard_panic(payload);
-                None
+                Err(message)
             }
         };
         let waker = {
@@ -174,8 +175,8 @@ where
         };
         drop(replaced);
         match outcome {
-            Some(Some(value)) => Poll::Ready(Ok(value)),
-            Some(None) => Poll::Ready(Err(Error::Panicked)),
+            Some(Ok(value)) => Poll::Ready(Ok(value)),
+            Some(Err(message)) => Poll::Ready(Err(Error::Panicked { message })),
             None => Poll::Pending,
         }
     })

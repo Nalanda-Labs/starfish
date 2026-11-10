@@ -13,9 +13,14 @@ pub enum Error {
     NoRuntime,
     /// A runtime is already running on this thread.
     AlreadyRunning,
-    /// The task (or the remote closure) panicked. The panic was caught and
-    /// the rest of the runtime keeps running.
-    Panicked,
+    /// The task (or the closure run elsewhere) panicked. The panic was
+    /// caught and the rest of the runtime keeps running.
+    Panicked {
+        /// What the panic said, if it carried text, as `panic!("...")`
+        /// does. `None` for a panic with another kind of payload, or
+        /// where the text could not be recovered.
+        message: Option<String>,
+    },
     /// The task was dropped before it finished, usually because the runtime
     /// or the target shard is shutting down.
     Canceled,
@@ -45,7 +50,8 @@ impl fmt::Display for Error {
             Error::Io(err) => write!(f, "I/O error: {err}"),
             Error::NoRuntime => f.write_str("not running inside a starfish runtime"),
             Error::AlreadyRunning => f.write_str("a starfish runtime is already running on this thread"),
-            Error::Panicked => f.write_str("task panicked"),
+            Error::Panicked { message: Some(message) } => write!(f, "task panicked: {message}"),
+            Error::Panicked { message: None } => f.write_str("task panicked"),
             Error::Canceled => f.write_str("task was canceled"),
             Error::InvalidShard { shard, count } => {
                 write!(f, "shard {shard} does not exist (runtime has {count})")

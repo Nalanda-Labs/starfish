@@ -31,7 +31,6 @@ use io_uring::{opcode, types};
 use crate::buf::{IoBuf, IoBufMut};
 use crate::ioqueue::Direction;
 use crate::reactor::Op;
-use crate::runtime::try_current;
 
 /// The alignment [`AlignedBuf::new`] uses, and the one assumed for a file
 /// whose filesystem does not report its direct-I/O requirements. It
@@ -73,16 +72,7 @@ impl AsRawFd for FileFd {
 
 impl Drop for FileFd {
     fn drop(&mut self) {
-        let fd = self.0;
-        let queued = try_current()
-            .and_then(|shard| shard.reactor.with(|reactor| reactor.close_detached(fd)))
-            .unwrap_or(false);
-        if !queued {
-            // SAFETY: the descriptor is ours and nothing else closes it.
-            unsafe {
-                libc::close(fd);
-            }
-        }
+        crate::reactor::close_fd(self.0);
     }
 }
 
@@ -198,17 +188,36 @@ async fn set_len(fd: &FileFd, len: u64) -> io::Result<()> {
     match result {
         Ok(_) => Ok(()),
         // Kernels before 6.9 do not know the operation. Fall back to the
-        // system call, which blocks the shard for its duration.
-        Err(err) if err.raw_os_error() == Some(libc::EINVAL) => {
-            let len = libc::off64_t::try_from(len).map_err(|_| invalid("length is too large"))?;
-            // SAFETY: plain system call on a descriptor we own.
-            match unsafe { libc::ftruncate64(raw, len) } {
-                0 => Ok(()),
-                _ => Err(io::Error::last_os_error()),
-            }
-        }
+        // system call, on a thread of its own since it may block.
+        Err(err) if err.raw_os_error() == Some(libc::EINVAL) => truncate_on_thread(raw, len).await,
         Err(err) => Err(err),
     }
+}
+
+/// Sets a file's length with the blocking system call, off the shard.
+async fn truncate_on_thread(fd: RawFd, len: u64) -> io::Result<()> {
+    let len = libc::off64_t::try_from(len).map_err(|_| invalid("length is too large"))?;
+    // The call is made on a duplicate of the descriptor. It runs on
+    // another thread and goes on if this future is dropped, by when the
+    // original may be closed and its number in use for another file.
+    // SAFETY: plain system call; the result is checked.
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    crate::run_blocking(move || {
+        // SAFETY: plain system calls on a descriptor only this closure
+        // has, which it closes.
+        unsafe {
+            let outcome = match libc::ftruncate64(duplicate, len) {
+                0 => Ok(()),
+                _ => Err(io::Error::last_os_error()),
+            };
+            libc::close(duplicate);
+            outcome
+        }
+    })
+    .await?
 }
 
 async fn allocate(fd: &FileFd, offset: u64, len: u64) -> io::Result<()> {
@@ -228,6 +237,11 @@ async fn read_into<B: IoBufMut>(
     len: u32,
     offset: u64,
 ) -> (io::Result<usize>, B) {
+    if len == 0 {
+        // A read of nothing would return `Ok(0)`, which means "end of
+        // file" to every caller.
+        return (Err(invalid("read buffer has no room")), buf);
+    }
     let target = types::Fd(fd.as_raw_fd());
     let ptr = buf.as_mut_ptr();
     let sqe = match buf.fixed_index() {
@@ -475,6 +489,11 @@ impl File {
     /// Reads at `offset` into `buf` from its start, replacing its contents:
     /// on success the buffer holds exactly the bytes read, at most its
     /// capacity. `Ok(0)` means end of file.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` if the buffer has no capacity, as `Vec::new()` has
+    /// none: there would be no telling that from the end of the file.
     pub async fn read_at<B: IoBufMut>(&self, buf: B, offset: u64) -> (io::Result<usize>, B) {
         let len = clamp_len(buf.capacity());
         read_into(&self.fd, Some(self.device), buf, len, offset).await
@@ -929,6 +948,11 @@ impl DmaFile {
 
     /// Reads at `offset`, replacing the buffer's contents, as many whole
     /// blocks as fit in its capacity. A short read means end of file.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` if the buffer breaks the file's alignment rules or
+    /// has room for less than one block.
     ///
     /// Any buffer with suitably aligned memory works: an [`AlignedBuf`] or
     /// a [`FixedBuf`](crate::buf::FixedBuf).
@@ -1449,3 +1473,56 @@ debug_impl!(AlignedBuf, "len" => |buf| buf.len, "capacity" => |buf| buf.capacity
 debug_impl!(<F> Cursor<F>, "position" => |cursor| cursor.position);
 debug_impl!(<F> DmaStreamWriter<F>, "position" => |writer| writer.start.saturating_add(writer.filled as u64));
 debug_impl!(<F> DmaStreamReader<F>, "position" => |reader| reader.position);
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic, clippy::arithmetic_side_effects)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::pin::pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    /// Wakes a thread blocked in `block_on`.
+    struct Unpark(std::thread::Thread);
+
+    impl Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+        let mut future = pin!(future);
+        loop {
+            match future.as_mut().poll(&mut Context::from_waker(&waker)) {
+                Poll::Ready(output) => return output,
+                Poll::Pending => std::thread::park(),
+            }
+        }
+    }
+
+    /// The path kernels before 6.9 take in `set_len`, which newer ones
+    /// never exercise.
+    #[test]
+    #[cfg_attr(miri, ignore = "makes system calls Miri does not model")]
+    fn the_length_can_be_set_off_the_shard() {
+        let path = std::env::temp_dir().join(format!("starfish-test-{}-truncate", std::process::id()));
+        std::fs::write(&path, vec![7u8; 5000]).unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+
+        block_on(truncate_on_thread(file.as_raw_fd(), 1234)).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 1234);
+        block_on(truncate_on_thread(file.as_raw_fd(), 9000)).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 9000);
+
+        // The original descriptor is untouched, and errors come through.
+        drop(file);
+        let read_only = std::fs::File::open(&path).unwrap();
+        let refused = block_on(truncate_on_thread(read_only.as_raw_fd(), 1)).unwrap_err();
+        assert_eq!(refused.raw_os_error(), Some(libc::EINVAL));
+        assert!(block_on(truncate_on_thread(-1, 1)).is_err());
+        std::fs::remove_file(&path).unwrap();
+    }
+}

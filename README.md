@@ -140,6 +140,7 @@ The servers listen on 127.0.0.1, ports 7000 to 7006.
   uses the kernel stack; there is no userspace TCP stack.
 - **Buffered I/O:** `io::BufReader` and `io::BufWriter` for lines and
   length-framed data, over TCP streams and, through `fs::Cursor`, files.
+  A buffered read that times out loses nothing and can be tried again.
 - **Buffers:** I/O takes owned buffers (`Vec<u8>`, `AlignedBuf`, and others
   through `buf::IoBuf`). `buf::FixedBuf` comes from a per-shard pool
   registered with io_uring; `TcpStream::send_zc` sends from one without
@@ -164,7 +165,8 @@ clippy lints at the top of `src/lib.rs` keep panicking constructs out; run
 `cargo clippy --all-targets` after any change.
 
 A panic in *your* code is caught at the task boundary: the task ends, whoever
-awaits it gets `Error::Panicked`, and the shard carries on. This relies on
+awaits it gets `Error::Panicked` with the panic's message, and the shard
+carries on. This relies on
 unwinding, so it does not hold under `panic = "abort"`.
 
 ## Checks
@@ -182,7 +184,9 @@ RUSTFLAGS=-Zsanitizer=thread cargo +nightly test -Zbuild-std \
   shard-to-shard queue, the I/O scheduler's arithmetic and the allocator's
   size tables. It cannot run
   io_uring or the allocator's memory mapping.
-- **The thread sanitizer** runs the integration tests.
+- **The thread sanitizer** runs the integration tests. Under it
+  everything runs several times slower, so the tests that assert on
+  timing can fail there; run those with `--test-threads=1` if they do.
 - **Fuzzing:** `cargo +nightly fuzz run alloc_ops` (needs `cargo-fuzz`).
 - **Soak test:** `python3 scripts/kvdb_soak.py [rounds]` runs the `kvdb`
   example under load, kills it at random moments, restarts it and checks

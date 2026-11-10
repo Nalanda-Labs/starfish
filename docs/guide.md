@@ -389,9 +389,9 @@ async fn shards() -> starfish::Result<()> {
   [`shared_channel`](crate::sync::shared_channel) for a stream.
 - Dropping the returned future stops the wait, not the call. The closure
   still runs to the end on the other shard; only its result is discarded.
-- A call to the shard it is made on runs in place, as an ordinary
-  function call. One consequence: if it panics, the panic is the calling
-  task's own, not an [`Error::Panicked`](crate::Error::Panicked) result.
+- A call to the shard it is made on runs in place, without a message or
+  a task. A panic in it is still caught and returned as
+  [`Error::Panicked`](crate::Error::Panicked), as for any other shard.
 - Calls run as separate tasks on the other shard and may finish in any
   order.
 - [`Error::Canceled`](crate::Error::Canceled) means the other shard shut
@@ -797,10 +797,9 @@ Reads need an [`IoBufMut`](crate::buf::IoBufMut): `Vec<u8>`, `AlignedBuf` or
 - A read fills the buffer from its start, up to its *capacity*, and sets
   its length to what was read. Whatever the buffer held is replaced; a
   read never appends.
-- A `Vec` with no capacity reads nothing, and the `Ok(0)` that results
-  looks exactly like the end of the stream. `Vec::new()` and a `Vec` left
-  behind by `std::mem::take` have no capacity. Use
-  `Vec::with_capacity(n)`.
+- A read needs a buffer with capacity. `Vec::new()` and a `Vec` left
+  behind by `std::mem::take` have none, and a read into one fails with
+  `InvalidInput`. Use `Vec::with_capacity(n)`.
 - A `Vec` may have more capacity than was asked for, and a read uses all
   of it.
 - If the future of an I/O call is dropped, the buffer does not come back.
@@ -867,8 +866,7 @@ another shard inside a [`submit_to`](crate::submit_to) closure.
   in as many steps as it takes, so two tasks calling `write_all` on one
   stream at the same time can interleave their data. Give each stream one
   writer.
-- `read` returning `Ok(0)` means the peer closed its sending side, or the
-  buffer has no capacity (see [Buffers](#buffers)).
+- `read` returning `Ok(0)` means the peer closed its sending side.
 - There is no built-in time limit on anything. A peer that goes silent
   holds its task and its connection forever unless the read is wrapped in
   [`timeout`](crate::timeout), and after a timeout the connection should
@@ -880,7 +878,9 @@ another shard inside a [`submit_to`](crate::submit_to) closure.
 - Writing to a connection the peer has closed returns an error
   (`EPIPE`); the process does not get `SIGPIPE`.
 - `shutdown` and dropping a socket are immediate system calls, not
-  awaited operations.
+  awaited operations. Neither blocks. (Closing sockets through io_uring
+  was tried and made connections about 4% slower to open and close, for
+  no gain.)
 - Networking uses the kernel's stack. There is no TLS.
 
 # Buffered reading and writing
@@ -944,10 +944,18 @@ Both types live in [`io`](crate::io) and are re-exported from `net`.
 - Dropping a `BufWriter` does **not** flush it. Whatever is still in the
   buffer is lost, silently. Flush before the writer goes, and before
   waiting for a reply.
-- A read that is dropped while it waits for the network may lose the
-  bytes that were arriving at that moment. After a `timeout` on a
-  buffered read the position in the stream is unknown: close the
-  connection.
+- A read that is given up, by `timeout`, `select` or an aborted task,
+  loses nothing with `next_line`, `read_line`, `read` and `fill_buf`:
+  the reader keeps the read it had started and the part of a line it had
+  collected, and the next call carries on. So a line can be waited for
+  with a time limit, again and again.
+- `read_until` appends to a buffer of yours, so it carries on only if
+  called again with that same buffer, and `read_exact` cannot be resumed
+  at all: after a timeout on it, the position in the stream is unknown.
+- Each read from a socket through the reader allocates a small box for
+  the read in progress, which is what lets it outlive a caller that has
+  stopped waiting. That is noise next to the system call, but it is
+  there.
 - If a write fails or is dropped part-way, some of the buffer may have
   been sent and the rest is lost. The connection is of no further use.
 - `into_inner` discards what the reader has received but not handed out.
@@ -992,9 +1000,10 @@ async fn udp_echo() -> std::io::Result<()> {
 
 **Caveats**
 
-- A datagram longer than the buffer's capacity is cut to fit, and the
-  rest is discarded without any sign. Size the buffer for the largest
-  datagram the protocol allows.
+- A datagram longer than the buffer's capacity cannot be received
+  whole: the receive fails with `InvalidData`, the buffer comes back
+  holding the part that fitted, and the rest is gone. Size the buffer for
+  the largest datagram the protocol allows.
 - Nothing tells a sender that nobody is listening. Guard every receive
   that expects an answer with a [`timeout`](crate::timeout).
 - With a socket per shard, the kernel picks the socket by the sender's
@@ -1107,8 +1116,7 @@ async fn files() -> std::io::Result<()> {
 - Data is not safe until a sync returns. A successful write has only
   reached the page cache.
 - `read_at` returning fewer bytes than the buffer holds means the end of
-  the file was reached; `Ok(0)` means the offset is at or past the end
-  (or the buffer has no capacity; see [Buffers](#buffers)).
+  the file was reached; `Ok(0)` means the offset is at or past the end.
 - `write_at` may write only part of the buffer; `write_all_at` writes all
   of it. Writes past the end leave a gap that reads back as zeros.
 - Reads of data that is not in the page cache, and writes that have to
@@ -1118,8 +1126,8 @@ async fn files() -> std::io::Result<()> {
   For predictable storage performance use [direct I/O](#direct-io).
 - `size` asks the kernel every time. It is not a field.
 - `set_len` uses an io_uring operation that kernels before 6.9 lack. On
-  those it falls back to the ordinary system call, which blocks the shard
-  for its (normally short) duration.
+  those it makes the ordinary system call on a thread outside the
+  runtime, which costs more but does not hold the shard up.
 - Dropping a file closes it through the shard's io_uring without waiting
   and without reporting failure. Filesystems that only find out at close
   that data could not be stored (network filesystems above all) can only
@@ -1174,7 +1182,7 @@ async fn direct() -> std::io::Result<()> {
   `Vec<u8>` is almost never aligned; use `alloc`, an `AlignedBuf` or a
   `FixedBuf`.
 - A read takes as many whole blocks as fit in the buffer's capacity; a
-  capacity below one block reads nothing.
+  capacity below one block is refused with `InvalidInput`.
 - Alignment is asked of the kernel when the file is opened, which needs
   Linux 6.1. Before that, 4096 bytes is assumed for both memory and
   offsets, which is right for most devices but not all.
@@ -1348,8 +1356,9 @@ async fn send_block(stream: &TcpStream, block: &[u8]) -> starfish::Result<usize>
   every sender on the shard waiting in `acquire`. Size the pool for the
   number of connections, and put a `timeout` on `acquire`.
 - `send_zc` may accept only part of the buffer. It returns how much, and
-  the buffer is gone either way: the rest has to be sent again from
-  another buffer.
+  the buffer is gone either way. To send all of a buffer use
+  [`send_all_zc`](crate::net::TcpStream::send_all_zc), which keeps going
+  until everything is queued.
 - Zero-copy pays off from roughly 10 KiB per send. For small messages the
   bookkeeping costs more than the copy it saves; use `write`.
 - Registered memory is pinned and counts against the process's
@@ -1748,9 +1757,11 @@ same holds for a closure sent to another shard.
 
 - This relies on unwinding. Under `panic = "abort"` a panic anywhere ends
   the process.
-- The panic's message is not kept. It goes to the panic hook (by default,
-  standard error) and the awaiting task only learns that there was a
-  panic.
+- The panic's message is kept in the error
+  (`Error::Panicked { message }`) when the panic carried text, as
+  `panic!("...")` does. It also still goes to the panic hook, by default
+  to standard error. A panic with another kind of payload has no
+  message.
 - A panic leaves the task's shared state as it was at that instant. Data
   in an `Rc<RefCell<..>>` that the task was half-way through changing
   stays half changed, for the other tasks to find.
@@ -1783,7 +1794,9 @@ has let go of it.
 - A cancelled operation may have happened anyway. The kernel may have
   completed a write, or part of it, before the cancellation arrived. A
   cancelled read may have taken bytes out of the socket that are now
-  lost with the buffer.
+  lost with the buffer. (Reading through a
+  [`BufReader`](crate::io::BufReader) avoids that: it keeps the read
+  alive when its caller gives up.)
 - So after a timeout on a socket read or write, the state of the stream
   is unknown and the connection should be closed. After a timeout on a
   file write, the range may hold the old data, the new data or a
