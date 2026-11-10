@@ -1,5 +1,8 @@
 # starfish
 
+[![CI](https://github.com/Nalanda-Labs/starfish/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Nalanda-Labs/starfish/actions/workflows/ci.yml)
+[![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
+
 A shared-nothing, thread-per-core async runtime for Rust on io_uring,
 modelled on [Seastar](https://seastar.io).
 
