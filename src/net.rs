@@ -171,6 +171,37 @@ macro_rules! buffered_stream {
 buffered_stream!(TcpStream);
 buffered_stream!(UnixStream);
 
+/// Looks up the addresses of a host name, with the system's resolver.
+///
+/// The system's resolver blocks, so the lookup is made on a thread
+/// outside the runtime ([`run_blocking`](crate::run_blocking)) while the
+/// task waits. That costs far more than an ordinary call: look names up
+/// once and keep the addresses, do not resolve per request.
+///
+/// ```no_run
+/// use starfish::net::{lookup_host, TcpStream};
+///
+/// # async fn example() -> std::io::Result<()> {
+/// let addresses = lookup_host("example.com", 80).await?;
+/// let first = addresses.first().ok_or(std::io::ErrorKind::NotFound)?;
+/// let stream = TcpStream::connect(*first).await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Errors
+///
+/// Whatever the resolver reports, typically that the name does not exist.
+/// A name with no addresses gives an empty list, not an error.
+pub async fn lookup_host(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+    let host = host.to_owned();
+    crate::run_blocking(move || {
+        use std::net::ToSocketAddrs;
+        (host.as_str(), port).to_socket_addrs().map(|found| found.collect())
+    })
+    .await?
+}
+
 /// How a socket is bound: what [`TcpListener::bind_with`],
 /// [`UdpSocket::bind_with`] and [`UnixListener::bind_with`] take.
 ///

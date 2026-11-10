@@ -306,9 +306,14 @@ async fn worker() {
   `future.as_mut()`. Recreating it each round is fine for things that
   lose nothing when dropped, such as `recv` or `tick`, and wrong for
   anything that holds progress, such as a half-finished request.
-- There are two futures, not many. More are had by nesting, which gets
-  unwieldy past three; beyond that a task per source feeding one channel
-  is clearer.
+- For three futures of different kinds there is
+  [`select3`](crate::select3), and for any number of the same kind
+  [`select_all`](crate::select_all), which says which one finished and
+  takes them in turn so that none is favoured. Past three kinds, a task
+  per source feeding one channel is clearer.
+- `select_all` boxes each future, one allocation apiece, and drops all
+  but the winner. It is for a handful of alternatives, not for waiting on
+  thousands of things.
 - It is a function, not a macro: both futures are created before it is
   called, even the one that will lose.
 
@@ -398,6 +403,8 @@ async fn shards() -> starfish::Result<()> {
   down before running or finishing the call.
 - `submit_to_all` returns the first error and discards the other results,
   though the closure has run on the shards that succeeded.
+  [`submit_to_each`](crate::submit_to_each) returns every shard's
+  outcome instead.
 - The closure runs in the caller's scheduling group.
 - The number of calls in progress is limited; see
   [Backpressure between shards](#backpressure-between-shards).
@@ -464,14 +471,17 @@ async fn counters() -> starfish::Result<()> {
 
 **Caveats**
 
-- The factory is an ordinary function, not a future: an instance cannot
-  await anything while it is being built. Build it empty, then set it up
-  with `invoke_on_all`.
+- `start` takes an ordinary function. For an instance that has to wait
+  for something while it is built, such as opening its files, use
+  [`start_with`](crate::Sharded::start_with) or, if building can fail,
+  [`try_start_with`](crate::Sharded::try_start_with), which removes the
+  service from every shard if any one fails.
 - The instance type needs no `Send`, but the factory and the closures
   given to `invoke_on` do, since they travel to the other shards.
-- `stop` removes the instances; it does not call anything on them. An
-  instance that must finish work first needs a method for that, called
-  through `invoke_on_all` before `stop`.
+- `stop` removes the instances; it does not call anything on them. For
+  an instance that must finish work first,
+  [`stop_with`](crate::Sharded::stop_with) runs a future against each
+  before removing them.
 - An instance is dropped when the last `Rc` to it goes. A task that keeps
   the `Rc` from [`local`](crate::Sharded::local) past `stop` keeps its
   instance alive.
@@ -879,9 +889,10 @@ another shard inside a [`submit_to`](crate::submit_to) closure.
   [`timeout`](crate::timeout), and after a timeout the connection should
   be closed (see [Cancellation](#cancellation)).
 - Dropping `accept` just as a connection arrives closes that connection.
-- Addresses are `SocketAddr`s. There is no asynchronous name resolution;
-  the system's resolver can be called through
-  [`run_blocking`](crate::run_blocking).
+- Addresses are `SocketAddr`s. [`lookup_host`](crate::net::lookup_host)
+  turns a name into addresses with the system's resolver, on a thread
+  outside the runtime, which is slow: look a name up once and keep the
+  result. Nothing here caches names or notices when they change.
 - Writing to a connection the peer has closed returns an error
   (`EPIPE`); the process does not get `SIGPIPE`.
 - `shutdown` and dropping a socket are immediate system calls, not
@@ -1330,8 +1341,10 @@ async fn replace(dir: &str, name: &str, contents: Vec<u8>) -> std::io::Result<()
 - `create_dir_all` and `read_dir` are sequences of steps, not atomic:
   another process changing the same directories at the same time can
   make them fail or return a listing that was never true at one instant.
-- `remove_dir` removes only an empty directory. There is no recursive
-  removal.
+- `remove_dir` removes only an empty directory.
+  [`remove_dir_all`](crate::fs::remove_dir_all) removes a whole tree, on
+  a thread outside the runtime and not as one step: stopped part-way, it
+  leaves part of the tree.
 - New directories get mode `0777` less the process's umask.
 - Relative paths are relative to the process's current directory, which
   all shards share.
@@ -1423,9 +1436,12 @@ both want the whole CPU get 799 ms and 200 ms of a second.
 
 **Caveats**
 
-- Groups cannot be deleted. Each one created stays for the life of the
-  runtime, so create a handful at start-up, never one per request or per
-  connection.
+- Groups cannot be deleted, and there is no limit on how many are made.
+  Each one stays for the life of the runtime and every shard keeps a
+  little state for it, so create a handful at start-up, never one per
+  request or per connection: that would grow without end. (A limit that
+  turned this into an error was tried and withdrawn, because having many
+  groups is meant to work.)
 - Shares only matter under contention. A group alone on a shard gets all
   of it, whatever its shares.
 - CPU shares only work if tasks yield. A task that never awaits keeps the
@@ -1531,7 +1547,11 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 fn evict_under_pressure(cache: Rc<RefCell<HashMap<u64, Vec<u8>>>>) -> starfish::Result<()> {
-    starfish::alloc::on_pressure(move || cache.borrow_mut().clear())
+    let hook = starfish::alloc::on_pressure(move || cache.borrow_mut().clear())?;
+    // Kept only if the function should be taken out again later, with
+    // `hook.remove()`. Dropping it leaves the function registered.
+    drop(hook);
+    Ok(())
 }
 ```
 
@@ -1546,8 +1566,10 @@ fn evict_under_pressure(cache: Rc<RefCell<HashMap<u64, Vec<u8>>>>) -> starfish::
 - If a call leaves the heap over the limit, the next call comes only
   after some turns of the event loop, so a function with nothing to give
   is not called continuously.
-- Pressure functions cannot be removed, and belong to the shard they
-  were registered on.
+- A pressure function belongs to the shard it was registered on, and
+  stays registered until the runtime stops unless it is taken out with
+  the [`PressureHook`](crate::alloc::PressureHook) that `on_pressure`
+  returns. Dropping the hook does not remove the function.
 - The limit and [`alloc::stats`](crate::alloc::stats) do nothing unless
   `ShardAlloc` is the program's global allocator.
 - Only shard threads use the per-shard heaps. Every other thread, and a
@@ -1587,10 +1609,13 @@ async fn control() -> std::io::Result<()> {
 **Caveats**
 
 - Listening for a signal replaces what the process would otherwise do on
-  receiving it, for the rest of the process's life. After anything has
-  listened for `SIGINT`, Ctrl-C no longer ends the program by itself, not
-  even once the listener is gone. A program that listens must act on what
-  it hears.
+  receiving it, for as long as anything listens. While a `Signals` for
+  `SIGINT` exists, Ctrl-C does not end the program by itself: a program
+  that listens must act on what it hears. When the last listener for a
+  signal is dropped, the signal goes back to what it did before.
+- [`termination`](crate::signal::termination) stops listening when it
+  returns. So during the shutdown that follows, a second Ctrl-C ends the
+  program at once, without any code for it.
 - Signal handlers are process-wide. If another library installs its own
   handler for the same signal, whichever was installed last wins and the
   other stops hearing it.
@@ -1646,8 +1671,9 @@ async fn serve_until_stopped(acceptor: JoinHandle<()>, serving: Gate) -> starfis
 - A connection that is idle, waiting for a request that never comes,
   keeps its guard and holds the gate open until the timeout. Either time
   out idle reads, or abort the connection tasks on shutdown.
-- A second Ctrl-C does nothing unless the program listens for it. To let
-  an impatient operator force the exit, keep a
+- After [`termination`](crate::signal::termination) has returned, a
+  second Ctrl-C ends the program at once, as for any program: nothing
+  listens any more. To decide yourself what a second signal does, keep a
   [`Signals`](crate::signal::Signals) and [`select`](crate::select)
   between the shutdown and the next signal, as the `kvdb` example does.
 - At the very end the runtime cancels every operation still in the
@@ -1687,9 +1713,10 @@ fn report() -> starfish::Result<()> {
 
 **Caveats**
 
-- Every figure is for the shard the call is made on. To see the whole
-  runtime, collect them with [`submit_to_all`](crate::submit_to_all), as
-  the `shard_stats` example does.
+- Every figure is for the shard the call is made on.
+  [`stats::all_shards`](crate::stats::all_shards) collects the event-loop
+  counters of every shard; for groups and devices, collect them with
+  [`submit_to_all`](crate::submit_to_all).
 - Counters run from the start of the runtime and are never reset. For a
   rate, take two readings and subtract.
 - `busy` is time spent running tasks, `idle` is time asleep and
@@ -1752,9 +1779,11 @@ fn main() -> starfish::Result<()> {
 - The stack is of the moment the timer fired, somewhere inside the
   stall. It shows what was running then, which is usually but not
   always the whole story.
-- The handler given to `on_stall` is a plain function, so it cannot
-  capture anything. It runs on the shard's thread, between tasks: keep
-  it short, and do not block in it.
+- The handler given to `on_stall` is shared by all shards and called on
+  whichever stalled, so what it captures must be `Send` and `Sync`: an
+  atomic counter or a channel to a logging thread, not an `Rc`. It runs
+  on the shard's thread, between tasks: keep it short, and do not block
+  in it.
 - Time the thread spent descheduled by the operating system counts too.
   On an overcommitted machine, stalls are reported that no task caused.
 
@@ -1926,5 +1955,4 @@ the pieces fit.
 - No calls for links or for changing permissions.
 - No cross-shard channel with several receivers.
 - No work stealing or load balancing between shards.
-- No `select` over more than two futures at once, except by nesting.
 - Only Linux on x86-64.

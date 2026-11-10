@@ -269,6 +269,11 @@ impl SchedulingGroup {
 
     /// Creates a group with separate CPU and I/O shares, each clamped to
     /// `1..=10_000`.
+    ///
+    /// There is no limit on the number of groups, but a group cannot be
+    /// removed and every shard keeps a little state for each. Groups are
+    /// classes of work, to be made once at start-up, not one per request
+    /// or per connection.
     pub fn create_with(name: &str, cpu_shares: u32, io_shares: u32) -> Result<SchedulingGroup> {
         let id = current()?.runtime.groups.create(name, cpu_shares, io_shares);
         Ok(SchedulingGroup { id })

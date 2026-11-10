@@ -277,7 +277,7 @@ pub(crate) struct Shard {
     /// requests inherit it.
     pub(crate) current_group: Cell<usize>,
     pub(crate) stats: Counters,
-    /// Callbacks that free memory when the shard's heap is over its limit.
+    /// Functions that free memory when the shard's heap is over its limit.
     pub(crate) reclaimers: Local<Vec<Rc<dyn Fn()>>>,
     /// Indexed by target shard: one permit for every call this shard may
     /// have in progress there (see `Runtime::submit_limit`).
@@ -648,7 +648,7 @@ impl Shard {
             self.stats.longest_stall_nanos.set(nanos);
         }
         let backtrace = stall::take_backtrace();
-        let Some(on_stall) = self.config.on_stall else { return };
+        let Some(StallHandler(on_stall)) = &self.config.on_stall else { return };
         let report = StallReport {
             shard: self.shared.id,
             duration,
@@ -813,13 +813,23 @@ impl Drop for StopOnDrop {
 /// cleanly instead of exhausting memory.
 const MAX_SHARDS: usize = 1024;
 
-#[derive(Clone, Copy, Debug)]
+/// What to call after a stall.
+#[derive(Clone)]
+struct StallHandler(Arc<dyn Fn(&StallReport) + Send + Sync>);
+
+impl std::fmt::Debug for StallHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StallHandler")
+    }
+}
+
+#[derive(Clone, Debug)]
 struct ShardConfig {
     task_quota: Duration,
     io_depth: usize,
     stall_threshold: Duration,
     stall_backtraces: bool,
-    on_stall: Option<fn(&StallReport)>,
+    on_stall: Option<StallHandler>,
     memory_limit: Option<usize>,
     submit_limit: usize,
     spin: Duration,
@@ -950,8 +960,8 @@ impl Runtime {
     }
 
     /// Calls `handler` on the shard's thread after every stall.
-    pub fn on_stall(mut self, handler: fn(&StallReport)) -> Runtime {
-        self.config.on_stall = Some(handler);
+    pub fn on_stall(mut self, handler: impl Fn(&StallReport) + Send + Sync + 'static) -> Runtime {
+        self.config.on_stall = Some(StallHandler(Arc::new(handler)));
         self
     }
 
@@ -1117,7 +1127,7 @@ impl Runtime {
                 }
             }
         }
-        let config = self.config;
+        let config = self.config.clone();
         let latency_goal = self.io_latency_goal.unwrap_or_else(|| {
             let quota = config.task_quota;
             quota.saturating_add(quota.checked_div(2).unwrap_or_default())
@@ -1148,6 +1158,7 @@ impl Runtime {
         for parts in parts {
             let runtime = runtime.clone();
             let devices = devices.clone();
+            let config = config.clone();
             let cpu = cpu_for(parts.shared.id);
             let thread = std::thread::Builder::new()
                 .name(format!("starfish-{}", parts.shared.id))

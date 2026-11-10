@@ -2843,3 +2843,229 @@ fn files_are_opened_the_way_the_options_say() {
         })
         .unwrap();
 }
+
+#[test]
+fn names_are_resolved_and_trees_removed_off_the_shard() {
+    use starfish::fs::{create_dir_all, metadata, remove_dir_all};
+    use starfish::net::lookup_host;
+
+    let root = scratch("tree-to-remove");
+    rt(1)
+        .run({
+            let root = root.clone();
+            move || async move {
+                let found = lookup_host("localhost", 8080).await.unwrap();
+                assert!(!found.is_empty());
+                assert!(found.iter().all(|addr| addr.ip().is_loopback() && addr.port() == 8080), "{found:?}");
+                assert!(lookup_host("no-such-host.invalid", 1).await.is_err());
+
+                create_dir_all(root.join("a/b/c")).await.unwrap();
+                for name in ["a/one", "a/b/two", "a/b/c/three"] {
+                    let file = File::create(root.join(name)).await.unwrap();
+                    let (result, _) = file.write_all_at("x", 0).await;
+                    result.unwrap();
+                }
+                // `remove_dir` would refuse; this takes the lot.
+                assert!(starfish::fs::remove_dir(&root).await.is_err());
+                remove_dir_all(&root).await.unwrap();
+                assert_eq!(metadata(&root).await.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+                assert_eq!(remove_dir_all(&root).await.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+            }
+        })
+        .unwrap();
+}
+
+#[test]
+fn sharded_services_can_be_built_and_finished_by_futures() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    rt(3)
+        .run(|| async {
+            // Built by a future, which may wait.
+            let service = Sharded::start_with(|shard| async move {
+                sleep(Duration::from_millis(1)).await;
+                Cell::new(shard * 10)
+            })
+            .await
+            .unwrap();
+            let values = service.invoke_on_all(|cell| async move { cell.get() }).await.unwrap();
+            assert_eq!(values, [0, 10, 20]);
+
+            // Finished by a future as well, on every shard, before the
+            // instances go.
+            let finished = Arc::new(AtomicUsize::new(0));
+            let counter = finished.clone();
+            service
+                .stop_with(move |cell| {
+                    let counter = counter.clone();
+                    async move {
+                        yield_now().await;
+                        counter.fetch_add(cell.get() + 1, Ordering::SeqCst);
+                    }
+                })
+                .await
+                .unwrap();
+            assert_eq!(finished.load(Ordering::SeqCst), 1 + 11 + 21);
+            assert!(matches!(service.local(), Err(Error::ServiceStopped)));
+
+            // A factory that fails on one shard leaves no instance
+            // anywhere.
+            let built = Arc::new(AtomicUsize::new(0));
+            let counter = built.clone();
+            let failed = Sharded::<usize>::try_start_with(move |shard| {
+                let counter = counter.clone();
+                async move {
+                    if shard == 1 {
+                        return Err(std::io::Error::other("shard 1 cannot start"));
+                    }
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(shard)
+                }
+            })
+            .await;
+            let Err(Error::Io(error)) = failed else { panic!("it started") };
+            assert_eq!(error.to_string(), "shard 1 cannot start");
+
+            // Every shard's outcome, where `submit_to_all` gives the first
+            // failure only.
+            let outcomes = starfish::submit_to_each(|| async {
+                let shard = shard_id().unwrap();
+                if shard == 1 {
+                    panic!("shard 1 fails");
+                }
+                shard
+            })
+            .await
+            .unwrap();
+            assert_eq!(outcomes.len(), 3);
+            assert!(matches!(outcomes[0], Ok(0)));
+            assert!(matches!(&outcomes[1], Err(Error::Panicked { message: Some(text) }) if text == "shard 1 fails"));
+            assert!(matches!(outcomes[2], Ok(2)));
+
+            let stats = starfish::stats::all_shards().await.unwrap();
+            let shards: Vec<_> = stats.iter().map(|shard| shard.shard).collect();
+            assert_eq!(shards, [0, 1, 2]);
+            assert!(stats.iter().all(|shard| shard.loops > 0));
+        })
+        .unwrap();
+}
+
+#[test]
+fn select_among_three_and_among_many() {
+    use starfish::{select3, select_all, Either3};
+
+    rt(1)
+        .run(|| async {
+            let (sender, mut inbox) = channel::<u8>(1);
+            let nothing = std::future::pending::<()>();
+            let first = select3(nothing, inbox.recv(), sleep(Duration::from_millis(10))).await;
+            assert_eq!(first, Either3::Third(()));
+            sender.send(9).await.unwrap();
+            let second = select3(std::future::pending::<()>(), inbox.recv(), sleep(Duration::from_secs(5))).await;
+            assert_eq!(second, Either3::Second(Some(9)));
+            assert_eq!(select3(async { 1 }, async { 2 }, async { 3 }).await, Either3::First(1));
+
+            // Among many of one kind: the quickest, and which it was.
+            let sleeps = [30u64, 5, 20].map(|millis| async move {
+                sleep(Duration::from_millis(millis)).await;
+                millis
+            });
+            assert_eq!(select_all(sleeps).await, (1, 5));
+            // None is favoured when several are ready time after time.
+            let mut wins = [0u32; 3];
+            for _ in 0..30 {
+                let ready = (0..3).map(|n| async move {
+                    yield_now().await;
+                    n
+                });
+                wins[select_all(ready).await.0] += 1;
+            }
+            assert!(wins.iter().all(|count| *count > 0), "{wins:?}");
+            // An empty list never finishes.
+            let empty = select_all(Vec::<std::future::Ready<()>>::new());
+            assert!(timeout(Duration::from_millis(5), empty).await.is_err());
+        })
+        .unwrap();
+}
+
+#[test]
+fn stall_handlers_may_capture_and_pressure_functions_be_removed() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    let stalled = Arc::new(AtomicU64::new(0));
+    let counter = stalled.clone();
+    rt(1)
+        .stall_threshold(Duration::from_millis(5))
+        // A closure with something of its own, where a bare function was
+        // all that could be given before.
+        .on_stall(move |stall| {
+            counter.fetch_add(stall.duration.as_millis() as u64, Ordering::SeqCst);
+        })
+        .memory_limit(8 << 20)
+        .run(|| async {
+            hog_the_cpu_for_a_while(Duration::from_millis(20));
+            yield_now().await;
+
+            let calls = Rc::new(Cell::new(0u32));
+            let hook = starfish::alloc::on_pressure({
+                let calls = calls.clone();
+                move || calls.set(calls.get() + 1)
+            })
+            .unwrap();
+            // Over the limit: the function is asked to free memory.
+            let ballast = vec![1u8; 16 << 20];
+            for _ in 0..200 {
+                yield_now().await;
+            }
+            assert!(calls.get() > 0);
+
+            hook.remove();
+            let before = calls.get();
+            for _ in 0..200 {
+                yield_now().await;
+            }
+            assert_eq!(calls.get(), before);
+            drop(ballast);
+        })
+        .unwrap();
+    assert!(stalled.load(Ordering::SeqCst) >= 15, "{stalled:?}");
+}
+
+#[test]
+fn a_signal_goes_back_to_what_it_did_when_nobody_listens() {
+    /// What the process does with a signal right now.
+    fn handler(signal: i32) -> usize {
+        // SAFETY: asks the kernel for the current action without changing
+        // it; the structure is filled in by the call.
+        unsafe {
+            let mut current: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(signal, std::ptr::null(), &mut current);
+            current.sa_sigaction
+        }
+    }
+
+    // A signal no other test uses, and which is ignored by default.
+    let signal = libc::SIGWINCH;
+    let default = handler(signal);
+    rt(1)
+        .run(move || async move {
+            let first = Signals::new(&[signal]).unwrap();
+            let mut second = Signals::new(&[signal, signal]).unwrap();
+            assert_ne!(handler(signal), default);
+            drop(first);
+            // Still listened for.
+            assert_ne!(handler(signal), default);
+            send_signal_to_self(signal);
+            assert_eq!(timeout(Duration::from_secs(5), second.next()).await.unwrap(), signal);
+            drop(second);
+            // Nobody listens: back to the default.
+            assert_eq!(handler(signal), default);
+
+            // A list that cannot all be listened for leaves nothing behind.
+            assert!(Signals::new(&[signal, libc::SIGKILL]).is_err());
+            assert_eq!(handler(signal), default);
+        })
+        .unwrap();
+}

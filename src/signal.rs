@@ -13,9 +13,10 @@
 //! ```
 //!
 //! Listening for a signal replaces what the process would otherwise do on
-//! receiving it, and that lasts for the life of the process: once anything
-//! has listened for `SIGINT`, Ctrl-C no longer ends the program by itself,
-//! even after the listener is gone.
+//! receiving it, for as long as anything listens: while a [`Signals`] for
+//! `SIGINT` exists, Ctrl-C does not end the program by itself. When the
+//! last listener for a signal is dropped, the signal goes back to what it
+//! did before.
 //!
 //! Signals are process-wide, so a listener works on any shard, and every
 //! listener for a signal sees it. Deliveries that arrive faster than they
@@ -42,16 +43,29 @@ static NOTIFY: AtomicI32 = AtomicI32::new(-1);
 struct Registry {
     /// The relay thread and its eventfd exist.
     started: bool,
-    /// Which signals have our handler.
-    installed: [bool; SLOTS],
+    /// For each signal, who is listening and what was there before.
+    slots: [Slot; SLOTS],
     /// The tasks waiting in [`Signals::next`].
     listeners: BTreeMap<u64, Waker>,
     next_listener: u64,
 }
 
+/// One signal's state.
+#[derive(Clone, Copy)]
+struct Slot {
+    /// How many [`Signals`] listen for it.
+    listeners: u32,
+    /// What the process did with the signal before our handler went in,
+    /// to be put back when the last listener goes.
+    previous: Option<libc::sigaction>,
+}
+
 static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
     started: false,
-    installed: [false; SLOTS],
+    slots: [Slot {
+        listeners: 0,
+        previous: None,
+    }; SLOTS],
     listeners: BTreeMap::new(),
     next_listener: 0,
 });
@@ -146,28 +160,47 @@ fn install(registry: &mut Registry, signal: c_int) -> io::Result<()> {
     if FAULTS.contains(&signal) {
         return Err(invalid("cannot listen for a signal that reports a program fault"));
     }
-    let installed = usize::try_from(signal)
+    let slot = usize::try_from(signal)
         .ok()
         .filter(|slot| *slot >= 1)
-        .and_then(|slot| registry.installed.get_mut(slot))
+        .and_then(|slot| registry.slots.get_mut(slot))
         .ok_or_else(|| invalid("not a signal number"))?;
-    if *installed {
-        return Ok(());
+    if slot.listeners == 0 {
+        // SAFETY: installs a handler that keeps to async-signal-safe
+        // operations, on a zero-initialised structure, and has the kernel
+        // fill in what was there before.
+        let (failed, previous) = unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = on_signal as extern "C" fn(c_int) as usize;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            let mut previous: libc::sigaction = std::mem::zeroed();
+            (libc::sigaction(signal, &action, &mut previous) != 0, previous)
+        };
+        if failed {
+            return Err(io::Error::last_os_error());
+        }
+        slot.previous = Some(previous);
     }
-    // SAFETY: installs a handler that keeps to async-signal-safe
-    // operations, on a zero-initialised structure.
-    let failed = unsafe {
-        let mut action: libc::sigaction = std::mem::zeroed();
-        action.sa_sigaction = on_signal as extern "C" fn(c_int) as usize;
-        action.sa_flags = libc::SA_RESTART;
-        libc::sigemptyset(&mut action.sa_mask);
-        libc::sigaction(signal, &action, std::ptr::null_mut()) != 0
-    };
-    if failed {
-        return Err(io::Error::last_os_error());
-    }
-    *installed = true;
+    slot.listeners = slot.listeners.saturating_add(1);
     Ok(())
+}
+
+/// Takes one listener off `signal`. With the last one, the signal goes
+/// back to what the process did with it before anyone listened.
+fn uninstall(registry: &mut Registry, signal: c_int) {
+    let Some(slot) = usize::try_from(signal).ok().and_then(|slot| registry.slots.get_mut(slot)) else {
+        return;
+    };
+    slot.listeners = slot.listeners.saturating_sub(1);
+    if slot.listeners == 0 {
+        if let Some(previous) = slot.previous.take() {
+            // SAFETY: restores a disposition the kernel itself reported.
+            unsafe {
+                libc::sigaction(signal, &previous, std::ptr::null_mut());
+            }
+        }
+    }
 }
 
 /// A listener for a set of signals.
@@ -198,7 +231,13 @@ impl Signals {
         start(&mut registry)?;
         let mut seen = Vec::with_capacity(signals.len());
         for &signal in signals {
-            install(&mut registry, signal)?;
+            if let Err(err) = install(&mut registry, signal) {
+                // All or nothing: undo the ones that went in.
+                for (installed, _) in seen {
+                    uninstall(&mut registry, installed);
+                }
+                return Err(err);
+            }
             seen.push((signal, count(signal)));
         }
         let id = registry.next_listener;
@@ -233,7 +272,12 @@ impl Signals {
 
 impl Drop for Signals {
     fn drop(&mut self) {
-        let waker = registry().listeners.remove(&self.id);
+        let mut registry = registry();
+        let waker = registry.listeners.remove(&self.id);
+        for (signal, _) in &self.seen {
+            uninstall(&mut registry, *signal);
+        }
+        drop(registry);
         drop(waker);
     }
 }
@@ -241,8 +285,10 @@ impl Drop for Signals {
 /// Waits until the process is asked to stop, by `SIGINT` (Ctrl-C) or
 /// `SIGTERM`, and returns which of the two it was.
 ///
-/// To notice a second request, for instance to give up on a slow shutdown,
-/// keep a [`Signals`] instead.
+/// When this returns it has stopped listening, so the signals do again
+/// what they did before: a second Ctrl-C during the shutdown that follows
+/// ends the program at once, as it would any other. To handle a second
+/// request yourself, keep a [`Signals`] instead.
 pub async fn termination() -> io::Result<i32> {
     let mut signals = Signals::new(&[libc::SIGINT, libc::SIGTERM])?;
     Ok(signals.next().await)

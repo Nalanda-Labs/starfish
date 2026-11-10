@@ -858,16 +858,46 @@ pub(crate) fn over_limit() -> bool {
 /// over the limit. If that does not bring the heap back under it, the
 /// function is called again every so often for as long as the heap stays
 /// over.
-pub fn on_pressure(reclaim: impl Fn() + 'static) -> crate::Result<()> {
+///
+/// The function stays registered until the runtime stops, or until
+/// [`remove`](PressureHook::remove) is called on what this returns.
+/// Dropping the returned value does not remove it.
+pub fn on_pressure(reclaim: impl Fn() + 'static) -> crate::Result<PressureHook> {
     let shard = crate::runtime::current()?;
-    let mut reclaim: Option<std::rc::Rc<dyn Fn()>> = Some(std::rc::Rc::new(reclaim));
+    let hook: std::rc::Rc<dyn Fn()> = std::rc::Rc::new(reclaim);
+    let mut registered = Some(hook.clone());
     shard.reclaimers.with(|reclaimers| {
-        if let Some(reclaim) = reclaim.take() {
+        if let Some(reclaim) = registered.take() {
             reclaimers.push(reclaim);
         }
     });
-    Ok(())
+    Ok(PressureHook { hook })
 }
+
+/// A function registered with [`on_pressure`], for taking it out again.
+pub struct PressureHook {
+    hook: std::rc::Rc<dyn Fn()>,
+}
+
+impl PressureHook {
+    /// Stops the function from being called. It must be done on the shard
+    /// the function was registered on, which is the only place this value
+    /// can be.
+    pub fn remove(self) {
+        let Some(shard) = crate::runtime::try_current() else { return };
+        // Taken out of the list here and dropped after, outside the
+        // borrow: dropping it may run code of the application's.
+        let removed = shard.reclaimers.with(|reclaimers| {
+            let place = reclaimers
+                .iter()
+                .position(|registered| std::rc::Rc::ptr_eq(registered, &self.hook))?;
+            Some(reclaimers.swap_remove(place))
+        });
+        drop(removed);
+    }
+}
+
+debug_impl!(PressureHook);
 
 debug_impl!(ShardAlloc);
 

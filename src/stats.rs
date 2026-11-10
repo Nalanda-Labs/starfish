@@ -130,6 +130,11 @@ pub fn shard() -> Result<ShardStats> {
     })
 }
 
+/// The event loop counters of every shard, in shard order.
+pub async fn all_shards() -> Result<Vec<ShardStats>> {
+    crate::submit_to_all(|| async { shard() }).await?.into_iter().collect()
+}
+
 /// Every scheduling group that has run on the current shard, in creation
 /// order.
 pub fn groups() -> Result<Vec<GroupStats>> {

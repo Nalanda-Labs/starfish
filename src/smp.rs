@@ -223,6 +223,27 @@ where
     Fut: Future<Output = T> + 'static,
     T: Send + 'static,
 {
+    submit_to_each(f).await?.into_iter().collect()
+}
+
+/// Runs `f` on every shard concurrently and returns every shard's outcome,
+/// in shard order: its result, or why there is none.
+///
+/// Where [`submit_to_all`] gives up at the first failure and discards the
+/// rest, this says what happened on each shard. Use it when the calls
+/// have effects and it matters which of them took place.
+///
+/// # Errors
+///
+/// The call as a whole fails only with [`Error::NoRuntime`], outside a
+/// runtime. Every other failure is one shard's, and is in its place in
+/// the list.
+pub async fn submit_to_each<F, Fut, T>(f: F) -> Result<Vec<Result<T>>>
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = T> + 'static,
+    T: Send + 'static,
+{
     let f = Arc::new(f);
     let count = current()?.runtime.shards.len();
     let handles: Vec<_> = (0..count)
@@ -233,7 +254,9 @@ where
         .collect();
     let mut results = Vec::with_capacity(count);
     for handle in handles {
-        results.push(handle.await??);
+        // A failure of the local task that made the call counts as that
+        // shard's failure.
+        results.push(handle.await.and_then(|outcome| outcome));
     }
     Ok(results)
 }

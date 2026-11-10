@@ -82,6 +82,95 @@ pub async fn select<A: Future, B: Future>(first: A, second: B) -> Either<A::Outp
     .await
 }
 
+/// Which of the three futures given to [`select3`] finished, with its
+/// output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Either3<A, B, C> {
+    /// The first future finished.
+    First(A),
+    /// The second future finished.
+    Second(B),
+    /// The third future finished.
+    Third(C),
+}
+
+/// Waits for whichever of three futures finishes first. Everything said
+/// of [`select`] holds: the others are dropped unless passed by reference,
+/// and they are looked at in order, so put the rarest event first.
+pub async fn select3<A: Future, B: Future, C: Future>(
+    first: A,
+    second: B,
+    third: C,
+) -> Either3<A::Output, B::Output, C::Output> {
+    let mut first = pin!(first);
+    let mut second = pin!(second);
+    let mut third = pin!(third);
+    poll_fn(|cx| {
+        if let Poll::Ready(output) = first.as_mut().poll(cx) {
+            return Poll::Ready(Either3::First(output));
+        }
+        if let Poll::Ready(output) = second.as_mut().poll(cx) {
+            return Poll::Ready(Either3::Second(output));
+        }
+        if let Poll::Ready(output) = third.as_mut().poll(cx) {
+            return Poll::Ready(Either3::Third(output));
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+/// Waits for whichever of a list of like futures finishes first, and
+/// returns its place in the list with its output. The others are dropped.
+///
+/// The futures are looked at in a different order each time, starting one
+/// further along, and each call starts where the last left off, so that
+/// no position in the list is favoured. An empty list never finishes.
+///
+/// ```no_run
+/// use starfish::net::TcpStream;
+///
+/// # async fn example(replicas: Vec<std::net::SocketAddr>) {
+/// // Whichever replica answers first.
+/// let attempts: Vec<_> = replicas.iter().map(|addr| TcpStream::connect(*addr)).collect();
+/// let (winner, connection) = starfish::select_all(attempts).await;
+/// # drop((winner, connection));
+/// # }
+/// ```
+pub async fn select_all<F: Future>(futures: impl IntoIterator<Item = F>) -> (usize, F::Output) {
+    thread_local! {
+        /// Where the last call on this thread started looking.
+        static TURN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    // Boxed so that each stays put while the list is walked.
+    let mut futures: Vec<_> = futures.into_iter().map(Box::pin).collect();
+    // A different starting point for every call as well as for every
+    // look: a program that calls this in a loop, with a fresh list each
+    // time, would otherwise see the same position win whenever several
+    // are ready together.
+    let mut start = TURN
+        .try_with(|turn| {
+            let start = turn.get();
+            turn.set(start.wrapping_add(1));
+            start
+        })
+        .unwrap_or(0);
+    poll_fn(|cx| {
+        let count = futures.len();
+        for step in 0..count {
+            let index = start.wrapping_add(step).checked_rem(count).unwrap_or(0);
+            if let Some(future) = futures.get_mut(index) {
+                if let Poll::Ready(output) = future.as_mut().poll(cx) {
+                    return Poll::Ready((index, output));
+                }
+            }
+        }
+        start = start.wrapping_add(1);
+        Poll::Pending
+    })
+    .await
+}
+
 /// Ticks at a fixed rate, without drifting. Made by [`interval`].
 pub struct Interval {
     period: Duration,

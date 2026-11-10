@@ -105,7 +105,8 @@ The servers listen on 127.0.0.1, ports 7000 to 7006.
 ## What is in it
 
 - **Tasks:** `spawn`, `JoinHandle` (with `abort`), `sleep`, `timeout`,
-  `interval`, `select`, `yield_now`. A task is one allocation.
+  `interval`, `select` (also `select3` and `select_all`), `yield_now`. A
+  task is one allocation.
 - **Blocking work:** `run_blocking` runs a closure on a thread outside the
   runtime, for system calls and libraries with no asynchronous form.
 - **Coordination:** `sync::Semaphore` to bound what runs at once on a shard,
@@ -117,7 +118,7 @@ The servers listen on 127.0.0.1, ports 7000 to 7006.
   an orderly way on Ctrl-C or `SIGTERM`.
 - **Shards:** `submit_to` runs a closure on another shard over a lock-free
   queue dedicated to that pair of shards; `Sharded<T>` keeps one instance of
-  a service per shard; `sync::shared_channel` streams values from one shard
+  a service per shard, built and finished by futures if need be; `sync::shared_channel` streams values from one shard
   to another, and `sync::shared_mpsc` from several shards to one. A shard
   that falls behind slows its senders down: calls in progress between two
   shards are limited, and the channels are bounded. An idle shard can be
@@ -138,7 +139,8 @@ The servers listen on 127.0.0.1, ports 7000 to 7006.
   with `iotune::measure`) and all shards together stay within it.
 - **Network:** `net::TcpListener`, `TcpStream`, `UdpSocket`, and
   `UnixListener`/`UnixStream` for local connections, with `BindOptions`
-  for whether a port is shared and how long its accept queue is. Networking
+  for whether a port is shared and how long its accept queue is, and
+  `lookup_host` for names. Networking
   uses the kernel stack; there is no userspace TCP stack.
 - **Buffered I/O:** `io::BufReader` and `io::BufWriter` for lines and
   length-framed data, over TCP streams and, through `fs::Cursor`, files.

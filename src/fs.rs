@@ -321,6 +321,20 @@ pub async fn remove_dir(path: impl AsRef<Path>) -> io::Result<()> {
     result.map(|_| ())
 }
 
+/// Deletes a directory and everything in it.
+///
+/// This is many system calls, and none of them has an asynchronous form
+/// that would help, so it runs on a thread outside the runtime
+/// ([`run_blocking`](crate::run_blocking)) while the task waits.
+///
+/// It is not one step: if it fails or the program stops part-way, some of
+/// the contents are gone and some are not. Symbolic links inside are
+/// removed, not followed.
+pub async fn remove_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
+    let path = path.as_ref().to_path_buf();
+    crate::run_blocking(move || std::fs::remove_dir_all(path)).await?
+}
+
 /// Renames a file or directory, replacing `to` if it exists. Both names
 /// must be on the same filesystem.
 ///
