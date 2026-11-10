@@ -601,7 +601,7 @@ impl OpenOptions {
     ///
     /// Appending does not go with direct I/O's whole-block writes at
     /// stated offsets; use a
-    /// [`DmaStreamWriter`](crate::fs::DmaStreamWriter) for that.
+    /// [`DmaStreamWriter`] for that.
     pub async fn open_direct(&self, path: impl AsRef<Path>) -> io::Result<DmaFile> {
         if self.append {
             return Err(invalid("a file opened for direct I/O cannot be in append mode"));
