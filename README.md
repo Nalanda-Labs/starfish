@@ -55,7 +55,7 @@ Ctrl-C; the others do their work and exit.
 | | `abort` | Cancelling a task and what happens to its state |
 | | `yielding` | The cost of not yielding, and `maybe_yield` |
 | | `panics` | A panic ends one task, not the shard |
-| | `blocking` | Running blocking code on a thread and awaiting it |
+| | `blocking` | Running blocking code off the shard with `run_blocking` |
 | Shards | `cross_shard` | `submit_to` and `submit_to_all` |
 | | `sharded_counter` | A `Sharded` service with one instance per shard |
 | | `kv_store` | Data split across shards by key hash |
@@ -96,6 +96,8 @@ The servers listen on 127.0.0.1, ports 7000 to 7005.
 
 - **Tasks:** `spawn`, `JoinHandle` (with `abort`), `sleep`, `timeout`,
   `yield_now`. A task is one allocation.
+- **Blocking work:** `run_blocking` runs a closure on a thread outside the
+  runtime, for system calls and libraries with no asynchronous form.
 - **Coordination:** `sync::Semaphore` to bound what runs at once on a shard,
   `sync::channel` to pass values between its tasks with backpressure, and
   `sync::Gate` to refuse new work and wait for work in progress when

@@ -1775,3 +1775,88 @@ fn dropped_files_are_closed_without_being_awaited() {
     std::fs::remove_file(&path).unwrap();
     assert_eq!((before, during, after), (0, 300, 0));
 }
+
+#[test]
+fn blocking_work_runs_off_the_shard() {
+    use starfish::run_blocking;
+    use std::collections::HashSet;
+
+    rt(2)
+        .run(|| async {
+            // The shard keeps going while a thread elsewhere is blocked.
+            let ticks = Rc::new(Cell::new(0u32));
+            let ticker = spawn({
+                let ticks = ticks.clone();
+                async move {
+                    loop {
+                        sleep(Duration::from_millis(2)).await;
+                        ticks.set(ticks.get() + 1);
+                    }
+                }
+            });
+            let here = std::thread::current().id();
+            let (value, there) = run_blocking(move || {
+                std::thread::sleep(Duration::from_millis(60));
+                (6 * 7, std::thread::current().id())
+            })
+            .await
+            .unwrap();
+            ticker.abort();
+            assert_eq!(value, 42);
+            assert_ne!(there, here);
+            assert!(ticks.get() >= 10, "only {} ticks", ticks.get());
+
+            // A panic is reported, and the pool is none the worse.
+            let panicked = run_blocking(move || {
+                if std::thread::current().id() != here {
+                    panic!("boom in blocking work");
+                }
+            })
+            .await;
+            assert!(matches!(panicked, Err(Error::Panicked)));
+
+            // Work done one piece after another reuses its thread.
+            let mut used = HashSet::new();
+            for _ in 0..50 {
+                used.insert(run_blocking(|| std::thread::current().id()).await.unwrap());
+            }
+            assert!(used.len() <= 3, "{} threads for sequential work", used.len());
+
+            // Many at once, from two shards, each on a thread of its own.
+            let burst = |count: u64| async move {
+                let jobs: Vec<_> = (0..count)
+                    .map(|n| {
+                        spawn(run_blocking(move || {
+                            std::thread::sleep(Duration::from_millis(20));
+                            n
+                        }))
+                    })
+                    .collect();
+                let mut sum = 0;
+                for job in jobs {
+                    sum += job.await.unwrap().unwrap();
+                }
+                sum
+            };
+            let start = Instant::now();
+            let remote = spawn(submit_to(1, move || burst(40)));
+            let local = burst(40).await;
+            assert_eq!(local + remote.await.unwrap().unwrap(), 2 * (39 * 40 / 2));
+            // 80 sleeps of 20 ms in sequence would take 1.6 s.
+            assert!(start.elapsed() < Duration::from_millis(800), "{:?}", start.elapsed());
+
+            // Giving up on the wait leaves the work to finish by itself.
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let abandoned = timeout(
+                Duration::from_millis(5),
+                run_blocking(move || {
+                    std::thread::sleep(Duration::from_millis(30));
+                    sender.send(()).unwrap();
+                }),
+            )
+            .await;
+            assert!(abandoned.is_err());
+            run_blocking(move || receiver.recv_timeout(Duration::from_secs(5)).unwrap()).await.unwrap();
+        })
+        .unwrap();
+}

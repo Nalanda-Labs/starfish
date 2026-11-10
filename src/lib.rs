@@ -42,6 +42,7 @@
 //! [`Semaphore`](sync::Semaphore) to bound what runs at once, a
 //! [`channel`](sync::channel) to pass values with backpressure, and a
 //! [`Gate`](sync::Gate) to wait for work in progress before shutting down.
+//! Code that blocks goes to [`run_blocking`], off the shard.
 //! A task that is no longer wanted is cancelled with [`JoinHandle::abort`],
 //! and [`signal::termination`] tells the program when it is asked to stop.
 //!
@@ -105,6 +106,7 @@ pub mod signal;
 pub mod stats;
 pub mod sync;
 
+pub use blocking::run_blocking;
 pub use error::{Error, Result};
 pub use ioqueue::IoProperties;
 pub use runtime::{shard_count, shard_id, Runtime};

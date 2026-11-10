@@ -421,13 +421,14 @@ impl DirEntry {
 /// the filesystem returns.
 ///
 /// The kernel has no asynchronous way to do this, so the listing is made
-/// on a helper thread, started for the purpose, while the task waits. That
-/// costs more than other file calls and the whole listing is held in
-/// memory: fine for finding one's files at start-up, not for a hot path or
-/// for directories with millions of entries.
+/// on a thread outside the runtime ([`run_blocking`](crate::run_blocking))
+/// while the task waits. That costs more than other file calls and the
+/// whole listing is held in memory: fine for finding one's files at
+/// start-up, not for a hot path or for directories with millions of
+/// entries.
 pub async fn read_dir(path: impl AsRef<Path>) -> io::Result<Vec<DirEntry>> {
     let directory = path.as_ref().to_path_buf();
-    crate::blocking::run(move || {
+    crate::run_blocking(move || {
         let mut entries = Vec::new();
         for entry in std::fs::read_dir(&directory)? {
             let entry = entry?;

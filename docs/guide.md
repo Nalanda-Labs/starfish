@@ -12,6 +12,7 @@ the code.
 - [Tasks](#tasks)
 - [Time](#time)
 - [Yielding](#yielding)
+- [Blocking work](#blocking-work)
 - [Working across shards](#working-across-shards)
 - [Services with an instance per shard](#services-with-an-instance-per-shard)
 - [Backpressure between shards](#backpressure-between-shards)
@@ -63,8 +64,8 @@ works on its part ([`Sharded`](crate::Sharded)).
   [Yielding](#yielding).
 - Nothing on a shard may block: no `std::thread::sleep`, no blocking file
   or socket calls, no waiting on a `std::sync::Mutex` that another thread
-  holds for long. Blocking work belongs on a thread of its own; the
-  `blocking` example shows how.
+  holds for long. Blocking work belongs on a thread of its own; see
+  [Blocking work](#blocking-work).
 - Work does not move between shards. If one shard has more to do than the
   others, they do not help; spreading the load evenly is the
   application's job.
@@ -250,6 +251,52 @@ that calls `maybe_yield`.
 - Code that cannot await (a long sort, a compression call, a library that
   takes its time) cannot yield either. Cut the work into pieces or move
   it to a thread.
+
+# Blocking work
+
+Nothing on a shard may block. [`run_blocking`](crate::run_blocking) runs a
+closure on a thread outside the runtime and gives back its result, while
+the shard carries on with its other tasks. It is for system calls and
+libraries that have no asynchronous form, and for long computations that
+cannot be cut into pieces.
+
+```rust,no_run
+use std::net::{SocketAddr, ToSocketAddrs};
+
+async fn resolve(name: String) -> starfish::Result<Vec<SocketAddr>> {
+    // The system's name resolver blocks.
+    let found = starfish::run_blocking(move || {
+        (name.as_str(), 0).to_socket_addrs().map(|found| found.collect())
+    })
+    .await??;
+    Ok(found)
+}
+```
+
+**Caveats**
+
+- Each call costs a hand-over to another thread and back: microseconds,
+  where a call on the shard costs nanoseconds. Not for anything on a hot
+  path.
+- The work cannot be interrupted. Dropping the future, by `timeout` or
+  `abort`, stops the wait; the work runs to the end and its result is
+  discarded.
+- The threads are shared by the whole process and there are at most 256.
+  When all are busy, further work waits. Work that blocks indefinitely,
+  such as waiting on a lock or a socket that may never answer, can use
+  them all up and starve everything else that needs one, `read_dir`
+  included.
+- The closure and its result cross threads and must be `Send`. The work
+  cannot use anything that belongs to a shard: no `Rc`, and none of the
+  runtime's own calls, which fail there with
+  [`Error::NoRuntime`](crate::Error::NoRuntime).
+- These threads use the system allocator, not the per-shard heaps, and
+  are not pinned. Heavy computation on them competes with the shards for
+  CPU.
+- A panic in the work is caught and returned as
+  [`Error::Panicked`](crate::Error::Panicked).
+- A thread that has been idle for ten seconds exits, so a burst of
+  blocking work does not leave threads behind for good.
 
 # Working across shards
 
@@ -628,7 +675,9 @@ another shard inside a [`submit_to`](crate::submit_to) closure.
   [`timeout`](crate::timeout), and after a timeout the connection should
   be closed (see [Cancellation](#cancellation)).
 - Dropping `accept` just as a connection arrives closes that connection.
-- Addresses are `SocketAddr`s. There is no name resolution.
+- Addresses are `SocketAddr`s. There is no asynchronous name resolution;
+  the system's resolver can be called through
+  [`run_blocking`](crate::run_blocking).
 - Writing to a connection the peer has closed returns an error
   (`EPIPE`); the process does not get `SIGPIPE`.
 - `shutdown` and dropping a socket are immediate system calls, not
@@ -879,8 +928,8 @@ async fn replace(dir: &str, name: &str, contents: Vec<u8>) -> std::io::Result<()
 **Caveats**
 
 - `read_dir` is the one call that is not done through io_uring, because
-  the kernel offers no way. It starts a helper thread for each call and
-  returns the whole listing at once. That is fine for finding one's files
+  the kernel offers no way. It runs as [blocking work](#blocking-work) on
+  a thread outside the runtime and returns the whole listing at once. That is fine for finding one's files
   at start-up, and wrong for a hot path or for directories with millions
   of entries.
 - The order of a listing is whatever the filesystem returns. Sort it if
@@ -1372,8 +1421,6 @@ has let go of it.
   or permissions calls.
 - A [`shared_channel`](crate::sync::shared_channel) has one sender and one
   receiver. There is no cross-shard channel with several senders.
-- No general way to run blocking code; the `blocking` example shows how
-  to do it with a thread.
 - No work stealing or load balancing between shards.
 - No interval timer and no `select` over several futures.
 - Only Linux on x86-64.
