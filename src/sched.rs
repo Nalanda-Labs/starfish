@@ -381,17 +381,28 @@ impl SchedulingGroup {
         Ok(())
     }
 
-    /// The group's CPU weight.
+    /// The group's CPU weight, as last set with
+    /// [`set_cpu_shares`](Self::set_cpu_shares) or at creation.
+    ///
+    /// Fails with [`Error::InvalidGroup`] if the group does not belong to the
+    /// running runtime, [`Error::NoRuntime`] outside one.
     pub fn cpu_shares(&self) -> Result<u32> {
         Ok(self.info()?.cpu_shares.load(Ordering::Relaxed))
     }
 
-    /// The group's disk weight.
+    /// The group's disk weight, as last set with
+    /// [`set_io_shares`](Self::set_io_shares) or at creation.
+    ///
+    /// Fails with [`Error::InvalidGroup`] if the group does not belong to the
+    /// running runtime, [`Error::NoRuntime`] outside one.
     pub fn io_shares(&self) -> Result<u32> {
         Ok(self.info()?.io_shares.load(Ordering::Relaxed))
     }
 
-    /// The name the group was created with.
+    /// The name the group was created with, as it appears in statistics.
+    ///
+    /// Fails with [`Error::InvalidGroup`] if the group does not belong to the
+    /// running runtime, [`Error::NoRuntime`] outside one.
     pub fn name(&self) -> Result<String> {
         Ok(self.info()?.name.clone())
     }

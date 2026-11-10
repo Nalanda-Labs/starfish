@@ -608,7 +608,10 @@ impl OpenOptions {
         }
     }
 
-    /// Open for reading. Without this, reads on the file fail.
+    /// Open for reading. Without this, reads on the file fail with
+    /// `EBADF`. Off by default: an `OpenOptions` opens nothing until at least
+    /// one of `read`, [`write`](Self::write) and [`append`](Self::append) is
+    /// set.
     pub fn read(mut self, read: bool) -> OpenOptions {
         self.read = read;
         self
@@ -1338,6 +1341,12 @@ impl DmaFile {
     }
 
     /// The file's length in bytes, asked of the kernel on every call.
+    ///
+    /// Nothing is cached, so the answer reflects writes and truncations made
+    /// through any handle, by this process or another, up to the moment of the
+    /// call. It is the length, not the space allocated: a file grown with
+    /// [`allocate`](Self::allocate) reports the grown length, and a sparse file
+    /// its full extent.
     pub async fn size(&self) -> io::Result<u64> {
         Ok(stat_fd(&self.fd).await?.size)
     }
@@ -1358,6 +1367,11 @@ impl DmaFile {
     }
 
     /// Closes the file and reports the outcome; see [`File::close`].
+    ///
+    /// Dropping a `DmaFile` also closes it, but without telling whether that
+    /// worked. Since direct writes do not pass through the page cache, a close
+    /// rarely has anything left to report; it is [`sync_data`](Self::sync_data)
+    /// that makes written data durable, and closing does not replace it.
     pub async fn close(self) -> io::Result<()> {
         close_fd(self.fd).await
     }

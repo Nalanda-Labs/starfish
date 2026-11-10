@@ -842,7 +842,10 @@ impl UnixStream {
         stream_read(self.fd.as_raw_fd(), buf).await
     }
 
-    /// Writes some prefix of `buf` and returns how many bytes were sent.
+    /// Writes some prefix of `buf` and returns how many bytes were sent,
+    /// which may be fewer than the buffer holds when the socket's send buffer is
+    /// nearly full. The buffer is handed back with the result either way. Use
+    /// [`write_all`](Self::write_all) to send everything.
     pub async fn write<B: IoBuf>(&self, buf: B) -> (io::Result<usize>, B) {
         stream_send_from(self.fd.as_raw_fd(), buf, 0).await
     }
@@ -853,7 +856,10 @@ impl UnixStream {
         stream_write_all(self.fd.as_raw_fd(), buf).await
     }
 
-    /// Shuts down the read half, the write half or both.
+    /// Shuts down the read half, the write half or both, without closing
+    /// the socket. Shutting down the write half is how one end says it has no
+    /// more to send while still reading the reply: the peer's next read returns
+    /// 0 once it has consumed what was sent.
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         SockRef::from(&self.fd).shutdown(how)
     }
