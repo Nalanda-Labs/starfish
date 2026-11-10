@@ -908,7 +908,13 @@ fn statistics_describe_the_shard() {
                 }
             });
             spinner.await.unwrap();
-            submit_to(1, || async {}).await.unwrap();
+            // A call there and one back. The call back is what this shard
+            // is certain to receive as a message: the reply to a call need
+            // not be one, since on a busy machine it can be ready before
+            // the caller has started to wait.
+            submit_to(1, || async { submit_to(0, || async {}).await.unwrap() })
+                .await
+                .unwrap();
             sleep(Duration::from_millis(20)).await;
             let file = File::create(&path_in).await.unwrap();
             let (result, _) = file.write_all_at(vec![1u8; 10_000], 0).await;
