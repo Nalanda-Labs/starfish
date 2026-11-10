@@ -25,11 +25,17 @@ use crate::reactor::{HeldOp, Op};
 
 pub use crate::io::{BufReader, BufWriter};
 
+/// Turns the kernel's form of a socket address into an IP address and
+/// port. Fails with `InvalidData` for an address of another family, which a
+/// TCP or UDP socket never has.
 fn to_socket_addr(addr: SockAddr) -> io::Result<SocketAddr> {
     addr.as_socket()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "not an IP socket address"))
 }
 
+/// A length as the 32-bit number one io_uring operation takes, clamped to
+/// the largest it can express. A longer buffer is transferred in part, like
+/// any other short read or write.
 fn clamp_len(len: usize) -> u32 {
     u32::try_from(len).unwrap_or(u32::MAX)
 }
@@ -56,13 +62,20 @@ unsafe fn datagram_received<B: IoBufMut>(buf: &mut B, received: usize) -> io::Re
     Ok(received)
 }
 
+/// The error for a read into a buffer with no capacity.
 fn no_room() -> io::Error {
     // A read of nothing would return `Ok(0)`, which means "the peer has
     // closed" to every caller.
     io::Error::new(io::ErrorKind::InvalidInput, "read buffer has no room")
 }
 
-/// Reads from a stream socket into `buf` from its start.
+/// Reads from a stream socket into `buf` from its start, replacing its
+/// contents, and sets its length to what arrived.
+///
+/// Shared by TCP and Unix-domain streams. A registered buffer is read with
+/// the fixed-buffer operation, any other with an ordinary receive. The future
+/// takes the descriptor by number and the buffer by value, so it borrows
+/// nothing: it can be kept and resumed, which the buffered reader relies on.
 async fn stream_read<B: IoBufMut>(fd: RawFd, mut buf: B) -> (io::Result<usize>, B) {
     if buf.capacity() == 0 {
         return (Err(no_room()), buf);
@@ -89,7 +102,11 @@ async fn stream_read<B: IoBufMut>(fd: RawFd, mut buf: B) -> (io::Result<usize>, 
     }
 }
 
-/// Sends some of `buf`, from `offset` on, to a stream socket.
+/// Sends some of `buf`, from `offset` on, to a stream socket, and returns
+/// how many bytes the kernel took.
+///
+/// The send is made with `MSG_NOSIGNAL`, so writing to a connection the peer
+/// has closed is an error (`EPIPE`) and not a signal to the process.
 async fn stream_send_from<B: IoBuf>(fd: RawFd, buf: B, offset: usize) -> (io::Result<usize>, B) {
     let offset = offset.min(buf.len());
     let len = clamp_len(buf.len().saturating_sub(offset));
@@ -102,7 +119,11 @@ async fn stream_send_from<B: IoBuf>(fd: RawFd, buf: B, offset: usize) -> (io::Re
     (result.map(|n| n as usize), buf)
 }
 
-/// Sends all of `buf` to a stream socket.
+/// Sends all of `buf` to a stream socket, repeating the send from where
+/// the last one stopped until nothing is left.
+///
+/// A send that takes nothing is reported as `WriteZero` rather than retried
+/// forever.
 async fn stream_write_all<B: IoBuf>(fd: RawFd, mut buf: B) -> (io::Result<()>, B) {
     let mut written = 0usize;
     while written < buf.len() {
@@ -117,7 +138,11 @@ async fn stream_write_all<B: IoBuf>(fd: RawFd, mut buf: B) -> (io::Result<()>, B
     (Ok(()), buf)
 }
 
-/// Waits for the next connection on a listening socket.
+/// Waits for the next connection on a listening socket and returns its
+/// descriptor, already marked close-on-exec.
+///
+/// If the future is dropped as a connection arrives, the reactor closes that
+/// connection, so no descriptor leaks.
 async fn accept_fd(listener: RawFd) -> io::Result<OwnedFd> {
     let sqe = opcode::Accept::new(types::Fd(listener), std::ptr::null_mut(), std::ptr::null_mut())
         .flags(libc::SOCK_CLOEXEC)
@@ -130,6 +155,9 @@ async fn accept_fd(listener: RawFd) -> io::Result<OwnedFd> {
 }
 
 /// Connects a socket to `addr`.
+///
+/// The address is boxed and owned by the operation, because the kernel reads
+/// it after this function's frame may have moved.
 async fn connect_fd(fd: &OwnedFd, addr: SockAddr) -> io::Result<()> {
     // Boxed so the address the kernel reads does not move with the future.
     let addr = Box::new(addr);
@@ -141,6 +169,10 @@ async fn connect_fd(fd: &OwnedFd, addr: SockAddr) -> io::Result<()> {
 
 /// Makes the buffered reader and writer work on a kind of stream, held by
 /// value, by reference or in an `Rc`.
+///
+/// One implementation per way of holding the stream, since a single generic
+/// one over "anything that can be borrowed as this stream" could not exist
+/// for two stream types at once.
 macro_rules! buffered_stream {
     ($stream:ty) => {
         buffered_stream!(@impl $stream, $stream);
@@ -223,6 +255,7 @@ pub struct BindOptions {
 }
 
 impl Default for BindOptions {
+    /// The defaults, as [`BindOptions::new`].
     fn default() -> Self {
         BindOptions::new()
     }
@@ -262,25 +295,51 @@ impl BindOptions {
         self
     }
 
+    /// The backlog as the signed number `listen(2)` takes, clamped to the
+    /// largest it can express.
     fn backlog_for_listen(&self) -> i32 {
         i32::try_from(self.backlog).unwrap_or(i32::MAX)
     }
 }
 
-/// A listening TCP socket.
+/// A listening TCP socket: the thing connections arrive on.
+///
+/// It is bound to an address when it is made and listens from then on. Each
+/// call to [`accept`](Self::accept) takes one connection. In a server with a
+/// listener per shard, each shard runs its own accept loop on its own
+/// listener, all bound to the same address, and the kernel shares the
+/// connections out.
+///
+/// Dropping it stops listening; connections not yet accepted are refused.
 pub struct TcpListener {
     fd: OwnedFd,
 }
 
 impl TcpListener {
-    /// Binds with `SO_REUSEPORT`, so every shard can bind its own listener to
-    /// the same address and the kernel spreads connections across them.
+    /// Binds to `addr` and starts listening, with the port shared
+    /// (`SO_REUSEPORT`) so that every shard can bind its own listener to the same
+    /// address, and with room for 1024 connections waiting to be accepted.
+    ///
+    /// Port 0 asks the kernel for any free port;
+    /// [`local_addr`](Self::local_addr) then tells which.
+    ///
+    /// # Errors
+    ///
+    /// The kernel's error, for instance `AddrInUse` if the port is held by a
+    /// socket that does not share it, or `PermissionDenied` for a port below
+    /// 1024 without the privilege.
     pub fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
         TcpListener::bind_with(addr, &BindOptions::new())
     }
 
-    /// Binds with the given options: whether the port may be shared, and
-    /// how many connections may wait to be accepted.
+    /// Binds to `addr` and starts listening, with the given options: whether
+    /// the port may be shared, and how many connections may wait to be accepted.
+    /// See [`BindOptions`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`bind`](Self::bind). With sharing turned off, `AddrInUse` if any
+    /// other socket is bound to the port.
     pub fn bind_with(addr: SocketAddr, options: &BindOptions) -> io::Result<TcpListener> {
         let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
         socket.set_reuse_address(true)?;
@@ -293,7 +352,8 @@ impl TcpListener {
     }
 
     /// The address the listener is bound to. After binding to port 0, this
-    /// tells which port the kernel chose.
+    /// tells which port the kernel chose, which is how a test or a program that
+    /// does not care about the number finds its own port.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         to_socket_addr(SockRef::from(&self.fd).local_addr()?)
     }
@@ -310,12 +370,30 @@ impl TcpListener {
 }
 
 /// A connected TCP socket.
+///
+/// Reading and writing take `&self`, so one task can read while another
+/// writes on the same stream, shared through an `Rc`. Each call is one
+/// io_uring operation on the shard it is made on; the stream itself is not
+/// tied to a shard and can be moved to another, for instance in a
+/// [`submit_to`](crate::submit_to) closure.
+///
+/// Dropping it closes the connection.
 pub struct TcpStream {
     fd: OwnedFd,
 }
 
 impl TcpStream {
-    /// Opens a connection to `addr`.
+    /// Opens a connection to `addr`, and completes when the connection is
+    /// established or has failed.
+    ///
+    /// There is no time limit other than the kernel's own, which is long; wrap
+    /// the call in [`timeout`](crate::timeout) for a shorter one. To connect by
+    /// name, resolve it first with [`lookup_host`].
+    ///
+    /// # Errors
+    ///
+    /// The kernel's error: `ConnectionRefused` if nothing listens there, or a
+    /// timeout or unreachable-network error if the host does not answer.
     pub async fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
         let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
         let fd: OwnedFd = socket.into();
@@ -336,12 +414,24 @@ impl TcpStream {
         stream_read(self.fd.as_raw_fd(), buf).await
     }
 
-    /// Writes some prefix of `buf` and returns how many bytes were sent.
+    /// Writes some prefix of `buf` and returns how many bytes were sent, which
+    /// may be fewer than the buffer holds when the socket's send buffer is nearly
+    /// full. The buffer comes back unchanged.
+    ///
+    /// Most callers want [`write_all`](Self::write_all).
     pub async fn write<B: IoBuf>(&self, buf: B) -> (io::Result<usize>, B) {
         stream_send_from(self.fd.as_raw_fd(), buf, 0).await
     }
 
-    /// Writes all of `buf`.
+    /// Writes all of `buf`, in as many sends as it takes, and returns the
+    /// buffer.
+    ///
+    /// The sends are separate operations. If two tasks call this on one stream
+    /// at the same time, their data may interleave; give each stream one writer.
+    ///
+    /// # Errors
+    ///
+    /// The first send's error. How much was sent before it is not reported.
     pub async fn write_all<B: IoBuf>(&self, buf: B) -> (io::Result<()>, B) {
         stream_write_all(self.fd.as_raw_fd(), buf).await
     }
@@ -423,7 +513,12 @@ impl TcpStream {
         SockRef::from(&self.fd).set_nodelay(nodelay)
     }
 
-    /// Shuts down the read half, the write half or both.
+    /// Shuts down the read half, the write half or both, without closing the
+    /// socket.
+    ///
+    /// Shutting down the write half sends the peer an end-of-stream, after
+    /// everything already written, while leaving this end able to read the
+    /// peer's reply: the way to say "that was my whole request".
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         SockRef::from(&self.fd).shutdown(how)
     }
@@ -440,10 +535,15 @@ struct Datagram {
 
 /// Owns a [`Datagram`] through a raw pointer, so that the pointers inside
 /// it stay valid however this handle is moved.
+///
+/// A `Box` would do the same for the allocation, but moving a `Box` asserts
+/// unique access to its contents, which the pointers the structure holds into
+/// itself would contradict.
 struct DatagramBox(std::ptr::NonNull<Datagram>);
 
 impl DatagramBox {
-    /// Describes `len` bytes at `data`, with room for a peer address.
+    /// Describes `len` bytes at `data`, with room for a peer address, and
+    /// wires the header's pointers to the structure's own fields.
     fn new(data: *mut u8, len: usize) -> DatagramBox {
         // SAFETY: all three are plain C structures for which all-zero is a
         // valid value.
@@ -463,12 +563,13 @@ impl DatagramBox {
         DatagramBox(raw)
     }
 
+    /// The message header, in the form the kernel takes.
     fn header(&self) -> *mut libc::msghdr {
         // SAFETY: the allocation is live for as long as `self`.
         unsafe { std::ptr::addr_of_mut!((*self.0.as_ptr()).header) }
     }
 
-    /// Sets the destination.
+    /// Sets the destination, for a send.
     fn set_address(&mut self, addr: &SockAddr) {
         let len = (addr.len() as usize).min(std::mem::size_of::<libc::sockaddr_storage>());
         // SAFETY: copies at most the size of the destination from an
@@ -484,7 +585,7 @@ impl DatagramBox {
         }
     }
 
-    /// The peer address the kernel filled in.
+    /// The peer address the kernel filled in, after a receive.
     fn address(&self) -> io::Result<SocketAddr> {
         // SAFETY: the kernel wrote `msg_namelen` bytes of address into the
         // storage, which is large enough for any address family.
@@ -497,6 +598,7 @@ impl DatagramBox {
 }
 
 impl Drop for DatagramBox {
+    /// Frees the datagram description.
     fn drop(&mut self) {
         // SAFETY: made by `Box::into_non_null` in `new`, freed once.
         drop(unsafe { Box::from_raw(self.0.as_ptr()) });
@@ -513,13 +615,20 @@ pub struct UdpSocket {
 }
 
 impl UdpSocket {
-    /// Binds with `SO_REUSEPORT`.
+    /// Binds to `addr` with the port shared (`SO_REUSEPORT`), so that every
+    /// shard can bind its own socket to the same address and the kernel spreads
+    /// incoming datagrams across them by sender.
+    ///
+    /// # Errors
+    ///
+    /// The kernel's error, for instance `AddrInUse`.
     pub fn bind(addr: SocketAddr) -> io::Result<UdpSocket> {
         UdpSocket::bind_with(addr, &BindOptions::new())
     }
 
-    /// Binds with the given options. Only
-    /// [`reuse_port`](BindOptions::reuse_port) matters for UDP.
+    /// Binds to `addr` with the given options. Only
+    /// [`reuse_port`](BindOptions::reuse_port) matters for UDP: turned off, the
+    /// socket has the port to itself and a second bind fails.
     pub fn bind_with(addr: SocketAddr, options: &BindOptions) -> io::Result<UdpSocket> {
         let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
         // For UDP this option alone lets two sockets share a port, so it
@@ -540,17 +649,26 @@ impl UdpSocket {
 
     /// Sets the peer for [`send`](Self::send) and [`recv`](Self::recv);
     /// datagrams from anyone else are then discarded by the kernel.
+    ///
+    /// Nothing is sent: UDP has no connections, and this only records the
+    /// address. It can be called again to change the peer.
     pub fn connect(&self, addr: SocketAddr) -> io::Result<()> {
         SockRef::from(&self.fd).connect(&addr.into())
     }
 
-    /// Allows or forbids sending to a broadcast address (`SO_BROADCAST`).
+    /// Allows or forbids sending to a broadcast address (`SO_BROADCAST`). The
+    /// kernel refuses such sends unless this is on.
     pub fn set_broadcast(&self, broadcast: bool) -> io::Result<()> {
         SockRef::from(&self.fd).set_broadcast(broadcast)
     }
 
-    /// Sends the contents of `buf` as one datagram to `addr`. Returns how
-    /// many bytes were sent, which for UDP is all of them or an error.
+    /// Sends the contents of `buf` as one datagram to `addr`. Returns how many
+    /// bytes were sent, which for UDP is all of them or an error, and the buffer.
+    ///
+    /// # Errors
+    ///
+    /// The kernel's error, for instance `EMSGSIZE` for a datagram larger than
+    /// the network allows. Success says nothing about delivery.
     pub async fn send_to<B: IoBuf>(&self, buf: B, addr: SocketAddr) -> (io::Result<usize>, B) {
         let mut datagram = DatagramBox::new(buf.as_ptr().cast_mut(), buf.len());
         datagram.set_address(&SockAddr::from(addr));
@@ -594,6 +712,12 @@ impl UdpSocket {
     }
 
     /// Sends the contents of `buf` as one datagram to the connected peer.
+    ///
+    /// # Errors
+    ///
+    /// The kernel's error, including `NotConnected` if
+    /// [`connect`](Self::connect) has not been called. A previous datagram that
+    /// the peer refused may be reported here.
     pub async fn send<B: IoBuf>(&self, buf: B) -> (io::Result<usize>, B) {
         let len = clamp_len(buf.len());
         let sqe = opcode::Send::new(types::Fd(self.fd.as_raw_fd()), buf.as_ptr(), len)
@@ -662,6 +786,9 @@ impl UnixListener {
     }
 
     /// Another handle to the same listening socket, for another shard.
+    ///
+    /// Both handles accept from one queue of connections; each connection goes
+    /// to one of them. This is how several shards serve one Unix-domain socket.
     pub fn try_clone(&self) -> io::Result<UnixListener> {
         Ok(UnixListener {
             fd: self.fd.try_clone()?,
@@ -688,6 +815,12 @@ pub struct UnixStream {
 
 impl UnixStream {
     /// Connects to the socket at `path`.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` if nothing is at the path, `ConnectionRefused` if a socket
+    /// file is there but nobody listens on it, `PermissionDenied` if the file's
+    /// permissions do not allow it.
     pub async fn connect(path: impl AsRef<std::path::Path>) -> io::Result<UnixStream> {
         let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
         socket.set_cloexec(true)?;
@@ -714,7 +847,8 @@ impl UnixStream {
         stream_send_from(self.fd.as_raw_fd(), buf, 0).await
     }
 
-    /// Writes all of `buf`.
+    /// Writes all of `buf`, in as many sends as it takes. As with TCP, give
+    /// each stream one writer.
     pub async fn write_all<B: IoBuf>(&self, buf: B) -> (io::Result<()>, B) {
         stream_write_all(self.fd.as_raw_fd(), buf).await
     }
@@ -752,7 +886,10 @@ impl UnixStream {
     }
 }
 
-/// Who is on the other end of a [`UnixStream`].
+/// Who is on the other end of a [`UnixStream`]: the process, user and
+/// group that connected, as the kernel recorded them at that moment.
+///
+/// The structure may gain fields in later versions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PeerCredentials {

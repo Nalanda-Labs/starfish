@@ -13,21 +13,36 @@ use crate::runtime::current;
 use crate::stats::GroupStats;
 use crate::task::{spawn_in, yield_now, JoinHandle, Task};
 
+/// The index of the group that exists from the start: the one `main` and
+/// everything it spawns run in.
 pub(crate) const DEFAULT_GROUP: usize = 0;
+/// The shares of the default group, and the scale against which other
+/// groups' shares are judged: a group with 500 gets half as much as it.
 const DEFAULT_SHARES: u32 = 1000;
+/// The most shares a group may have. With the least being 1, the ratio
+/// between two groups is at most ten thousand to one.
 const MAX_SHARES: u32 = 10_000;
 
+/// Shares brought into the permitted range.
 fn clamp_shares(shares: u32) -> u32 {
     shares.clamp(1, MAX_SHARES)
 }
 
+/// What the runtime knows about one scheduling group: its name and its
+/// two weights.
+///
+/// The weights are atomic because they can be changed at any time from any
+/// shard and are read by every shard on every scheduling decision.
 pub(crate) struct GroupInfo {
     name: String,
     cpu_shares: AtomicU32,
     io_shares: AtomicU32,
 }
 
-/// The runtime-wide list of groups. Groups are only ever added.
+/// The runtime-wide list of groups, shared by all shards.
+///
+/// Groups are only ever added, so an index, once handed out, stays valid and
+/// always means the same group.
 pub(crate) struct GroupTable {
     groups: Mutex<Vec<Arc<GroupInfo>>>,
     /// Mirrors `groups.len()` so that existence checks need no lock.
@@ -35,6 +50,7 @@ pub(crate) struct GroupTable {
 }
 
 impl GroupTable {
+    /// A table holding only the default group.
     pub(crate) fn new() -> GroupTable {
         let main = Arc::new(GroupInfo {
             name: String::from("main"),
@@ -47,10 +63,13 @@ impl GroupTable {
         }
     }
 
+    /// Whether `group` is the index of a group that exists. A single atomic
+    /// read, with no lock.
     pub(crate) fn exists(&self, group: usize) -> bool {
         group < self.count.load(Ordering::Acquire)
     }
 
+    /// Adds a group and returns its index.
     fn create(&self, name: &str, cpu_shares: u32, io_shares: u32) -> usize {
         let mut groups = self.groups.lock().unwrap_or_else(PoisonError::into_inner);
         let id = groups.len();
@@ -63,17 +82,21 @@ impl GroupTable {
         id
     }
 
+    /// Adds a group with the same shares of both kinds; for the unit tests of
+    /// other modules.
     #[cfg(test)]
     pub(crate) fn create_for_test(&self, name: &str, shares: u32) -> usize {
         self.create(name, shares, shares)
     }
 
+    /// One group's record, or `None` for an index that is not a group's.
     fn get(&self, group: usize) -> Option<Arc<GroupInfo>> {
         let groups = self.groups.lock().unwrap_or_else(PoisonError::into_inner);
         groups.get(group).cloned()
     }
 
-    /// Appends the groups from index `from` on to `out`.
+    /// Appends the groups from index `from` on to `out`: how a shard's cache
+    /// catches up with groups made since it last looked.
     fn copy_from(&self, from: usize, out: &mut Vec<Arc<GroupInfo>>) {
         let groups = self.groups.lock().unwrap_or_else(PoisonError::into_inner);
         out.extend(groups.iter().skip(from).cloned());
@@ -89,6 +112,7 @@ pub(crate) struct GroupCache {
 }
 
 impl GroupCache {
+    /// An empty cache over `table`. It fills on first use.
     pub(crate) fn new(table: Arc<GroupTable>) -> GroupCache {
         GroupCache {
             table,
@@ -96,6 +120,8 @@ impl GroupCache {
         }
     }
 
+    /// One group's record, from the cache, after catching up with the shared
+    /// table if the group is newer than the cache.
     fn get(&mut self, group: usize) -> Option<&GroupInfo> {
         if group >= self.local.len() && self.table.exists(group) {
             self.table.copy_from(self.local.len(), &mut self.local);
@@ -103,15 +129,20 @@ impl GroupCache {
         self.local.get(group).map(|info| &**info)
     }
 
+    /// Whether `group` exists.
     pub(crate) fn exists(&mut self, group: usize) -> bool {
         self.get(group).is_some()
     }
 
+    /// A group's CPU weight, or the default weight for a group that does not
+    /// exist.
     fn cpu_shares(&mut self, group: usize) -> u32 {
         self.get(group)
             .map_or(DEFAULT_SHARES, |info| info.cpu_shares.load(Ordering::Relaxed))
     }
 
+    /// A group's disk weight, or the default weight for a group that does not
+    /// exist.
     pub(crate) fn io_shares(&mut self, group: usize) -> u32 {
         self.get(group)
             .map_or(DEFAULT_SHARES, |info| info.io_shares.load(Ordering::Relaxed))
@@ -125,6 +156,12 @@ pub(crate) fn virtual_cost(work: u64, shares: u32) -> u64 {
     work.checked_div(u64::from(shares)).unwrap_or(work).max(1)
 }
 
+/// One group's runnable tasks on one shard, with the group's virtual time
+/// and its running totals.
+///
+/// Virtual time is the CPU time the group has used, divided by its shares.
+/// The group with the least virtual time runs next, which is what gives each
+/// group CPU time in proportion to its shares.
 #[derive(Default)]
 struct GroupQueue {
     tasks: VecDeque<Task>,
@@ -133,7 +170,8 @@ struct GroupQueue {
     polled: u64,
 }
 
-/// The runnable tasks of one shard, one FIFO per group.
+/// The runnable tasks of one shard, one first-in-first-out queue per
+/// group, with the bookkeeping that decides which group runs next.
 pub(crate) struct RunQueues {
     cache: GroupCache,
     groups: Vec<GroupQueue>,
@@ -146,6 +184,7 @@ pub(crate) struct RunQueues {
 }
 
 impl RunQueues {
+    /// Empty run queues over `table`.
     pub(crate) fn new(table: Arc<GroupTable>) -> RunQueues {
         RunQueues {
             cache: GroupCache::new(table),
@@ -155,10 +194,17 @@ impl RunQueues {
         }
     }
 
+    /// Whether no group has a runnable task.
     pub(crate) fn is_empty(&self) -> bool {
         self.active.is_empty()
     }
 
+    /// Makes a task runnable, at the back of its group's queue.
+    ///
+    /// A group that was idle starts from the current virtual time, not from
+    /// where it left off, so that a group cannot save up a claim on the CPU by
+    /// doing nothing. A task whose group does not exist runs in the default
+    /// group.
     pub(crate) fn push(&mut self, task: Task) {
         let index = if self.cache.exists(task.group()) {
             task.group()
@@ -185,6 +231,7 @@ impl RunQueues {
         Some((index, len))
     }
 
+    /// Takes the next task of group `index`, or `None` if it has none.
     pub(crate) fn pop(&mut self, index: usize) -> Option<Task> {
         let group = self.groups.get_mut(index)?;
         let task = group.tasks.pop_front()?;
@@ -210,6 +257,8 @@ impl RunQueues {
         }
     }
 
+    /// Forgets every runnable task. Used at shutdown, when the tasks are about
+    /// to be dropped through the task table.
     pub(crate) fn clear(&mut self) {
         for group in &mut self.groups {
             group.tasks.clear();
@@ -217,10 +266,12 @@ impl RunQueues {
         self.active.clear();
     }
 
+    /// A group's name, or an empty string for an index that is not a group's.
     pub(crate) fn group_name(&mut self, index: usize) -> String {
         self.cache.get(index).map(|info| info.name.clone()).unwrap_or_default()
     }
 
+    /// One [`GroupStats`] per group that has had a task on this shard.
     pub(crate) fn stats(&mut self) -> Vec<GroupStats> {
         let mut stats = Vec::with_capacity(self.groups.len());
         for (index, group) in self.groups.iter().enumerate() {
@@ -261,8 +312,15 @@ impl SchedulingGroup {
     /// shares of each kind.
     pub const DEFAULT: SchedulingGroup = SchedulingGroup { id: DEFAULT_GROUP };
 
-    /// Creates a group with the same number of CPU and I/O shares.
-    /// Shares are clamped to `1..=10_000`.
+    /// Creates a group with the same number of CPU and I/O shares, clamped to
+    /// `1..=10_000`.
+    ///
+    /// The name is a label for statistics and stall reports; it need not be
+    /// unique. The group exists on every shard from now on.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoRuntime`] outside a runtime.
     pub fn create(name: &str, shares: u32) -> Result<SchedulingGroup> {
         SchedulingGroup::create_with(name, shares, shares)
     }
@@ -279,18 +337,30 @@ impl SchedulingGroup {
         Ok(SchedulingGroup { id })
     }
 
-    /// The group of the task that is running now.
+    /// The group of the task that is running now. This is the group a task
+    /// spawned here would inherit.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoRuntime`] outside a runtime.
     pub fn current() -> Result<SchedulingGroup> {
         Ok(SchedulingGroup {
             id: current()?.current_group.get(),
         })
     }
 
+    /// The group's record in the running runtime's table.
     fn info(&self) -> Result<Arc<GroupInfo>> {
         current()?.runtime.groups.get(self.id).ok_or(Error::InvalidGroup)
     }
 
-    /// Changes the group's CPU weight on every shard.
+    /// Changes the group's CPU weight on every shard, clamped to
+    /// `1..=10_000`. It takes effect at each shard's next scheduling decision.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidGroup`] if the group does not belong to the running
+    /// runtime, [`Error::NoRuntime`] outside one.
     pub fn set_cpu_shares(&self, shares: u32) -> Result<()> {
         self.info()?
             .cpu_shares
@@ -298,7 +368,12 @@ impl SchedulingGroup {
         Ok(())
     }
 
-    /// Changes the group's disk weight on every shard.
+    /// Changes the group's disk weight on every shard, clamped to
+    /// `1..=10_000`. It applies to requests not yet handed to the kernel.
+    ///
+    /// # Errors
+    ///
+    /// As for [`set_cpu_shares`](Self::set_cpu_shares).
     pub fn set_io_shares(&self, shares: u32) -> Result<()> {
         self.info()?
             .io_shares
@@ -345,6 +420,21 @@ pub fn need_preempt() -> bool {
 
 /// Yields to the scheduler if the time slice is used up; otherwise returns
 /// immediately.
+///
+/// This is what a long loop should call on every pass. It costs two memory
+/// reads when the slice still has time, and a trip round the run queue, as
+/// [`yield_now`](crate::yield_now) makes, when it has not.
+///
+/// ```no_run
+/// # async fn example(items: &[u64]) -> u64 {
+/// let mut total = 0u64;
+/// for item in items {
+///     total = total.wrapping_add(item.wrapping_mul(31));
+///     starfish::maybe_yield().await;
+/// }
+/// total
+/// # }
+/// ```
 pub async fn maybe_yield() {
     if need_preempt() {
         yield_now().await;

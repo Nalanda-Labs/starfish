@@ -37,21 +37,32 @@ use crate::reactor::Op;
 /// satisfies devices with 512-byte and 4096-byte logical blocks.
 pub const DMA_ALIGNMENT: usize = 4096;
 
+/// The `statx` mask bit that asks for a file's direct-I/O alignment
+/// requirements. Kernels from 6.1 answer it; older ones leave it unset in
+/// the reply.
 const STATX_DIOALIGN: u32 = 0x2000;
+/// An empty path, for `statx` on an open descriptor.
 static EMPTY_PATH: &CStr = c"";
 
+/// A length as the 32-bit number one io_uring operation takes, clamped to
+/// the largest it can express.
 fn clamp_len(len: usize) -> u32 {
     u32::try_from(len).unwrap_or(u32::MAX)
 }
 
+/// An `InvalidInput` error with the given message: the caller asked for
+/// something that cannot be done, and the kernel was not troubled with it.
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
+/// Whether `value` is a whole multiple of `of`. False if `of` is zero.
 fn is_multiple(value: u64, of: usize) -> bool {
     value.checked_rem(of as u64) == Some(0)
 }
 
+/// A path as the NUL-terminated string the kernel takes. Fails for a path
+/// with a NUL byte inside, which no file can have.
 fn c_path(path: &Path) -> io::Result<CString> {
     CString::new(path.as_os_str().as_bytes()).map_err(|_| invalid("path contains a NUL byte"))
 }
@@ -65,18 +76,24 @@ fn c_path(path: &Path) -> io::Result<CString> {
 struct FileFd(RawFd);
 
 impl AsRawFd for FileFd {
+    /// The descriptor's number.
     fn as_raw_fd(&self) -> RawFd {
         self.0
     }
 }
 
 impl Drop for FileFd {
+    /// Closes the descriptor through the shard's ring, without waiting.
     fn drop(&mut self) {
         crate::reactor::close_fd(self.0);
     }
 }
 
 /// Closes a file and reports what the kernel said about it.
+///
+/// The descriptor is taken out of its owner first, so that it is closed
+/// exactly once, by the operation here. If the operation never reaches the
+/// kernel, the descriptor is closed directly instead.
 async fn close_fd(fd: FileFd) -> io::Result<()> {
     let raw = fd.0;
     // From here on the descriptor is closed by the operation below.
@@ -101,6 +118,9 @@ async fn close_fd(fd: FileFd) -> io::Result<()> {
     }
 }
 
+/// Opens `path` with the given flags and mode, close-on-exec, and returns
+/// its descriptor. If the future is dropped as the open completes, the
+/// reactor closes the descriptor.
 async fn open_fd(path: &Path, flags: i32, mode: u32) -> io::Result<FileFd> {
     let path = c_path(path)?;
     let sqe = opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), path.as_ptr())
@@ -113,7 +133,8 @@ async fn open_fd(path: &Path, flags: i32, mode: u32) -> io::Result<FileFd> {
     Ok(FileFd(fd))
 }
 
-/// What the kernel says about an open file.
+/// What the kernel says about an open file: which device it is on, how
+/// direct I/O on it must be aligned, and how long it is.
 struct FileInfo {
     /// Device number of the filesystem the file is on.
     device: u64,
@@ -125,6 +146,11 @@ struct FileInfo {
     size: u64,
 }
 
+/// Asks the kernel about an open file.
+///
+/// Where the filesystem does not report its direct-I/O requirements, which
+/// is every filesystem on kernels before 6.1 and some on later ones,
+/// [`DMA_ALIGNMENT`] is assumed for both.
 async fn stat_fd(fd: &FileFd) -> io::Result<FileInfo> {
     // A Vec gives a heap slot whose address survives being moved into the
     // operation; the kernel fills it in.
@@ -164,6 +190,9 @@ async fn stat_fd(fd: &FileFd) -> io::Result<FileInfo> {
     })
 }
 
+/// Flushes a file's data and metadata to its device. Goes through the I/O
+/// scheduler as a write of no bytes, so it takes its turn among the device's
+/// other requests.
 async fn fsync(fd: &FileFd, device: u64) -> io::Result<()> {
     let sqe = opcode::Fsync::new(types::Fd(fd.as_raw_fd())).build();
     // SAFETY: the entry carries no pointers.
@@ -171,6 +200,8 @@ async fn fsync(fd: &FileFd, device: u64) -> io::Result<()> {
     result.map(|_| ())
 }
 
+/// Flushes a file's data to its device, with only the metadata needed to
+/// read it back. Scheduled like [`fsync`].
 async fn fdatasync(fd: &FileFd, device: u64) -> io::Result<()> {
     let sqe = opcode::Fsync::new(types::Fd(fd.as_raw_fd()))
         .flags(types::FsyncFlags::DATASYNC)
@@ -180,6 +211,8 @@ async fn fdatasync(fd: &FileFd, device: u64) -> io::Result<()> {
     result.map(|_| ())
 }
 
+/// Sets a file's length, through io_uring where the kernel can and on a
+/// thread outside the runtime where it cannot.
 async fn set_len(fd: &FileFd, len: u64) -> io::Result<()> {
     let raw = fd.as_raw_fd();
     let sqe = opcode::Ftruncate::new(types::Fd(raw), len).build();
@@ -220,6 +253,8 @@ async fn truncate_on_thread(fd: RawFd, len: u64) -> io::Result<()> {
     .await?
 }
 
+/// Reserves disk space for a range of a file, extending the file if the
+/// range ends beyond it.
 async fn allocate(fd: &FileFd, offset: u64, len: u64) -> io::Result<()> {
     let sqe = opcode::Fallocate::new(types::Fd(fd.as_raw_fd()), len).offset(offset).build();
     // SAFETY: the entry carries no pointers.
@@ -271,6 +306,9 @@ async fn read_into<B: IoBufMut>(
 }
 
 /// Writes `len` bytes of `buf`, starting `start` bytes in, at `offset`.
+/// With a device the request goes through the I/O scheduler; without one it
+/// goes straight to the kernel. Returns how many bytes were written and the
+/// buffer.
 async fn write_from<B: IoBuf>(
     fd: &FileFd,
     device: Option<u64>,
@@ -302,6 +340,15 @@ async fn write_from<B: IoBuf>(
 }
 
 /// Deletes a file.
+///
+/// The name goes at once; the file's contents are freed when the last open
+/// descriptor to it is closed. To make the removal survive a crash, sync the
+/// directory ([`sync_dir`]).
+///
+/// # Errors
+///
+/// `NotFound` if there is no such file; the kernel's error if `path` is a
+/// directory or may not be removed.
 pub async fn remove_file(path: impl AsRef<Path>) -> io::Result<()> {
     let path = c_path(path.as_ref())?;
     let sqe = opcode::UnlinkAt::new(types::Fd(libc::AT_FDCWD), path.as_ptr()).build();
@@ -311,6 +358,11 @@ pub async fn remove_file(path: impl AsRef<Path>) -> io::Result<()> {
 }
 
 /// Deletes an empty directory.
+///
+/// # Errors
+///
+/// `DirectoryNotEmpty` if it has anything in it (see [`remove_dir_all`]),
+/// `NotFound` if it does not exist.
 pub async fn remove_dir(path: impl AsRef<Path>) -> io::Result<()> {
     let path = c_path(path.as_ref())?;
     let sqe = opcode::UnlinkAt::new(types::Fd(libc::AT_FDCWD), path.as_ptr())
@@ -358,6 +410,13 @@ pub async fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<
 }
 
 /// Creates a directory. Its parent must exist and it must not.
+///
+/// The directory gets mode `0777` less the process's umask.
+///
+/// # Errors
+///
+/// `AlreadyExists` if something is at the path, `NotFound` if the parent is
+/// missing (see [`create_dir_all`]).
 pub async fn create_dir(path: impl AsRef<Path>) -> io::Result<()> {
     let path = c_path(path.as_ref())?;
     let sqe = opcode::MkDirAt::new(types::Fd(libc::AT_FDCWD), path.as_ptr())
@@ -387,6 +446,14 @@ async fn is_dir(path: &Path) -> io::Result<bool> {
 
 /// Creates a directory and every missing directory above it. Succeeds if
 /// the directory is already there.
+///
+/// The directories are made one at a time from the outermost in. It is not
+/// one step: stopped part-way, the outer ones exist and the inner ones do
+/// not.
+///
+/// # Errors
+///
+/// `AlreadyExists` if some part of the path exists and is not a directory.
 pub async fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
     let path = path.as_ref();
     // Outermost first.
@@ -411,6 +478,10 @@ pub async fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
 }
 
 /// One name in a directory, as returned by [`read_dir`].
+///
+/// It holds the name and, where the filesystem gave it for free, what kind
+/// of thing the name refers to. It is a snapshot: by the time it is used, the
+/// file may have been renamed or removed.
 #[derive(Clone, Debug)]
 pub struct DirEntry {
     directory: PathBuf,
@@ -419,12 +490,13 @@ pub struct DirEntry {
 }
 
 impl DirEntry {
-    /// The entry's name, without the directory.
+    /// The entry's name, without the directory. Not necessarily valid UTF-8.
     pub fn file_name(&self) -> &OsStr {
         &self.name
     }
 
-    /// The path given to [`read_dir`] followed by the entry's name.
+    /// The path given to [`read_dir`] followed by the entry's name: what to
+    /// pass to `File::open` and the like.
     pub fn path(&self) -> PathBuf {
         self.directory.join(&self.name)
     }
@@ -435,12 +507,14 @@ impl DirEntry {
         self.file_type
     }
 
-    /// Whether the entry is a directory (not a link to one).
+    /// Whether the entry is a directory. A symbolic link to a directory is
+    /// not one; neither is an entry whose kind the filesystem did not say.
     pub fn is_dir(&self) -> bool {
         self.file_type.is_some_and(|kind| kind.is_dir())
     }
 
-    /// Whether the entry is a regular file (not a link to one).
+    /// Whether the entry is a regular file. A symbolic link to a file is not
+    /// one; neither is an entry whose kind the filesystem did not say.
     pub fn is_file(&self) -> bool {
         self.file_type.is_some_and(|kind| kind.is_file())
     }
@@ -513,6 +587,7 @@ pub struct OpenOptions {
 }
 
 impl Default for OpenOptions {
+    /// Nothing set, as [`OpenOptions::new`].
     fn default() -> Self {
         OpenOptions::new()
     }
@@ -533,13 +608,14 @@ impl OpenOptions {
         }
     }
 
-    /// Open for reading.
+    /// Open for reading. Without this, reads on the file fail.
     pub fn read(mut self, read: bool) -> OpenOptions {
         self.read = read;
         self
     }
 
-    /// Open for writing.
+    /// Open for writing. Without this or [`append`](Self::append), writes on
+    /// the file fail.
     pub fn write(mut self, write: bool) -> OpenOptions {
         self.write = write;
         self
@@ -553,7 +629,8 @@ impl OpenOptions {
         self
     }
 
-    /// Create the file if it does not exist.
+    /// Create the file if it does not exist; open it as it is if it does.
+    /// Needs the file opened for writing.
     pub fn create(mut self, create: bool) -> OpenOptions {
         self.create = create;
         self
@@ -567,7 +644,8 @@ impl OpenOptions {
         self
     }
 
-    /// Empty the file if it exists.
+    /// Empty the file if it exists, as the first thing done on opening it.
+    /// Needs the file opened for writing.
     pub fn truncate(mut self, truncate: bool) -> OpenOptions {
         self.truncate = truncate;
         self
@@ -580,6 +658,10 @@ impl OpenOptions {
         self
     }
 
+    /// The `open(2)` flags these options stand for.
+    ///
+    /// Rejects the combinations that could only be mistakes: neither reading nor
+    /// writing, and creating or emptying a file that is not opened for writing.
     fn flags(&self) -> io::Result<i32> {
         let writing = self.write || self.append;
         let access = match (self.read, writing) {
@@ -606,7 +688,13 @@ impl OpenOptions {
         Ok(flags)
     }
 
-    /// Opens a file through the page cache.
+    /// Opens a file through the page cache, as these options say.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` for a combination of options that makes no sense, before
+    /// the kernel is asked. Otherwise the kernel's error: `NotFound`,
+    /// `AlreadyExists` with [`create_new`](Self::create_new), `PermissionDenied`.
     pub async fn open(&self, path: impl AsRef<Path>) -> io::Result<File> {
         File::open_with(path, self.flags()?, self.mode).await
     }
@@ -624,20 +712,34 @@ impl OpenOptions {
     }
 }
 
-/// An open file. There is no cursor: every read and write names its offset,
-/// so concurrent operations on one file do not interfere.
+/// An open file, read and written through the kernel's page cache.
+///
+/// There is no cursor: every read and write names its offset, so concurrent
+/// operations on one file do not interfere, and the methods take `&self`.
+/// For reading or writing in order, wrap the file in a [`Cursor`].
+///
+/// Dropping it closes the file without waiting and without reporting
+/// failure; [`close`](Self::close) reports.
 pub struct File {
     fd: FileFd,
     device: u64,
 }
 
 impl File {
-    /// Opens an existing file for reading.
+    /// Opens an existing file for reading only.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` if there is no such file; the kernel's error otherwise.
     pub async fn open(path: impl AsRef<Path>) -> io::Result<File> {
         File::open_with(path, libc::O_RDONLY, 0).await
     }
 
-    /// Opens a file for reading and writing, creating or truncating it.
+    /// Opens a file for reading and writing, creating it if it does not exist
+    /// and emptying it if it does. New files get mode `0644` less the umask.
+    ///
+    /// For any other combination, such as keeping the contents or refusing to
+    /// replace an existing file, use [`OpenOptions`].
     pub async fn create(path: impl AsRef<Path>) -> io::Result<File> {
         File::open_with(path, libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC, 0o644).await
     }
@@ -666,14 +768,23 @@ impl File {
         read_into(&self.fd, Some(self.device), buf, len, offset).await
     }
 
-    /// Writes some prefix of `buf` at `offset` and returns how many bytes
-    /// were written.
+    /// Writes some prefix of `buf` at `offset` and returns how many bytes were
+    /// written, which is normally all of them. Writing past the end extends the
+    /// file; a gap left before `offset` reads back as zeros.
+    ///
+    /// The data is in the page cache when this returns, not yet on the device.
     pub async fn write_at<B: IoBuf>(&self, buf: B, offset: u64) -> (io::Result<usize>, B) {
         let len = clamp_len(buf.len());
         write_from(&self.fd, Some(self.device), buf, 0, len, offset).await
     }
 
-    /// Writes all of `buf` at `offset`.
+    /// Writes all of `buf` at `offset`, repeating the write from where the
+    /// last one stopped until nothing is left.
+    ///
+    /// # Errors
+    ///
+    /// The first failed write's error, or `WriteZero` if a write took nothing,
+    /// which is what a full device looks like.
     pub async fn write_all_at<B: IoBuf>(&self, mut buf: B, offset: u64) -> (io::Result<()>, B) {
         let mut written = 0usize;
         while written < buf.len() {
@@ -691,7 +802,9 @@ impl File {
         (Ok(()), buf)
     }
 
-    /// Flushes file data and metadata to the device.
+    /// Flushes file data and metadata to the device. When this returns, the
+    /// file's contents and its length, times and permissions survive a crash.
+    /// The file's name in its directory is another matter; see [`sync_dir`].
     pub async fn sync_all(&self) -> io::Result<()> {
         fsync(&self.fd, self.device).await
     }
@@ -703,13 +816,17 @@ impl File {
         fdatasync(&self.fd, self.device).await
     }
 
-    /// The file's length in bytes, asked of the kernel on every call.
+    /// The file's length in bytes, asked of the kernel on every call. Another
+    /// process, or another task, may have changed it since the last one.
     pub async fn size(&self) -> io::Result<u64> {
         Ok(stat_fd(&self.fd).await?.size)
     }
 
-    /// Sets the file's length. Shortening discards the rest; lengthening
-    /// adds zeros, without allocating space for them.
+    /// Sets the file's length. Shortening discards the rest; lengthening adds
+    /// zeros, without allocating space for them.
+    ///
+    /// On kernels before 6.9 this runs on a thread outside the runtime, which
+    /// is slower but does not hold the shard up.
     pub async fn set_len(&self, len: u64) -> io::Result<()> {
         set_len(&self.fd, len).await
     }
@@ -765,8 +882,8 @@ impl<F: std::borrow::Borrow<File>> Cursor<F> {
         Cursor { file, position: 0 }
     }
 
-    /// A cursor at `position`. To append, start at the file's
-    /// [`size`](File::size).
+    /// A cursor at `position`, which need not be inside the file. To append,
+    /// start at the file's [`size`](File::size).
     pub fn at(file: F, position: u64) -> Cursor<F> {
         Cursor { file, position }
     }
@@ -781,23 +898,25 @@ impl<F: std::borrow::Borrow<File>> Cursor<F> {
         self.position
     }
 
-    /// Moves the cursor.
+    /// Moves the cursor: the next read or write takes place at `position`.
+    /// Under a buffered reader or writer, flush or discard its buffer first.
     pub fn set_position(&mut self, position: u64) {
         self.position = position;
     }
 
-    /// The file.
+    /// The file the cursor reads and writes.
     pub fn get_ref(&self) -> &File {
         self.file.borrow()
     }
 
-    /// Gives the file back.
+    /// Gives the file back, ending the cursor.
     pub fn into_inner(self) -> F {
         self.file
     }
 }
 
 impl<F: std::borrow::Borrow<File>> crate::io::Read for Cursor<F> {
+    /// Reads at the cursor's position and moves it past what was read.
     async fn read_some(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
         let (result, buf) = self.file.borrow().read_at(buf, self.position).await;
         if let Ok(read) = &result {
@@ -808,6 +927,9 @@ impl<F: std::borrow::Borrow<File>> crate::io::Read for Cursor<F> {
 }
 
 impl<F: std::borrow::Borrow<File>> crate::io::Write for Cursor<F> {
+    /// Writes all of `buf` at the cursor's position and moves it past what
+    /// was written. After a failed write the position is unchanged, though part
+    /// of the buffer may have been written.
     async fn write_whole(&mut self, buf: Vec<u8>) -> (io::Result<()>, Vec<u8>) {
         let (result, buf) = self.file.borrow().write_all_at(buf, self.position).await;
         if result.is_ok() {
@@ -818,7 +940,8 @@ impl<F: std::borrow::Borrow<File>> crate::io::Write for Cursor<F> {
 }
 
 /// What the filesystem records about a file or directory, as returned by
-/// [`metadata`].
+/// [`metadata`]: its length, its kind, its permission bits and when it was
+/// last changed. A snapshot from the moment of the call.
 #[derive(Clone, Copy, Debug)]
 pub struct Metadata {
     len: u64,
@@ -827,7 +950,8 @@ pub struct Metadata {
 }
 
 impl Metadata {
-    /// Length in bytes.
+    /// Length in bytes. For a directory, whatever the filesystem uses to
+    /// store its names.
     pub fn len(&self) -> u64 {
         self.len
     }
@@ -837,7 +961,8 @@ impl Metadata {
         self.len == 0
     }
 
-    /// Whether this is a regular file.
+    /// Whether this is a regular file, as opposed to a directory, a device,
+    /// a socket and so on.
     pub fn is_file(&self) -> bool {
         self.mode & libc::S_IFMT == libc::S_IFREG
     }
@@ -847,12 +972,13 @@ impl Metadata {
         self.mode & libc::S_IFMT == libc::S_IFDIR
     }
 
-    /// The permission bits, as in `chmod`: `0o644` and the like.
+    /// The permission bits, as in `chmod`: `0o644` and the like, including
+    /// the set-user-id, set-group-id and sticky bits.
     pub fn permissions(&self) -> u32 {
         self.mode & 0o7777
     }
 
-    /// When the contents were last changed.
+    /// When the contents were last changed, as the filesystem recorded it.
     pub fn modified(&self) -> std::time::SystemTime {
         self.modified
     }
@@ -860,6 +986,10 @@ impl Metadata {
 
 /// Looks up a path, following symbolic links. Fails with `NotFound` if
 /// nothing is there, which makes it the way to ask whether a file exists.
+///
+/// The answer may be out of date by the time it is used. To act on a file
+/// only if it exists, or only if it does not, open it with the right
+/// [`OpenOptions`] instead of checking first.
 pub async fn metadata(path: impl AsRef<Path>) -> io::Result<Metadata> {
     let path = c_path(path.as_ref())?;
     let mut buf: Vec<libc::statx> = Vec::with_capacity(1);
@@ -904,8 +1034,14 @@ unsafe impl Send for AlignedBuf {}
 unsafe impl Sync for AlignedBuf {}
 
 impl AlignedBuf {
-    /// Allocates an empty buffer aligned to [`DMA_ALIGNMENT`]. To match a
-    /// particular file exactly, use [`DmaFile::alloc`].
+    /// Allocates an empty buffer aligned to [`DMA_ALIGNMENT`], with room for
+    /// `capacity` bytes rounded up to whole blocks. To match a particular file
+    /// exactly, use [`DmaFile::alloc`].
+    ///
+    /// # Errors
+    ///
+    /// `OutOfMemory` if the allocation fails, `InvalidInput` for a size that
+    /// cannot be represented.
     pub fn new(capacity: usize) -> io::Result<AlignedBuf> {
         AlignedBuf::with_alignment(capacity, DMA_ALIGNMENT)
     }
@@ -942,7 +1078,7 @@ impl AlignedBuf {
     }
 
     /// Allocates a buffer holding a copy of `data`, zero-padded to a whole
-    /// number of [`DMA_ALIGNMENT`] blocks.
+    /// number of [`DMA_ALIGNMENT`] blocks: ready to be written with direct I/O.
     pub fn padded_from(data: &[u8]) -> io::Result<AlignedBuf> {
         let mut buf = AlignedBuf::new(data.len())?;
         buf.fill_padded(data);
@@ -950,7 +1086,8 @@ impl AlignedBuf {
     }
 
     /// Replaces the contents with `data` (as much as fits), zero-padded to
-    /// the whole capacity.
+    /// the whole capacity, and sets the length to the capacity. Afterwards the
+    /// buffer is a whole number of blocks, which is what a direct write needs.
     pub fn fill_padded(&mut self, data: &[u8]) {
         self.len = self.capacity;
         let split = data.len().min(self.capacity);
@@ -961,7 +1098,7 @@ impl AlignedBuf {
         tail.fill(0);
     }
 
-    /// Number of bytes in the buffer.
+    /// Number of bytes in the buffer: how much a write of it sends.
     pub fn len(&self) -> usize {
         self.len
     }
@@ -972,11 +1109,12 @@ impl AlignedBuf {
     }
 
     /// Number of bytes the buffer has room for, a whole number of blocks.
+    /// A read fills at most this much.
     pub fn capacity(&self) -> usize {
         self.capacity
     }
 
-    /// The alignment of the buffer's memory.
+    /// The alignment of the buffer's memory, as given when it was allocated.
     pub fn alignment(&self) -> usize {
         self.alignment
     }
@@ -987,15 +1125,17 @@ impl AlignedBuf {
     }
 
     /// Sets the length, clamped to the capacity. Bytes that come into view
-    /// keep whatever was last stored there (zeros in a fresh buffer).
+    /// keep whatever was last stored there, which is zeros in a fresh buffer.
     pub fn set_len(&mut self, len: usize) {
         self.len = len.min(self.capacity);
     }
 }
 
 impl Deref for AlignedBuf {
+    /// An aligned buffer reads as a slice of its bytes.
     type Target = [u8];
 
+    /// The buffer's bytes, up to its length.
     fn deref(&self) -> &[u8] {
         // SAFETY: `len <= capacity`, and all `capacity` bytes are allocated
         // and initialised (zeroed at allocation, only overwritten since).
@@ -1004,6 +1144,7 @@ impl Deref for AlignedBuf {
 }
 
 impl DerefMut for AlignedBuf {
+    /// The buffer's bytes, up to its length, for changing in place.
     fn deref_mut(&mut self) -> &mut [u8] {
         // SAFETY: as in `deref`, and `&mut self` gives exclusive access.
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
@@ -1011,6 +1152,7 @@ impl DerefMut for AlignedBuf {
 }
 
 impl Drop for AlignedBuf {
+    /// Frees the allocation.
     fn drop(&mut self) {
         if let Ok(layout) = Layout::from_size_align(self.capacity, self.alignment) {
             // SAFETY: allocated in `with_alignment` with this exact layout.
@@ -1036,12 +1178,18 @@ pub struct DmaFile {
 }
 
 impl DmaFile {
-    /// Opens an existing file for reading.
+    /// Opens an existing file for direct reading.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` if there is no such file, and `EINVAL` on a filesystem without
+    /// direct I/O.
     pub async fn open(path: impl AsRef<Path>) -> io::Result<DmaFile> {
         DmaFile::open_with(path, libc::O_RDONLY, 0).await
     }
 
-    /// Opens a file for reading and writing, creating or truncating it.
+    /// Opens a file for direct reading and writing, creating it if it does
+    /// not exist and emptying it if it does.
     pub async fn create(path: impl AsRef<Path>) -> io::Result<DmaFile> {
         DmaFile::open_with(path, libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC, 0o644).await
     }
@@ -1074,7 +1222,8 @@ impl DmaFile {
     }
 
     /// Allocates an empty buffer suitable for this file, with room for at
-    /// least `capacity` bytes rounded up to whole blocks.
+    /// least `capacity` bytes rounded up to whole blocks. Its memory satisfies
+    /// both of the file's alignment requirements.
     pub fn alloc(&self, capacity: usize) -> io::Result<AlignedBuf> {
         AlignedBuf::with_alignment(capacity, self.memory_alignment.max(self.disk_alignment))
     }
@@ -1100,6 +1249,11 @@ impl DmaFile {
         }
     }
 
+    /// Checks a transfer against the file's alignment rules and returns its
+    /// length as io_uring takes it.
+    ///
+    /// The kernel would refuse a misaligned request with a bare `EINVAL`; these
+    /// errors say which rule was broken.
     fn check(&self, ptr: *const u8, offset: u64, len: usize) -> io::Result<u32> {
         if !is_multiple(ptr as usize as u64, self.memory_alignment) {
             return Err(invalid("buffer memory is not aligned for this file"));
@@ -1134,8 +1288,9 @@ impl DmaFile {
         self.write_impl(buf, offset, true).await
     }
 
-    /// `scheduled` is false only for capacity measurement, which must see
-    /// the device itself, not the scheduler.
+    /// Reads at `offset` as many whole blocks as fit in the buffer.
+    /// `scheduled` is false only for capacity measurement, which must see the
+    /// device itself, not the scheduler.
     pub(crate) async fn read_impl<B: IoBufMut>(
         &self,
         mut buf: B,
@@ -1151,6 +1306,8 @@ impl DmaFile {
         }
     }
 
+    /// Writes the buffer at `offset`, through the I/O scheduler or, for
+    /// capacity measurement only, straight to the kernel.
     pub(crate) async fn write_impl<B: IoBuf>(
         &self,
         buf: B,
@@ -1165,7 +1322,9 @@ impl DmaFile {
         }
     }
 
-    /// Flushes file data and metadata to the device.
+    /// Flushes file data and metadata to the device. Direct I/O bypasses the
+    /// page cache but not the device's own write cache, so this is still what
+    /// makes written data safe.
     pub async fn sync_all(&self) -> io::Result<()> {
         fsync(&self.fd, self.device).await
     }
@@ -1204,6 +1363,9 @@ impl DmaFile {
     }
 }
 
+/// The error every call on a stream returns once one of its operations
+/// has been dropped part-way: the stream's buffer went with that operation,
+/// and its position in the file is no longer known.
 fn interrupted() -> io::Error {
     io::Error::other("an earlier operation on this stream was dropped before it finished")
 }
@@ -1292,8 +1454,9 @@ impl<F: std::borrow::Borrow<DmaFile>> DmaStreamWriter<F> {
         Ok(writer)
     }
 
-    /// How many bytes the stream holds so far: the file offset the next
-    /// byte will go to.
+    /// How many bytes the stream holds so far: the file offset the next byte
+    /// will go to. It counts what is still in the buffer, so it runs ahead of
+    /// the file's length until the buffer is written.
     pub fn position(&self) -> u64 {
         self.start.saturating_add(self.filled as u64)
     }
@@ -1303,8 +1466,13 @@ impl<F: std::borrow::Borrow<DmaFile>> DmaStreamWriter<F> {
         self.file.borrow()
     }
 
-    /// Adds all of `data` to the stream, writing the buffer to the file
-    /// each time it fills up.
+    /// Adds all of `data` to the stream, writing the buffer to the file each
+    /// time it fills up. Data that fits in the buffer costs a copy and no I/O.
+    ///
+    /// # Errors
+    ///
+    /// The file's error, or `WriteZero` if the device is full. After an error
+    /// the stream should be abandoned.
     pub async fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
         let mut rest = data;
         while !rest.is_empty() {
@@ -1331,8 +1499,8 @@ impl<F: std::borrow::Borrow<DmaFile>> DmaStreamWriter<F> {
         Ok(())
     }
 
-    /// Writes the first `len` bytes of the buffer, a whole number of
-    /// blocks, at the buffer's place in the file.
+    /// Writes the first `len` bytes of the buffer, a whole number of blocks,
+    /// at the buffer's place in the file, and takes the buffer back.
     async fn write_buffer(&mut self, len: usize) -> io::Result<()> {
         let mut buf = self.buf.take().ok_or_else(interrupted)?;
         buf.set_len(len);
@@ -1372,6 +1540,9 @@ impl<F: std::borrow::Borrow<DmaFile>> DmaStreamWriter<F> {
 
     /// Ends the stream: writes what is left, sets the file's length to
     /// exactly what was written, makes it durable and gives the file back.
+    ///
+    /// This is the only call after which the file's length says where the data
+    /// ends.
     pub async fn finish(mut self) -> io::Result<F> {
         self.write_tail().await?;
         self.file.borrow().set_len(self.position()).await?;
@@ -1381,6 +1552,7 @@ impl<F: std::borrow::Borrow<DmaFile>> DmaStreamWriter<F> {
 }
 
 impl<F: std::borrow::Borrow<DmaFile>> crate::io::Write for DmaStreamWriter<F> {
+    /// Adds the buffer's contents to the stream.
     async fn write_whole(&mut self, buf: Vec<u8>) -> (io::Result<()>, Vec<u8>) {
         (self.write_all(&buf).await, buf)
     }
@@ -1440,13 +1612,16 @@ pub struct DmaStreamReader<F> {
 }
 
 impl<F: std::borrow::Borrow<DmaFile>> DmaStreamReader<F> {
-    /// A reader that starts at the beginning of the file, with a buffer of
-    /// at least `buffer_size` bytes (rounded up to whole blocks).
+    /// A reader that starts at the beginning of the file, with a buffer of at
+    /// least `buffer_size` bytes (rounded up to whole blocks). Larger buffers
+    /// mean fewer, larger reads.
     pub fn new(file: F, buffer_size: usize) -> io::Result<DmaStreamReader<F>> {
         DmaStreamReader::at(file, 0, buffer_size)
     }
 
-    /// A reader that starts at `position`, which may be anywhere.
+    /// A reader that starts at `position`, which may be anywhere, inside a
+    /// block or not. The first read begins at the block boundary before it, and
+    /// the bytes up to `position` are passed over.
     pub fn at(file: F, position: u64, buffer_size: usize) -> io::Result<DmaStreamReader<F>> {
         let block = file.borrow().disk_alignment().max(1);
         let first = file.borrow().alloc(buffer_size)?;
@@ -1494,7 +1669,9 @@ impl<F: std::borrow::Borrow<DmaFile>> DmaStreamReader<F> {
         self.file.borrow()
     }
 
-    /// Starts reads until as many are on their way as there should be.
+    /// Starts reads until as many are on their way as there should be: the
+    /// one about to be waited for, plus the configured number ahead of it. Each
+    /// takes a free buffer and the next stretch of the file.
     fn start_reads(&mut self) -> io::Result<()> {
         while self.pending.len() <= self.ahead {
             let Some(buf) = self.spare.pop() else { break };
@@ -1513,8 +1690,9 @@ impl<F: std::borrow::Borrow<DmaFile>> DmaStreamReader<F> {
         Ok(())
     }
 
-    /// Waits for the oldest read on its way. Returns where in the file it
-    /// was and how much it brought, with the data in `current`.
+    /// Waits for the oldest read on its way. Returns where in the file it was
+    /// and how much it brought, with the data in `current`; `None` if no read
+    /// was on its way.
     async fn finish_read(&mut self) -> io::Result<Option<(u64, usize)>> {
         let Some((offset, op)) = self.pending.pop_front() else { return Ok(None) };
         // If this future is dropped at the await, the read and its buffer
@@ -1588,8 +1766,9 @@ impl<F: std::borrow::Borrow<DmaFile>> DmaStreamReader<F> {
         self.position = self.position.saturating_add(count as u64);
     }
 
-    /// Reads some bytes into `out` and returns how many. `Ok(0)` means the
-    /// end of the file (or that `out` is empty).
+    /// Reads some bytes into `out` and returns how many: at least one unless
+    /// the file has ended. `Ok(0)` means the end of the file (or that `out` is
+    /// empty).
     pub async fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         let available = self.fill().await?;
         let count = available.len().min(out.len());
@@ -1620,6 +1799,7 @@ impl<F: std::borrow::Borrow<DmaFile>> DmaStreamReader<F> {
 }
 
 impl<F: std::borrow::Borrow<DmaFile>> crate::io::Read for DmaStreamReader<F> {
+    /// Fills the vector with what is buffered, up to its capacity.
     async fn read_some(&mut self, mut buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
         buf.clear();
         let room = buf.capacity();
