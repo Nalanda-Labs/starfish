@@ -153,6 +153,8 @@ pub mod net;
 pub mod signal;
 pub mod stats;
 pub mod sync;
+#[cfg(feature = "tls")]
+pub mod tls;
 
 pub use blocking::run_blocking;
 pub use error::{Error, Result};

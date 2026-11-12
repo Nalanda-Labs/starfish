@@ -24,6 +24,7 @@ the code.
 - [Buffers](#buffers)
 - [TCP](#tcp)
 - [Buffered reading and writing](#buffered-reading-and-writing)
+- [TLS](#tls)
 - [UDP](#udp)
 - [Unix-domain sockets](#unix-domain-sockets)
 - [Files](#files)
@@ -1079,6 +1080,87 @@ Both types live in [`io`](crate::io) and are re-exported from `net`.
   send to; the `log_writer` example does this.
 - A `Cursor` works on [`File`](crate::fs::File) only. For direct I/O,
   see [Streams on direct I/O](#streams-on-direct-io).
+
+# TLS
+
+With the crate's `tls` feature there is a `tls` module, which runs TLS
+over any of the runtime's streams using [rustls](https://docs.rs/rustls).
+The feature is off by default, because it brings in rustls and a
+cryptography library:
+
+```toml
+starfish = { version = "0.1", features = ["tls"] }
+```
+
+A `TlsAcceptor` holds a server's configuration and turns accepted
+connections into `TlsStream`s; a `TlsConnector` does the same on the
+client's side, checking the server's certificate against the name it is
+given. The configurations are rustls's own types, re-exported as
+`starfish::tls::rustls`, and say which certificates to present and which to
+trust.
+
+```rust,ignore
+use std::sync::Arc;
+use starfish::net::TcpListener;
+use starfish::tls::{rustls, TlsAcceptor};
+
+async fn serve(
+    certificates: Vec<rustls::pki_types::CertificateDer<'static>>,
+    key: rustls::pki_types::PrivateKeyDer<'static>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certificates, key)?;
+    let acceptor = TlsAcceptor::new(Arc::new(config));
+
+    let listener = TcpListener::bind("0.0.0.0:8443".parse()?)?;
+    loop {
+        let connection = listener.accept().await?;
+        let acceptor = acceptor.clone();
+        starfish::spawn(async move {
+            let mut stream = acceptor.accept(connection).await?;
+            let mut request = [0u8; 1024];
+            let length = stream.read(&mut request).await?;
+            stream.write_all(&request[..length]).await?;
+            stream.shutdown().await
+        });
+    }
+}
+```
+
+A `TlsStream` has `read`, `read_exact`, `write_all` and `shutdown`, and
+works under a `BufReader` or `BufWriter`. `shutdown` sends the TLS
+goodbye, after which the peer's `read` returns 0; a connection that ends
+without one makes `read` fail with `UnexpectedEof`, which is how to tell a
+complete conversation from one that was cut off. The acceptor and the
+connector can be cloned and sent to every shard. The `tls_echo` example is
+a server and client in one program, and its server answers `openssl
+s_client` as well.
+
+**Caveats**
+
+- One task uses a stream, in turns: reading and writing both take
+  `&mut self`, so one task cannot read while another writes. Protocols
+  where each side speaks in turn are served well; ones where both sides
+  send whenever they like are not. To write replies while reading lines
+  through a `BufReader`, reach the stream with `get_mut`.
+- A read or write that is dropped before it finishes, by `timeout` or in
+  `select`, leaves the session unusable: every later call fails, and the
+  connection has to be dropped. Encrypted data cannot be half read. Put
+  time limits around whole exchanges, and around `accept`, where a client
+  can otherwise stall the handshake for ever.
+- Every `write_all` goes out as records of its own. Collect small writes
+  first, by hand or with a `BufWriter`.
+- Encryption runs on the shard, in the task that reads or writes. That is
+  where the time of a busy TLS server goes; it is not handed to other
+  threads, and a `RecvStream` or zero-copy send cannot be used underneath,
+  since the data has to pass through the cipher.
+- There are no helpers for loading certificates and keys from files:
+  parse them with rustls's own `pki_types` (which reads PEM) and build the
+  configuration by hand. Reloading a certificate means building a new
+  acceptor and using it for new connections.
+- The cryptography is rustls with the *ring* provider, which needs a C
+  compiler to build.
 
 # UDP
 
@@ -2157,7 +2239,8 @@ the pieces fit.
 # What is not there
 
 - Networking uses the kernel's stack. There is no userspace TCP.
-- No TLS, no HTTP, no DNS resolution: addresses are `SocketAddr`s.
+- No HTTP. TLS is there behind a feature, with the limits its section
+  lists.
 - No calls for links or for changing permissions.
 - No work stealing or load balancing between shards.
 - Only Linux, and only run on x86-64 so far.

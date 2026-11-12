@@ -32,6 +32,10 @@ jobs:
         run: cargo test
       - name: Tests, release
         run: cargo test --release
+      - name: Clippy and tests with TLS
+        run: |
+          cargo clippy --all-targets --features tls -- -D warnings
+          cargo test --features tls
 
   miri:
     name: Miri (unsafe code without io_uring)

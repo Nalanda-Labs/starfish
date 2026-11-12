@@ -10,14 +10,24 @@ default = ["symbols"]
 # Function names, files and line numbers in the backtraces of stalled
 # shards. Without it they are raw addresses.
 symbols = ["dep:backtrace"]
+# TLS over the runtime's streams, with rustls (`starfish::tls`). Off by
+# default: it brings in rustls and a cryptography library with C and
+# assembly in it.
+tls = ["dep:rustls"]
 
 [dependencies]
 backtrace = { version = "0.3", optional = true }
 io-uring = "0.7"
 libc = "0.2"
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
 slab = "0.4"
 socket2 = { version = "0.5", features = ["all"] }
 
 [dev-dependencies]
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 monoio = "0.2.4"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time"] }
+
+[[example]]
+name = "tls_echo"
+required-features = ["tls"]

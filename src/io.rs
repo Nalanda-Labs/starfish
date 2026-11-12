@@ -180,6 +180,18 @@ impl<S: Read> BufReader<S> {
         &self.stream
     }
 
+    /// What is being read from, for using it in ways that need exclusive
+    /// access. This is how to write to a stream that a reader is wrapped
+    /// around when the stream does both through `&mut self`, as a
+    /// `tls::TlsStream` does:
+    /// `reader.get_mut().write_all(reply).await`.
+    ///
+    /// Writing through it is fine. Reading through it would skip whatever
+    /// the reader has buffered.
+    pub fn get_mut(&mut self) -> &mut S {
+        &mut self.stream
+    }
+
     /// Gives back what was being read from, ending the reader.
     ///
     /// Bytes that were received but not yet read from the reader are lost, as is
@@ -420,6 +432,16 @@ impl<S: Write> BufWriter<S> {
     /// new data ahead of the old. Flush first.
     pub fn get_ref(&self) -> &S {
         &self.stream
+    }
+
+    /// What is being written to, for using it in ways that need exclusive
+    /// access, such as reading from a stream that reads and writes through
+    /// `&mut self`.
+    ///
+    /// Reading through it is fine. Writing through it while the writer holds
+    /// buffered data would put the new data ahead of the old; flush first.
+    pub fn get_mut(&mut self) -> &mut S {
+        &mut self.stream
     }
 
     /// Gives back what was being written to, ending the writer.

@@ -50,7 +50,7 @@ wrong). `cargo doc --open` shows it together with the API reference.
 
 ## Examples
 
-There are 52 programs in `examples/`. Run one with
+There are 53 programs in `examples/`. Run one with
 `cargo run --release --example <name>`. Those marked *server* run until
 Ctrl-C; the others do their work and exit.
 
@@ -82,6 +82,7 @@ Ctrl-C; the others do their work and exit.
 | | `dispatcher` | Accepting on one shard, serving on others |
 | | `udp_ping` | Datagrams between two UDP sockets |
 | | `unix_socket` | A Unix-domain server shared by all shards, with caller identity |
+| | `tls_echo` | TLS server and client (needs `--features tls`) |
 | | `fixed_buffers` | Registered buffers and zero-copy sends |
 | | `recv_stream` | Receiving with one standing request and buffers the kernel picks |
 | | `echo` | *Server.* Echo with a connection limit and orderly shutdown |
@@ -149,6 +150,8 @@ The servers listen on 127.0.0.1, ports 7000 to 7006.
   for whether a port is shared and how long its accept queue is, and
   `lookup_host` for names. Networking
   uses the kernel stack; there is no userspace TCP stack.
+- **TLS:** with the `tls` feature, `tls::TlsAcceptor` and
+  `tls::TlsConnector` run TLS 1.2 and 1.3 over any stream, using rustls.
 - **Buffered I/O:** `io::BufReader` and `io::BufWriter` for lines and
   length-framed data, over TCP streams and, through `fs::Cursor`, files.
   A buffered read that times out loses nothing and can be tried again.
@@ -189,6 +192,7 @@ unwinding, so it does not hold under `panic = "abort"`.
 cargo clippy --all-targets          # includes the no-panic lints
 RUSTDOCFLAGS='-D warnings' cargo doc --no-deps
 cargo test                          # unit, integration and doc tests
+cargo test --features tls           # the same, with TLS
 MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test --lib
 RUSTFLAGS=-Zsanitizer=thread cargo +nightly test -Zbuild-std \
     --target x86_64-unknown-linux-gnu --lib --test basic --test alloc
