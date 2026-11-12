@@ -1480,12 +1480,16 @@ both want the whole CPU get 799 ms and 200 ms of a second.
 
 **Caveats**
 
-- Groups cannot be deleted, and there is no limit on how many are made.
-  Each one stays for the life of the runtime and every shard keeps a
-  little state for it, so create a handful at start-up, never one per
-  request or per connection: that would grow without end. (A limit that
-  turned this into an error was tried and withdrawn, because having many
-  groups is meant to work.)
+- A group stays until [`remove`](crate::SchedulingGroup::remove) is
+  called on it, and every shard keeps a little state for each group that
+  exists. A group per tenant or per job is fine if it is removed when the
+  tenant or job goes; one per request or per connection is not what
+  groups are for, since creating and removing take a lock shared by all
+  shards.
+- Removing a group does not stop its tasks. They carry on in the default
+  group, with its shares, and so does whatever they spawn. Handles to a
+  removed group fail with `InvalidGroup`, including the one a task still
+  running gets from `SchedulingGroup::current`.
 - Shares only matter under contention. A group alone on a shard gets all
   of it, whatever its shares.
 - CPU shares only work if tasks yield. A task that never awaits keeps the

@@ -609,7 +609,14 @@ where
     };
     let group = match group {
         None => shard.current_group.get(),
-        Some(group) if shard.runtime.groups.exists(group) => group,
+        Some(group)
+            if shard
+                .run_queue
+                .with(|queue| queue.group_exists(group))
+                .unwrap_or(false) =>
+        {
+            group
+        }
         Some(_) => return JoinHandle::failed(Error::InvalidGroup),
     };
     match shard.spawn_task(group, future, false) {

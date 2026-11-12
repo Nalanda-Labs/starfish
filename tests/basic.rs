@@ -1955,6 +1955,62 @@ fn files_are_read_and_written_in_order_through_a_cursor() {
 }
 
 #[test]
+fn a_removed_group_frees_its_place_and_its_tasks_carry_on() {
+    rt(2)
+        .run(|| async {
+            let before = starfish::stats::groups().unwrap().len();
+            let job = SchedulingGroup::create("job", 200).unwrap();
+            let (release, held) = starfish::sync::oneshot::<()>();
+            // A task that outlives its group, and spawns once the group is
+            // gone.
+            let survivor = job.spawn(async move {
+                held.await;
+                let inherited = SchedulingGroup::current().unwrap();
+                let child = spawn(async { 7 }).await.unwrap();
+                (inherited.name().is_err(), child)
+            });
+            yield_now().await;
+            assert_eq!(job.name().unwrap(), "job");
+
+            job.remove().unwrap();
+            // Every copy of the handle is dead, here and on other shards.
+            assert!(matches!(job.name(), Err(Error::InvalidGroup)));
+            assert!(matches!(job.set_cpu_shares(5), Err(Error::InvalidGroup)));
+            assert!(matches!(job.remove(), Err(Error::InvalidGroup)));
+            assert!(matches!(job.spawn(async {}).await, Err(Error::InvalidGroup)));
+            let elsewhere = submit_to(1, move || async move { job.spawn(async {}).await }).await;
+            assert!(matches!(elsewhere.unwrap(), Err(Error::InvalidGroup)));
+            assert!(matches!(SchedulingGroup::DEFAULT.remove(), Err(Error::InvalidGroup)));
+
+            // The next group takes the place over, under its own name and
+            // with nothing of the old one's record; the old handle does not
+            // reach it.
+            let next = SchedulingGroup::create("next", 300).unwrap();
+            assert_ne!(next, job);
+            assert_eq!(next.name().unwrap(), "next");
+            assert!(job.name().is_err());
+            next.spawn(async {}).await.unwrap();
+            let groups = starfish::stats::groups().unwrap();
+            assert!(groups.iter().all(|group| group.name != "job"));
+            assert!(groups.iter().any(|group| group.name == "next" && group.cpu_shares == 300));
+
+            // The task left behind finishes, in the default group.
+            release.send(()).unwrap();
+            assert_eq!(survivor.await.unwrap(), (true, 7));
+            next.remove().unwrap();
+
+            // Making and removing groups without end does not accumulate.
+            for round in 0..10_000 {
+                let group = SchedulingGroup::create("passing", 100).unwrap();
+                assert_eq!(group.spawn(async move { round }).await.unwrap(), round);
+                group.remove().unwrap();
+            }
+            assert!(starfish::stats::groups().unwrap().len() <= before + 1);
+        })
+        .unwrap();
+}
+
+#[test]
 fn a_cloned_tcp_listener_shares_one_queue_between_shards() {
     rt(2)
         .run(|| async {

@@ -28,25 +28,72 @@ fn clamp_shares(shares: u32) -> u32 {
     shares.clamp(1, MAX_SHARES)
 }
 
-/// What the runtime knows about one scheduling group: its name and its
-/// two weights.
+// A group is known by a number that packs two things: the index of its
+// slot in the group table (the low half) and the slot's generation at the
+// time the group was made (the high half). Removing a group frees its slot
+// for the next group and raises the slot's generation, so a number that
+// outlives its group never matches whatever takes the slot next. The
+// default group is slot 0 at generation 0, which makes its number 0.
+const _: () = assert!(usize::BITS == 64);
+
+/// Bits of a group's number that hold its slot.
+const SLOT_BITS: u32 = 32;
+/// The most slots the table can have, which is the most groups that can
+/// exist at one time.
+const MAX_SLOTS: usize = 1 << SLOT_BITS;
+
+/// The number of the group in `slot` at `generation`.
+fn pack(slot: usize, generation: u32) -> usize {
+    (slot & (MAX_SLOTS - 1)) | ((generation as usize) << SLOT_BITS)
+}
+
+/// The slot half of a group's number.
+fn slot_of(group: usize) -> usize {
+    group & (MAX_SLOTS - 1)
+}
+
+/// The generation half of a group's number.
+fn generation_of(group: usize) -> u32 {
+    (group >> SLOT_BITS) as u32
+}
+
+/// What the runtime knows about one scheduling group: its name, its two
+/// weights and the generation of its slot.
 ///
 /// The weights are atomic because they can be changed at any time from any
 /// shard and are read by every shard on every scheduling decision.
 pub(crate) struct GroupInfo {
     name: String,
+    generation: u32,
     cpu_shares: AtomicU32,
     io_shares: AtomicU32,
 }
 
+/// One place in the group table: the group in it, if any, and how many
+/// groups have been removed from it.
+struct Slot {
+    info: Option<Arc<GroupInfo>>,
+    generation: u32,
+}
+
+/// The table proper, behind the lock.
+struct Slots {
+    slots: Vec<Slot>,
+    /// Indexes of the slots with no group, to be used before the table grows.
+    free: Vec<usize>,
+}
+
 /// The runtime-wide list of groups, shared by all shards.
 ///
-/// Groups are only ever added, so an index, once handed out, stays valid and
-/// always means the same group.
+/// A group keeps its slot for as long as it exists. Removing it empties the
+/// slot, which the next group to be created takes over; the table therefore
+/// grows only as far as the most groups that ever existed at once.
 pub(crate) struct GroupTable {
-    groups: Mutex<Vec<Arc<GroupInfo>>>,
-    /// Mirrors `groups.len()` so that existence checks need no lock.
-    count: AtomicUsize,
+    slots: Mutex<Slots>,
+    /// Counts the changes to which groups exist. A shard compares it with the
+    /// count it last saw to know whether its copy of the table is current,
+    /// which costs one load and no lock.
+    epoch: AtomicUsize,
 }
 
 impl GroupTable {
@@ -54,61 +101,108 @@ impl GroupTable {
     pub(crate) fn new() -> GroupTable {
         let main = Arc::new(GroupInfo {
             name: String::from("main"),
+            generation: 0,
             cpu_shares: AtomicU32::new(DEFAULT_SHARES),
             io_shares: AtomicU32::new(DEFAULT_SHARES),
         });
         GroupTable {
-            groups: Mutex::new(vec![main]),
-            count: AtomicUsize::new(1),
+            slots: Mutex::new(Slots {
+                slots: vec![Slot {
+                    info: Some(main),
+                    generation: 0,
+                }],
+                free: Vec::new(),
+            }),
+            epoch: AtomicUsize::new(0),
         }
     }
 
-    /// Whether `group` is the index of a group that exists. A single atomic
-    /// read, with no lock.
-    pub(crate) fn exists(&self, group: usize) -> bool {
-        group < self.count.load(Ordering::Acquire)
-    }
-
-    /// Adds a group and returns its index.
-    fn create(&self, name: &str, cpu_shares: u32, io_shares: u32) -> usize {
-        let mut groups = self.groups.lock().unwrap_or_else(PoisonError::into_inner);
-        let id = groups.len();
-        groups.push(Arc::new(GroupInfo {
+    /// Adds a group and returns its number, or `None` if the table is full.
+    fn create(&self, name: &str, cpu_shares: u32, io_shares: u32) -> Option<usize> {
+        let mut table = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        let index = match table.free.pop() {
+            Some(index) => index,
+            None => {
+                let index = table.slots.len();
+                if index >= MAX_SLOTS {
+                    return None;
+                }
+                table.slots.push(Slot {
+                    info: None,
+                    generation: 0,
+                });
+                index
+            }
+        };
+        let slot = table.slots.get_mut(index)?;
+        let generation = slot.generation;
+        slot.info = Some(Arc::new(GroupInfo {
             name: name.to_owned(),
+            generation,
             cpu_shares: AtomicU32::new(clamp_shares(cpu_shares)),
             io_shares: AtomicU32::new(clamp_shares(io_shares)),
         }));
-        self.count.store(groups.len(), Ordering::Release);
-        id
+        self.epoch.fetch_add(1, Ordering::Release);
+        Some(pack(index, generation))
     }
 
     /// Adds a group with the same shares of both kinds; for the unit tests of
     /// other modules.
     #[cfg(test)]
     pub(crate) fn create_for_test(&self, name: &str, shares: u32) -> usize {
-        self.create(name, shares, shares)
+        self.create(name, shares, shares).unwrap_or(DEFAULT_GROUP)
     }
 
-    /// One group's record, or `None` for an index that is not a group's.
+    /// Removes a group and frees its slot. Returns false if `group` is not
+    /// the number of a group that exists, or is the default group, which
+    /// cannot be removed.
+    fn remove(&self, group: usize) -> bool {
+        let index = slot_of(group);
+        if index == DEFAULT_GROUP {
+            return false;
+        }
+        let mut table = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(slot) = table.slots.get_mut(index) else {
+            return false;
+        };
+        if slot.info.is_none() || slot.generation != generation_of(group) {
+            return false;
+        }
+        slot.info = None;
+        slot.generation = slot.generation.wrapping_add(1);
+        table.free.push(index);
+        self.epoch.fetch_add(1, Ordering::Release);
+        true
+    }
+
+    /// One group's record, or `None` for a number that is not a group's.
     fn get(&self, group: usize) -> Option<Arc<GroupInfo>> {
-        let groups = self.groups.lock().unwrap_or_else(PoisonError::into_inner);
-        groups.get(group).cloned()
+        let table = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        let info = table.slots.get(slot_of(group))?.info.as_ref()?;
+        (info.generation == generation_of(group)).then(|| info.clone())
     }
 
-    /// Appends the groups from index `from` on to `out`: how a shard's cache
-    /// catches up with groups made since it last looked.
-    fn copy_from(&self, from: usize, out: &mut Vec<Arc<GroupInfo>>) {
-        let groups = self.groups.lock().unwrap_or_else(PoisonError::into_inner);
-        out.extend(groups.iter().skip(from).cloned());
+    /// Replaces `out` with the table as it stands, slot by slot, and returns
+    /// the epoch that copy belongs to: how a shard's cache catches up.
+    fn copy_to(&self, out: &mut Vec<Option<Arc<GroupInfo>>>) -> usize {
+        let table = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        out.clear();
+        out.extend(table.slots.iter().map(|slot| slot.info.clone()));
+        // Read under the lock, which every change holds, so it is exact.
+        self.epoch.load(Ordering::Acquire)
     }
 }
 
-/// A shard's private view of the group table, so that reading shares on
-/// every scheduling decision takes no lock. It catches up with the shared
-/// table the first time it is asked about a group it has not seen.
+/// A shard's private copy of the group table, so that reading shares on
+/// every scheduling decision takes no lock. Before every use it compares
+/// the table's epoch with the one its copy was made at, and copies the table
+/// again if groups have been created or removed since.
 pub(crate) struct GroupCache {
     table: Arc<GroupTable>,
-    local: Vec<Arc<GroupInfo>>,
+    local: Vec<Option<Arc<GroupInfo>>>,
+    /// The table's epoch when `local` was copied; `usize::MAX` before the
+    /// first copy, which no table reaches.
+    epoch: usize,
 }
 
 impl GroupCache {
@@ -117,34 +211,47 @@ impl GroupCache {
         GroupCache {
             table,
             local: Vec::new(),
+            epoch: usize::MAX,
         }
     }
 
-    /// One group's record, from the cache, after catching up with the shared
-    /// table if the group is newer than the cache.
-    fn get(&mut self, group: usize) -> Option<&GroupInfo> {
-        if group >= self.local.len() && self.table.exists(group) {
-            self.table.copy_from(self.local.len(), &mut self.local);
+    /// Brings the copy up to date if the table has changed.
+    fn refresh(&mut self) {
+        if self.table.epoch.load(Ordering::Acquire) != self.epoch {
+            self.epoch = self.table.copy_to(&mut self.local);
         }
-        self.local.get(group).map(|info| &**info)
     }
 
-    /// Whether `group` exists.
+    /// The group now in slot `index`, if there is one.
+    fn in_slot(&mut self, index: usize) -> Option<&GroupInfo> {
+        self.refresh();
+        self.local.get(index)?.as_deref()
+    }
+
+    /// The slot of the group numbered `group`, or `None` if no such group
+    /// exists: it never did, or it has been removed.
+    pub(crate) fn slot(&mut self, group: usize) -> Option<usize> {
+        let index = slot_of(group);
+        let info = self.in_slot(index)?;
+        (info.generation == generation_of(group)).then_some(index)
+    }
+
+    /// Whether the group numbered `group` exists.
     pub(crate) fn exists(&mut self, group: usize) -> bool {
-        self.get(group).is_some()
+        self.slot(group).is_some()
     }
 
-    /// A group's CPU weight, or the default weight for a group that does not
-    /// exist.
-    fn cpu_shares(&mut self, group: usize) -> u32 {
-        self.get(group)
+    /// The CPU weight of the group in slot `index`, or the default weight
+    /// for an empty slot.
+    fn cpu_shares(&mut self, index: usize) -> u32 {
+        self.in_slot(index)
             .map_or(DEFAULT_SHARES, |info| info.cpu_shares.load(Ordering::Relaxed))
     }
 
-    /// A group's disk weight, or the default weight for a group that does not
-    /// exist.
-    pub(crate) fn io_shares(&mut self, group: usize) -> u32 {
-        self.get(group)
+    /// The disk weight of the group in slot `index`, or the default weight
+    /// for an empty slot.
+    pub(crate) fn io_shares(&mut self, index: usize) -> u32 {
+        self.in_slot(index)
             .map_or(DEFAULT_SHARES, |info| info.io_shares.load(Ordering::Relaxed))
     }
 }
@@ -168,12 +275,16 @@ struct GroupQueue {
     vtime: u64,
     cpu_nanos: u64,
     polled: u64,
+    /// Generation of the group the totals belong to. When another group has
+    /// taken the slot, the totals start again from zero.
+    generation: u32,
 }
 
 /// The runnable tasks of one shard, one first-in-first-out queue per
 /// group, with the bookkeeping that decides which group runs next.
 pub(crate) struct RunQueues {
     cache: GroupCache,
+    /// Indexed by slot in the group table.
     groups: Vec<GroupQueue>,
     /// The groups that have runnable tasks, ordered by virtual time. An
     /// entry's first field always equals that group's `vtime`.
@@ -203,13 +314,14 @@ impl RunQueues {
     ///
     /// A group that was idle starts from the current virtual time, not from
     /// where it left off, so that a group cannot save up a claim on the CPU by
-    /// doing nothing. A task whose group does not exist runs in the default
-    /// group.
+    /// doing nothing. A task whose group does not exist, which includes one
+    /// whose group has been removed, runs in the default group.
     pub(crate) fn push(&mut self, task: Task) {
-        let index = if self.cache.exists(task.group()) {
-            task.group()
-        } else {
-            DEFAULT_GROUP
+        // The default group always exists, so its tasks, which are most
+        // tasks, skip the lookup.
+        let index = match task.group() {
+            DEFAULT_GROUP => DEFAULT_GROUP,
+            group => self.cache.slot(group).unwrap_or(DEFAULT_GROUP),
         };
         if index >= self.groups.len() {
             self.groups.resize_with(index.saturating_add(1), GroupQueue::default);
@@ -222,8 +334,14 @@ impl RunQueues {
         group.tasks.push_back(task);
     }
 
+    /// Whether the group numbered `group` exists.
+    pub(crate) fn group_exists(&mut self, group: usize) -> bool {
+        self.cache.exists(group)
+    }
+
     /// Chooses the group to run next: the one that has had the least CPU
-    /// time relative to its shares. Returns it with its current length.
+    /// time relative to its shares. Returns its slot with its current
+    /// length.
     pub(crate) fn pick(&mut self) -> Option<(usize, usize)> {
         let &(vtime, index) = self.active.first()?;
         self.vclock = vtime;
@@ -245,7 +363,16 @@ impl RunQueues {
     /// group.
     pub(crate) fn charge(&mut self, index: usize, nanos: u64, polled: u64) {
         let shares = self.cache.cpu_shares(index);
+        let generation = self.cache.in_slot(index).map(|info| info.generation);
         let Some(group) = self.groups.get_mut(index) else { return };
+        if let Some(generation) = generation {
+            if group.generation != generation {
+                // Another group has taken the slot since the last charge.
+                group.generation = generation;
+                group.cpu_nanos = 0;
+                group.polled = 0;
+            }
+        }
         group.cpu_nanos = group.cpu_nanos.saturating_add(nanos);
         group.polled = group.polled.saturating_add(polled);
         let was_active = self.active.remove(&(group.vtime, index));
@@ -266,22 +393,30 @@ impl RunQueues {
         self.active.clear();
     }
 
-    /// A group's name, or an empty string for an index that is not a group's.
+    /// The name of the group in slot `index`, or an empty string for an empty
+    /// slot.
     pub(crate) fn group_name(&mut self, index: usize) -> String {
-        self.cache.get(index).map(|info| info.name.clone()).unwrap_or_default()
+        self.cache.in_slot(index).map(|info| info.name.clone()).unwrap_or_default()
     }
 
     /// One [`GroupStats`] per group that has had a task on this shard.
     pub(crate) fn stats(&mut self) -> Vec<GroupStats> {
         let mut stats = Vec::with_capacity(self.groups.len());
         for (index, group) in self.groups.iter().enumerate() {
-            let Some(info) = self.cache.get(index) else { continue };
+            let Some(info) = self.cache.in_slot(index) else { continue };
+            // Totals left by a removed group that had this slot before are
+            // not this group's.
+            let (cpu_nanos, polled) = if group.generation == info.generation {
+                (group.cpu_nanos, group.polled)
+            } else {
+                (0, 0)
+            };
             stats.push(GroupStats {
                 name: info.name.clone(),
                 cpu_shares: info.cpu_shares.load(Ordering::Relaxed),
                 io_shares: info.io_shares.load(Ordering::Relaxed),
-                cpu_time: Duration::from_nanos(group.cpu_nanos),
-                tasks_polled: group.polled,
+                cpu_time: Duration::from_nanos(cpu_nanos),
+                tasks_polled: polled,
                 runnable: group.tasks.len(),
             });
         }
@@ -300,8 +435,13 @@ impl RunQueues {
 /// A task belongs to the group it was spawned in. [`spawn`](crate::spawn)
 /// and [`submit_to`](crate::submit_to) inherit the caller's group; use
 /// [`SchedulingGroup::spawn`] to start work in another one. Groups exist on
-/// every shard of the runtime that created them, and a runtime can have any
-/// number of them.
+/// every shard of the runtime that created them, from
+/// [`create`](Self::create) until [`remove`](Self::remove), and a runtime
+/// can have any number of them.
+///
+/// The value itself is a small `Copy` handle that can be sent to other
+/// shards and kept anywhere. Once the group is removed, every copy of the
+/// handle is dead, and stays dead even after other groups are created.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SchedulingGroup {
     id: usize,
@@ -328,13 +468,57 @@ impl SchedulingGroup {
     /// Creates a group with separate CPU and I/O shares, each clamped to
     /// `1..=10_000`.
     ///
-    /// There is no limit on the number of groups, but a group cannot be
-    /// removed and every shard keeps a little state for each. Groups are
-    /// classes of work, to be made once at start-up, not one per request
+    /// Every shard keeps a little state for each group that exists, and
+    /// creating one takes a lock shared by all shards. Groups are classes
+    /// of work, such as a tenant or a kind of job: made when the class
+    /// appears and [removed](Self::remove) when it goes, not one per request
     /// or per connection.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoRuntime`] outside a runtime. [`Error::InvalidGroup`] if
+    /// four thousand million groups exist already.
     pub fn create_with(name: &str, cpu_shares: u32, io_shares: u32) -> Result<SchedulingGroup> {
-        let id = current()?.runtime.groups.create(name, cpu_shares, io_shares);
+        let id = current()?
+            .runtime
+            .groups
+            .create(name, cpu_shares, io_shares)
+            .ok_or(Error::InvalidGroup)?;
         Ok(SchedulingGroup { id })
+    }
+
+    /// Removes the group from every shard, freeing what the runtime keeps
+    /// for it. Every copy of this handle stops working: calls on them fail
+    /// with [`Error::InvalidGroup`], and so does spawning into the group.
+    ///
+    /// Tasks still in the group are not stopped. They carry on in the
+    /// default group, with its shares, from the next time they are woken,
+    /// and so do the tasks they spawn and the file requests they make. To
+    /// end a group's work rather than reclassify it, abort or await its
+    /// tasks first.
+    ///
+    /// ```no_run
+    /// use starfish::SchedulingGroup;
+    ///
+    /// # async fn example() -> starfish::Result<()> {
+    /// let job = SchedulingGroup::create("import", 200)?;
+    /// job.spawn(async { /* the work */ }).await?;
+    /// job.remove()?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidGroup`] if the group has been removed already, does
+    /// not belong to the running runtime, or is
+    /// [`DEFAULT`](Self::DEFAULT), which cannot be removed.
+    /// [`Error::NoRuntime`] outside a runtime.
+    pub fn remove(self) -> Result<()> {
+        if current()?.runtime.groups.remove(self.id) {
+            Ok(())
+        } else {
+            Err(Error::InvalidGroup)
+        }
     }
 
     /// The group of the task that is running now. This is the group a task

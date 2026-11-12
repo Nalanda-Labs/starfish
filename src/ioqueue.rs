@@ -430,7 +430,7 @@ impl IoScheduler {
         bytes: u64,
         sqe: squeue::Entry,
     ) -> usize {
-        let class = if self.groups.exists(class) { class } else { DEFAULT_GROUP };
+        let class = self.groups.slot(class).unwrap_or(DEFAULT_GROUP);
         let queue = self
             .queues
             .entry(device)

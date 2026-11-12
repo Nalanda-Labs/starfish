@@ -602,12 +602,18 @@ impl Shard {
                     return Err(err);
                 }
                 let start = Instant::now();
-                self.current_group.set(group);
                 stall::slice_begin();
                 let mut polled = 0u64;
                 for _ in 0..batch {
                     match self.run_queue.with(|queue| queue.pop(group)).flatten() {
-                        Some(header) => self.run_task(header),
+                        Some(header) => {
+                            // The task's own group, not the queue it was
+                            // found in: a task whose group was removed runs
+                            // from the default queue but must not pass a
+                            // live group on to what it spawns.
+                            self.current_group.set(header.group());
+                            self.run_task(header);
+                        }
                         None => break,
                     }
                     polled = polled.saturating_add(1);
