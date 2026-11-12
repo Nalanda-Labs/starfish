@@ -158,7 +158,8 @@ The servers listen on 127.0.0.1, ports 7000 to 7006.
   per shard, and `alloc::on_pressure` to shed memory when a shard is over
   its limit.
 - **Diagnostics:** `stats::{shard, groups, devices}`, a stall counter, and
-  optional backtraces of stalled shards.
+  optional backtraces of stalled shards, by function name and, with debug
+  information, file and line.
 
 To use the per-shard allocator:
 

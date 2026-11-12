@@ -5,7 +5,14 @@ edition = "2021"
 description = "A shared-nothing, thread-per-core async runtime on io_uring, modelled on Seastar"
 license = "GPL-3.0-or-later"
 
+[features]
+default = ["symbols"]
+# Function names, files and line numbers in the backtraces of stalled
+# shards. Without it they are raw addresses.
+symbols = ["dep:backtrace"]
+
 [dependencies]
+backtrace = { version = "0.3", optional = true }
 io-uring = "0.7"
 libc = "0.2"
 slab = "0.4"

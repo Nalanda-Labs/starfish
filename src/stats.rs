@@ -238,8 +238,14 @@ pub struct StallReport {
     pub duration: Duration,
     /// The scheduling group whose task was running.
     pub group: String,
-    /// The call stack while the shard was stalled, one line per frame, as
-    /// `module(function+offset) [address]`. Empty unless
+    /// The call stack while the shard was stalled, innermost function
+    /// first, one line per function: its name and, where the program was
+    /// built with debug information, `at file:line`. A function inlined
+    /// into its caller has a line of its own. Where nothing is known about
+    /// an address, or the crate was built without its `symbols` feature,
+    /// the line is `module(+offset) [address]` instead.
+    ///
+    /// Empty unless
     /// [`Runtime::stall_backtraces`](crate::Runtime::stall_backtraces) is
     /// on and the stall lasted long enough to be caught in the act.
     pub backtrace: Vec<String>,

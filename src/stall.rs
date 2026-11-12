@@ -84,21 +84,61 @@ extern "C" fn on_tick(_signal: c_int) {
 }
 
 /// Returns the stack recorded during the slice that just ended, if the
-/// timer caught it stalling, as one line per frame.
+/// timer caught it stalling, as one line per frame, innermost first.
+///
+/// With the `symbols` feature each line names the function and, where the
+/// program has debug information, the file and line; a function inlined
+/// into another gets a line of its own. Without it, or for an address
+/// nothing is known about, the line is what the C library makes of the
+/// address: the module, an offset and the address.
+///
+/// The frames of the signal handler itself, which are on top of every
+/// recorded stack, are left out.
 pub(crate) fn take_backtrace() -> Vec<String> {
     let depth = DEPTH.try_with(|depth| depth.replace(0)).unwrap_or(0);
     if depth <= 0 {
         return Vec::new();
     }
     let frames = FRAMES.try_with(Cell::get).unwrap_or([std::ptr::null_mut(); MAX_FRAMES]);
-    // SAFETY: `frames` holds `depth` addresses written by `backtrace`. The
-    // result is one malloc'd block of `depth` C strings, freed below.
-    unsafe {
-        let symbols = libc::backtrace_symbols(frames.as_ptr(), depth);
-        if symbols.is_null() {
-            return Vec::new();
+    let depth = usize::try_from(depth).unwrap_or(0).min(MAX_FRAMES);
+    let raw = raw_lines(&frames, depth);
+    let mut lines = Vec::with_capacity(depth);
+    // Where the interrupted code begins. The handler's frames are on top,
+    // and the frame after the last of them is the kernel's trampoline into
+    // the handler, which has no name to go by.
+    let mut handler_frame = None;
+    let mut starts = Vec::with_capacity(depth);
+    for (index, (address, raw)) in frames.iter().zip(raw).enumerate() {
+        starts.push(lines.len());
+        describe(*address, raw, &mut lines);
+        let from = starts.last().copied().unwrap_or(0);
+        let of_handler = lines.iter().skip(from).any(|line| line.contains("stall::on_tick"));
+        if of_handler && index < HANDLER_FRAMES {
+            handler_frame = Some(index);
         }
-        let lines = (0..usize::try_from(depth).unwrap_or(0))
+    }
+    if let Some(frame) = handler_frame {
+        let interrupted = starts.get(frame.saturating_add(2)).copied().unwrap_or(lines.len());
+        lines.drain(..interrupted);
+    }
+    lines
+}
+
+/// How far down the stack the signal handler's own frames can reach: the
+/// handler and whatever of it was not inlined.
+const HANDLER_FRAMES: usize = 8;
+
+/// What the C library says about each of the first `depth` addresses: the
+/// module, the nearest exported symbol if there is one, and the address.
+fn raw_lines(frames: &[*mut c_void; MAX_FRAMES], depth: usize) -> Vec<String> {
+    // SAFETY: `frames` holds at least `depth` addresses. The result is one
+    // malloc'd block of `depth` C strings, freed below.
+    unsafe {
+        let symbols = libc::backtrace_symbols(frames.as_ptr(), depth as c_int);
+        if symbols.is_null() {
+            return vec![String::new(); depth];
+        }
+        let lines = (0..depth)
             .map(|index| {
                 let line = *symbols.add(index);
                 if line.is_null() {
@@ -111,6 +151,44 @@ pub(crate) fn take_backtrace() -> Vec<String> {
         libc::free(symbols.cast());
         lines
     }
+}
+
+/// Appends the description of one frame to `lines`: a line per function at
+/// that address, the innermost inlined one first, or `raw` if the address
+/// cannot be resolved.
+#[cfg(feature = "symbols")]
+fn describe(address: *mut c_void, raw: String, lines: &mut Vec<String>) {
+    let before = lines.len();
+    // A frame's address is where its call returns to, which may already be
+    // the next line of the source. The byte before it is inside the call.
+    let inside = address.wrapping_byte_sub(1);
+    backtrace::resolve(inside, |symbol| {
+        let Some(name) = symbol.name() else { return };
+        // The alternate form leaves the hash off the end of a Rust name.
+        let mut line = format!("{name:#}");
+        if let (Some(file), Some(number)) = (symbol.filename(), symbol.lineno()) {
+            line.push_str(&format!(" at {}:{number}", file.display()));
+        }
+        lines.push(line);
+    });
+    if lines.len() == before {
+        lines.push(raw);
+    }
+}
+
+/// Appends the description of one frame to `lines`: what the C library
+/// made of it.
+#[cfg(not(feature = "symbols"))]
+fn describe(_address: *mut c_void, raw: String, lines: &mut Vec<String>) {
+    lines.push(raw);
+}
+
+/// Loads what resolving addresses needs (the program's symbol tables and
+/// debug information), so that the first stall report does not pay for it
+/// in the middle of serving requests.
+fn warm_symbols() {
+    #[cfg(feature = "symbols")]
+    backtrace::resolve(on_tick as *mut c_void, |_| {});
 }
 
 /// One shard's periodic timer, which interrupts the shard's thread so that
@@ -141,6 +219,7 @@ impl StallTimer {
             unsafe {
                 let mut warm = [std::ptr::null_mut(); 1];
                 libc::backtrace(warm.as_mut_ptr(), 1);
+                warm_symbols();
                 let mut action: libc::sigaction = std::mem::zeroed();
                 action.sa_sigaction = on_tick as extern "C" fn(c_int) as usize;
                 action.sa_flags = libc::SA_RESTART;

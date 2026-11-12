@@ -993,6 +993,17 @@ fn stalls_are_counted_and_reported_with_a_backtrace() {
     // Caught in the act: the stack is the test binary's, several frames deep.
     assert!(report.backtrace.len() > 3, "{report:?}");
     assert!(report.backtrace.iter().any(|frame| frame.contains("basic")), "{report:?}");
+    if cfg!(feature = "symbols") {
+        // By name, and without the signal handler's own frames.
+        let culprit = report.backtrace.iter().find(|frame| frame.contains("hog_the_cpu_for_a_while"));
+        let culprit = culprit.unwrap_or_else(|| panic!("the culprit is not named: {report:?}"));
+        // With the place in the source where there is debug information,
+        // which the release profile leaves out.
+        if cfg!(debug_assertions) {
+            assert!(culprit.contains("basic.rs:"), "{culprit}");
+        }
+        assert!(!report.backtrace.iter().any(|frame| frame.contains("on_tick")), "{report:?}");
+    }
 }
 
 #[test]

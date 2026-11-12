@@ -1962,10 +1962,19 @@ fn main() -> starfish::Result<()> {
 
 - A stall is noticed after it is over, from how long the slice took. A
   shard that never comes back is never reported.
-- Backtraces are raw: one line per frame with the module, an offset and
-  an address, and a function name only where the dynamic symbol table
-  has one. For names, link with `-rdynamic` or translate the addresses
-  with `addr2line`.
+- A backtrace names each function, innermost first, with a line of its
+  own for a function inlined into its caller. File and line numbers
+  appear only if the program was built with debug information
+  (`debug = true` or `"line-tables-only"` in the profile), which release
+  builds leave out by default. Names come from the `symbols` feature of
+  the crate, which is on by default; without it, and for addresses in
+  libraries without symbols, a line is the module, an offset and the
+  address.
+- Turning an address into a name reads the program's debug information,
+  which is loaded when the runtime starts (with backtraces on) so that
+  the first report does not pay for it. Each report then takes some
+  microseconds per frame, on the shard that stalled, before the handler
+  is called.
 - With backtraces on, every shard thread is interrupted by a signal
   (`SIGRTMIN + 5`) once per threshold, all the time. That is cheap but
   not free, and it installs a process-wide handler.
