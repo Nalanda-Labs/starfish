@@ -11,10 +11,11 @@
 //! `Send`: to coordinate across shards, keep one per shard in a
 //! [`Sharded`](crate::Sharded) service.
 //!
-//! The exceptions are [`shared_spsc`] and [`shared_mpsc`], whose ends
-//! live on different shards: bounded queues that carry a stream of values
-//! from one shard, or from several, to another, and slow a sender down
-//! when the receiver falls behind.
+//! The exceptions are [`shared_spsc`], [`shared_mpsc`] and
+//! [`shared_mpmc`], whose ends live on different shards: bounded queues
+//! that carry a stream of values from one shard, or from several, to
+//! another, or to whichever of several is free, and slow a sender down
+//! when the receivers fall behind.
 //!
 //! None of this needs a running runtime.
 
@@ -29,7 +30,8 @@ use crate::error::{Error, Result};
 use crate::runtime::{wake_quietly, Local};
 
 pub use crate::shared_channel::{
-    shared_spsc, shared_mpsc, SharedMpscReceiver, SharedMpscSender, SharedSpscReceiver, SharedSpscSender,
+    shared_mpmc, shared_mpsc, shared_spsc, SharedMpmcReceiver, SharedMpmcSender, SharedMpscReceiver,
+    SharedMpscSender, SharedSpscReceiver, SharedSpscSender,
 };
 
 /// A task waiting for permits: how many it asked for, and how to wake it.

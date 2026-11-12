@@ -620,11 +620,78 @@ async fn collect() -> starfish::Result<u64> {
   the original that the clones were made from.
 - The receiver takes from the senders in turn. A sender that produces
   faster than the others gets no more than its turn, and waits.
-- One receiver. There is no way to have several shards take from one
-  queue.
+- One receiver. For several shards taking from one queue, see the next
+  section.
 - As with `shared_spsc`, a value queued just as the receiver is
   dropped is lost without an error, and the capacity is rounded up to a
   power of two, at least 2.
+
+## To whichever of several shards is free
+
+[`shared_mpmc`](crate::sync::shared_mpmc) has any number of senders and
+any number of receivers, and each value goes to exactly one receiver:
+whichever asks first. It is the channel for sharing work out between
+shards, where it does not matter which of them does a job as long as one
+that is free does.
+
+```rust,no_run
+use starfish::sync::shared_mpmc;
+use starfish::{shard_count, spawn, submit_to};
+
+async fn process(jobs: Vec<Vec<u8>>) -> starfish::Result<usize> {
+    let (sender, receiver) = shared_mpmc::<Vec<u8>>(64);
+    let mut workers = Vec::new();
+    for shard in 0..shard_count()? {
+        let receiver = receiver.clone();
+        workers.push(spawn(submit_to(shard, move || async move {
+            let mut bytes = 0;
+            while let Some(job) = receiver.recv().await {
+                bytes += job.len(); // stands for the work
+            }
+            bytes
+        })));
+    }
+    drop(receiver);
+    for job in jobs {
+        if sender.send(job).await.is_err() {
+            break; // every worker is gone
+        }
+    }
+    // The workers' loops end when every sender is gone.
+    drop(sender);
+    let mut total = 0;
+    for worker in workers {
+        total += worker.await??;
+    }
+    Ok(total)
+}
+```
+
+Both ends take `&self` and can be cloned, so an end can be shared by
+several tasks of a shard as well as sent to other shards. Tasks that wait,
+for a value or for room, are served longest wait first, and `recv` can be
+dropped at any moment without losing a value.
+
+**Caveats**
+
+- It is one queue behind one lock, where the other two cross-shard
+  channels never lock. The lock is held for the moment it takes to add or
+  remove a value, which is cheap while the channel is lightly used; shards
+  that all use one channel heavily contend for it, and a shard that has to
+  wait for the lock does nothing else meanwhile. Use it to hand out jobs,
+  not for every packet. Where each value has an obvious destination, a
+  [`shared_spsc`](crate::sync::shared_spsc) per destination scales
+  better.
+- The order values are queued in is the order they are taken in, but with
+  several receivers that says nothing about the order they are finished
+  in.
+- The receivers' loops end only when every sender is gone, and senders
+  fail only when every receiver is gone: remember to drop the originals
+  that the clones were made from.
+- When the last receiver is dropped, values still queued are dropped with
+  it, without an error to whoever sent them.
+- This is not work stealing: a job is taken by the shard that asks, and
+  stays there. Nothing moves a task that is already running.
 
 # Semaphores
 
@@ -2082,6 +2149,5 @@ the pieces fit.
 - Networking uses the kernel's stack. There is no userspace TCP.
 - No TLS, no HTTP, no DNS resolution: addresses are `SocketAddr`s.
 - No calls for links or for changing permissions.
-- No cross-shard channel with several receivers.
 - No work stealing or load balancing between shards.
 - Only Linux on x86-64.

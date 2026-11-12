@@ -1958,6 +1958,67 @@ fn files_are_read_and_written_in_order_through_a_cursor() {
 }
 
 #[test]
+fn work_is_shared_out_between_shards_through_one_queue() {
+    use starfish::sync::shared_mpmc;
+
+    rt(4)
+        .run(|| async {
+            let (sender, receiver) = shared_mpmc::<u64>(8);
+            // A worker on every shard, and two producers on two shards.
+            let mut workers = Vec::new();
+            for shard in 0..4 {
+                let receiver = receiver.clone();
+                workers.push(spawn(submit_to(shard, move || async move {
+                    let (mut sum, mut seen) = (0u64, 0u64);
+                    while let Some(value) = receiver.recv().await {
+                        sum += value;
+                        seen += 1;
+                        if value % 64 == 0 {
+                            // A slow job now and then: the others go on.
+                            sleep(Duration::from_micros(200)).await;
+                        }
+                    }
+                    (sum, seen)
+                })));
+            }
+            drop(receiver);
+            let mut producers = Vec::new();
+            for shard in [1, 2] {
+                let sender = sender.clone();
+                producers.push(spawn(submit_to(shard, move || async move {
+                    for value in 0..5000u64 {
+                        sender.send(value).await.unwrap();
+                    }
+                })));
+            }
+            drop(sender);
+            for producer in producers {
+                producer.await.unwrap().unwrap();
+            }
+            let (mut sum, mut seen, mut idle) = (0, 0, 0);
+            for worker in workers {
+                let (part, count) = worker.await.unwrap().unwrap();
+                sum += part;
+                seen += count;
+                idle += usize::from(count == 0);
+            }
+            // Every value once, and no shard left out of the work.
+            assert_eq!(seen, 10_000);
+            assert_eq!(sum, 2 * (5000 * 4999 / 2));
+            assert_eq!(idle, 0);
+
+            // A receiver that gives up waiting loses nothing.
+            let (sender, receiver) = shared_mpmc::<u32>(1);
+            assert!(timeout(Duration::from_millis(5), receiver.recv()).await.is_err());
+            sender.send(9).await.unwrap();
+            assert_eq!(receiver.recv().await, Some(9));
+            drop(receiver);
+            assert_eq!(sender.send(10).await.unwrap_err().0, 10);
+        })
+        .unwrap();
+}
+
+#[test]
 fn a_directory_can_be_listed_a_part_at_a_time() {
     use starfish::fs::{create_dir, read_dir, remove_dir_all, ReadDir};
 

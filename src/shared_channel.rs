@@ -15,6 +15,7 @@
 //! either the waiter finds the change on its second look, or the other end
 //! finds the announcement and wakes it.
 
+use std::collections::VecDeque;
 use std::future::poll_fn;
 use std::sync::atomic::{fence, AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -587,10 +588,489 @@ impl<T> Drop for SharedMpscReceiver<T> {
     }
 }
 
+/// What the ends of a [`shared_mpmc`] share: the queue and everything
+/// that decides who waits, behind one lock.
+struct MpmcState<T> {
+    queue: VecDeque<T>,
+    /// Sending ends alive.
+    senders: usize,
+    /// Receiving ends alive.
+    receivers: usize,
+    /// Tasks waiting for room, longest wait first, each under the number it
+    /// was given when it began to wait.
+    send_waiters: VecDeque<(u64, Waker)>,
+    /// Tasks waiting for a value, longest wait first.
+    recv_waiters: VecDeque<(u64, Waker)>,
+    next_waiter: u64,
+}
+
+impl<T> MpmcState<T> {
+    /// Puts a task in the queue of waiters, or, if it is there already,
+    /// replaces its waker and leaves its place as it is. Returns the number
+    /// it waits under.
+    fn wait(waiters: &mut VecDeque<(u64, Waker)>, next: &mut u64, id: Option<u64>, waker: &Waker) -> u64 {
+        if let Some(id) = id {
+            if let Some(entry) = waiters.iter_mut().find(|entry| entry.0 == id) {
+                // Replaced, not dropped under the lock: wakers are the
+                // runtime's own and dropping one takes no lock.
+                entry.1.clone_from(waker);
+                return id;
+            }
+        }
+        let id = *next;
+        *next = next.wrapping_add(1);
+        waiters.push_back((id, waker.clone()));
+        id
+    }
+
+    /// Takes a task out of a queue of waiters. Returns whether it was
+    /// there; if it was not, it had been woken.
+    fn leave(waiters: &mut VecDeque<(u64, Waker)>, id: u64) -> bool {
+        match waiters.iter().position(|entry| entry.0 == id) {
+            Some(place) => {
+                waiters.remove(place);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// A [`shared_mpmc`] channel: its state behind the lock, and its capacity.
+struct Mpmc<T> {
+    state: Mutex<MpmcState<T>>,
+    capacity: usize,
+}
+
+impl<T> Mpmc<T> {
+    /// Locks the state, recovering it if a thread panicked while holding
+    /// the lock. Nothing of the application's runs under the lock, so that
+    /// cannot leave it inconsistent.
+    fn lock(&self) -> std::sync::MutexGuard<'_, MpmcState<T>> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Queues a value if there is room and a receiver. On success returns
+    /// the receiver to wake, if one waits.
+    fn push(&self, value: T) -> std::result::Result<Option<Waker>, TrySendError<T>> {
+        let mut state = self.lock();
+        if state.receivers == 0 {
+            return Err(TrySendError::Closed(value));
+        }
+        if state.queue.len() >= self.capacity {
+            return Err(TrySendError::Full(value));
+        }
+        state.queue.push_back(value);
+        Ok(state.recv_waiters.pop_front().map(|entry| entry.1))
+    }
+
+    /// Takes the oldest value, with the sender to wake if one waits for
+    /// room. `Err(true)` if there is none and never will be.
+    fn pop(&self) -> std::result::Result<(T, Option<Waker>), bool> {
+        let mut state = self.lock();
+        match state.queue.pop_front() {
+            Some(value) => Ok((value, state.send_waiters.pop_front().map(|entry| entry.1))),
+            None => Err(state.senders == 0),
+        }
+    }
+}
+
+/// A task's place among those waiting on a [`shared_mpmc`], given up when
+/// the wait ends, however it ends.
+///
+/// A wake-up is meant for one task. If that task's future is dropped after
+/// it was woken but before it ran, the wake-up would be lost and a value,
+/// or a free place, would sit unnoticed while others wait. So a wait that
+/// ends without having taken what it was woken for passes the wake-up on.
+struct MpmcWait<'a, T> {
+    channel: &'a Mpmc<T>,
+    /// The number this task waits under, once it has had to wait.
+    id: Option<u64>,
+    /// Waiting for a value, as opposed to for room.
+    receiving: bool,
+}
+
+impl<T> MpmcWait<'_, T> {
+    /// Ends the wait without passing anything on: the task got what it
+    /// waited for, or learnt that it never will.
+    fn finish(&mut self) {
+        let Some(id) = self.id.take() else { return };
+        let mut state = self.channel.lock();
+        let waiters = if self.receiving {
+            &mut state.recv_waiters
+        } else {
+            &mut state.send_waiters
+        };
+        MpmcState::<T>::leave(waiters, id);
+    }
+}
+
+impl<T> Drop for MpmcWait<'_, T> {
+    /// Leaves the queue of waiters. If this task had been woken and is going
+    /// away without acting on it, wakes the next one in its place.
+    fn drop(&mut self) {
+        let Some(id) = self.id.take() else { return };
+        let next = {
+            let mut state = self.channel.lock();
+            if self.receiving {
+                let was_waiting = MpmcState::<T>::leave(&mut state.recv_waiters, id);
+                if was_waiting || state.queue.is_empty() {
+                    None
+                } else {
+                    state.recv_waiters.pop_front()
+                }
+            } else {
+                let was_waiting = MpmcState::<T>::leave(&mut state.send_waiters, id);
+                if was_waiting || state.queue.len() >= self.channel.capacity {
+                    None
+                } else {
+                    state.send_waiters.pop_front()
+                }
+            }
+        };
+        if let Some((_, waker)) = next {
+            wake_quietly(waker);
+        }
+    }
+}
+
+/// Creates a queue between any number of senders and any number of
+/// receivers, on any shards: each value sent is received by exactly one
+/// receiver, whichever asks first.
+///
+/// This is the channel for sharing work out: several shards feed it,
+/// several take from it, and a value goes to a receiver that is free. It
+/// holds at most `capacity` values (at least 1); a sender that finds it
+/// full waits, and a receiver that finds it empty waits. Both ends can be
+/// cloned and sent to other shards, and an end can also be shared by
+/// several tasks of one shard, since sending and receiving take `&self`.
+///
+/// Values arrive in the order they were queued, though with several
+/// receivers that says little about the order they are handled in. Waiting
+/// tasks are served longest wait first.
+///
+/// Unlike [`shared_spsc`] and [`shared_mpsc`], which never lock, this
+/// channel is one queue behind one lock, taken for the moment it takes to
+/// add or remove a value. That is what lets any receiver take any value,
+/// and it is cheap while the channel is lightly used, but shards that use
+/// one channel heavily contend for the lock. Where each value has an
+/// obvious destination, a queue per destination scales better.
+///
+/// ```no_run
+/// use starfish::sync::shared_mpmc;
+/// use starfish::{shard_count, spawn, submit_to};
+///
+/// # async fn example(jobs: Vec<String>) -> starfish::Result<()> {
+/// // One worker on every shard; each job goes to whichever is free.
+/// let (sender, receiver) = shared_mpmc::<String>(128);
+/// let mut workers = Vec::new();
+/// for shard in 0..shard_count()? {
+///     let receiver = receiver.clone();
+///     workers.push(spawn(submit_to(shard, move || async move {
+///         let mut done = 0;
+///         while let Some(job) = receiver.recv().await {
+///             // ... do the job ...
+///             done += job.len();
+///         }
+///         done
+///     })));
+/// }
+/// drop(receiver);
+/// for job in jobs {
+///     if sender.send(job).await.is_err() {
+///         break; // every worker is gone
+///     }
+/// }
+/// // The workers' loops end when every sender is gone.
+/// drop(sender);
+/// for worker in workers {
+///     worker.await??;
+/// }
+/// # Ok(())
+/// # }
+/// ```
+pub fn shared_mpmc<T: Send>(capacity: usize) -> (SharedMpmcSender<T>, SharedMpmcReceiver<T>) {
+    let channel = Arc::new(Mpmc {
+        state: Mutex::new(MpmcState {
+            queue: VecDeque::new(),
+            senders: 1,
+            receivers: 1,
+            send_waiters: VecDeque::new(),
+            recv_waiters: VecDeque::new(),
+            next_waiter: 0,
+        }),
+        capacity: capacity.max(1),
+    });
+    let sender = SharedMpmcSender {
+        channel: channel.clone(),
+    };
+    (sender, SharedMpmcReceiver { channel })
+}
+
+/// A sending end of a [`shared_mpmc`].
+///
+/// Clone it for every further producer; a clone can go to another shard.
+/// Dropping the last one ends the receivers' streams, once they have taken
+/// what is still queued.
+pub struct SharedMpmcSender<T> {
+    channel: Arc<Mpmc<T>>,
+}
+
+impl<T> SharedMpmcSender<T> {
+    /// Queues `value`, waiting for room if the channel is full.
+    ///
+    /// Dropping the future before it completes drops the value without
+    /// sending it.
+    ///
+    /// # Errors
+    ///
+    /// Hands the value back if every receiver has been dropped, before or
+    /// during the wait.
+    pub async fn send(&self, value: T) -> std::result::Result<(), SendError<T>> {
+        let mut value = Some(value);
+        let mut wait = MpmcWait {
+            channel: &*self.channel,
+            id: None,
+            receiving: false,
+        };
+        poll_fn(|cx| {
+            // Nothing left to send: the future already completed.
+            let Some(unsent) = value.take() else { return Poll::Pending };
+            match self.channel.push(unsent) {
+                Ok(receiver) => {
+                    wait.finish();
+                    if let Some(receiver) = receiver {
+                        wake_quietly(receiver);
+                    }
+                    Poll::Ready(Ok(()))
+                }
+                Err(TrySendError::Closed(unsent)) => {
+                    wait.finish();
+                    Poll::Ready(Err(SendError(unsent)))
+                }
+                Err(TrySendError::Full(unsent)) => {
+                    // Checked again under the same lock that registers the
+                    // wait, so room made in between is not missed.
+                    let mut state = self.channel.lock();
+                    if state.receivers == 0 {
+                        drop(state);
+                        wait.finish();
+                        return Poll::Ready(Err(SendError(unsent)));
+                    }
+                    if state.queue.len() < self.channel.capacity {
+                        state.queue.push_back(unsent);
+                        let receiver = state.recv_waiters.pop_front();
+                        drop(state);
+                        wait.finish();
+                        if let Some((_, receiver)) = receiver {
+                            wake_quietly(receiver);
+                        }
+                        return Poll::Ready(Ok(()));
+                    }
+                    let state = &mut *state;
+                    wait.id = Some(MpmcState::<T>::wait(
+                        &mut state.send_waiters,
+                        &mut state.next_waiter,
+                        wait.id,
+                        cx.waker(),
+                    ));
+                    value = Some(unsent);
+                    Poll::Pending
+                }
+            }
+        })
+        .await
+    }
+
+    /// Queues `value` if the channel has room right now. It does not join
+    /// the tasks waiting in [`send`](Self::send), so it can take a place
+    /// ahead of them.
+    ///
+    /// # Errors
+    ///
+    /// Hands the value back as [`TrySendError::Full`] if the channel is
+    /// full, and as [`TrySendError::Closed`] if every receiver has been
+    /// dropped.
+    pub fn try_send(&self, value: T) -> std::result::Result<(), TrySendError<T>> {
+        let receiver = self.channel.push(value)?;
+        if let Some(receiver) = receiver {
+            wake_quietly(receiver);
+        }
+        Ok(())
+    }
+
+    /// Whether every receiver has been dropped, in which case nothing sent
+    /// from now on can arrive.
+    pub fn is_closed(&self) -> bool {
+        self.channel.lock().receivers == 0
+    }
+}
+
+impl<T> Clone for SharedMpmcSender<T> {
+    /// Makes another sending end of the same channel.
+    fn clone(&self) -> Self {
+        let mut state = self.channel.lock();
+        state.senders = state.senders.saturating_add(1);
+        drop(state);
+        SharedMpmcSender {
+            channel: self.channel.clone(),
+        }
+    }
+}
+
+impl<T> Drop for SharedMpmcSender<T> {
+    /// Counts the sender out. If it was the last, wakes every waiting
+    /// receiver, so that each learns the stream has ended once the queue is
+    /// empty.
+    fn drop(&mut self) {
+        let waiting = {
+            let mut state = self.channel.lock();
+            state.senders = state.senders.saturating_sub(1);
+            if state.senders == 0 {
+                std::mem::take(&mut state.recv_waiters)
+            } else {
+                VecDeque::new()
+            }
+        };
+        for (_, waker) in waiting {
+            wake_quietly(waker);
+        }
+    }
+}
+
+/// A receiving end of a [`shared_mpmc`].
+///
+/// Clone it for every further consumer; a clone can go to another shard.
+/// Dropping the last one closes the channel: senders get their values
+/// back, and values still queued are dropped.
+pub struct SharedMpmcReceiver<T> {
+    channel: Arc<Mpmc<T>>,
+}
+
+impl<T> SharedMpmcReceiver<T> {
+    /// Takes the oldest value, waiting for one if the channel is empty.
+    /// Returns `None` once the channel is empty and every sender has been
+    /// dropped.
+    ///
+    /// Dropping the future loses nothing: a value is only taken at the
+    /// moment the call returns it, and a wake-up this task does not use is
+    /// passed to the next receiver.
+    pub async fn recv(&self) -> Option<T> {
+        let mut wait = MpmcWait {
+            channel: &*self.channel,
+            id: None,
+            receiving: true,
+        };
+        poll_fn(|cx| {
+            let ended = match self.channel.pop() {
+                Ok((value, sender)) => {
+                    wait.finish();
+                    if let Some(sender) = sender {
+                        wake_quietly(sender);
+                    }
+                    return Poll::Ready(Some(value));
+                }
+                Err(ended) => ended,
+            };
+            if ended {
+                wait.finish();
+                return Poll::Ready(None);
+            }
+            // Checked again under the same lock that registers the wait, so
+            // a value queued in between is not missed.
+            let mut state = self.channel.lock();
+            if let Some(value) = state.queue.pop_front() {
+                let sender = state.send_waiters.pop_front();
+                drop(state);
+                wait.finish();
+                if let Some((_, sender)) = sender {
+                    wake_quietly(sender);
+                }
+                return Poll::Ready(Some(value));
+            }
+            if state.senders == 0 {
+                drop(state);
+                wait.finish();
+                return Poll::Ready(None);
+            }
+            let state = &mut *state;
+            wait.id = Some(MpmcState::<T>::wait(
+                &mut state.recv_waiters,
+                &mut state.next_waiter,
+                wait.id,
+                cx.waker(),
+            ));
+            Poll::Pending
+        })
+        .await
+    }
+
+    /// Takes the oldest value if there is one right now. `None` means the
+    /// channel is empty at the moment, not that it has ended.
+    pub fn try_recv(&self) -> Option<T> {
+        let (value, sender) = self.channel.pop().ok()?;
+        if let Some(sender) = sender {
+            wake_quietly(sender);
+        }
+        Some(value)
+    }
+
+    /// Number of values queued at this moment. With other shards sending
+    /// and receiving, it may be out of date as soon as it is returned.
+    pub fn len(&self) -> usize {
+        self.channel.lock().queue.len()
+    }
+
+    /// Whether nothing is queued at this moment.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl<T> Clone for SharedMpmcReceiver<T> {
+    /// Makes another receiving end of the same channel.
+    fn clone(&self) -> Self {
+        let mut state = self.channel.lock();
+        state.receivers = state.receivers.saturating_add(1);
+        drop(state);
+        SharedMpmcReceiver {
+            channel: self.channel.clone(),
+        }
+    }
+}
+
+impl<T> Drop for SharedMpmcReceiver<T> {
+    /// Counts the receiver out. If it was the last, the channel is closed:
+    /// every waiting sender is woken to take its value back, and the values
+    /// still queued are dropped.
+    fn drop(&mut self) {
+        let (waiting, unreceived) = {
+            let mut state = self.channel.lock();
+            state.receivers = state.receivers.saturating_sub(1);
+            if state.receivers == 0 {
+                (
+                    std::mem::take(&mut state.send_waiters),
+                    std::mem::take(&mut state.queue),
+                )
+            } else {
+                (VecDeque::new(), VecDeque::new())
+            }
+        };
+        // Outside the lock: dropping a value may run code of the
+        // application's.
+        drop(unreceived);
+        for (_, waker) in waiting {
+            wake_quietly(waker);
+        }
+    }
+}
+
 debug_impl!(<T> SharedSpscSender<T>);
 debug_impl!(<T> SharedSpscReceiver<T>);
 debug_impl!(<T> SharedMpscSender<T>);
 debug_impl!(<T> SharedMpscReceiver<T>, "senders" => |receiver| receiver.lanes.len());
+debug_impl!(<T> SharedMpmcSender<T>);
+debug_impl!(<T> SharedMpmcReceiver<T>);
 
 #[cfg(test)]
 #[allow(
@@ -871,5 +1351,175 @@ mod tests {
             thread.join().unwrap();
         }
         assert_eq!(received, producers * values);
+    }
+
+    #[test]
+    fn several_receivers_share_one_queue_in_order() {
+        let (sender, receiver) = shared_mpmc(2);
+        let other = receiver.clone();
+        sender.try_send(1).unwrap();
+        sender.try_send(2).unwrap();
+        assert!(matches!(sender.try_send(3), Err(TrySendError::Full(3))));
+        assert_eq!(receiver.len(), 2);
+        // Either end takes the oldest value.
+        assert_eq!(other.try_recv(), Some(1));
+        assert_eq!(receiver.try_recv(), Some(2));
+        assert_eq!(other.try_recv(), None);
+        assert!(receiver.is_empty());
+
+        // A waiting sender is woken by a receive, on either end.
+        sender.try_send(3).unwrap();
+        sender.try_send(4).unwrap();
+        let (wakes, waker) = counting_waker();
+        {
+            let mut send = pin!(sender.send(5));
+            assert!(poll(send.as_mut(), &waker).is_pending());
+            assert_eq!(other.try_recv(), Some(3));
+            assert_eq!(count(&wakes), 1);
+            assert!(matches!(poll(send.as_mut(), &waker), Poll::Ready(Ok(()))));
+        }
+        assert_eq!(receiver.try_recv(), Some(4));
+        assert_eq!(receiver.try_recv(), Some(5));
+
+        // The stream ends for every receiver when the last sender goes,
+        // after what is queued.
+        let second = sender.clone();
+        drop(sender);
+        second.try_send(6).unwrap();
+        let (wakes, waker) = counting_waker();
+        {
+            let mut first = pin!(receiver.recv());
+            assert!(matches!(poll(first.as_mut(), &waker), Poll::Ready(Some(6))));
+            let mut waiting = pin!(other.recv());
+            assert!(poll(waiting.as_mut(), &waker).is_pending());
+            drop(second);
+            assert_eq!(count(&wakes), 1);
+            assert!(matches!(poll(waiting.as_mut(), &waker), Poll::Ready(None)));
+        }
+        assert!(block_on(receiver.recv()).is_none());
+    }
+
+    #[test]
+    fn a_wake_up_nobody_uses_is_passed_on() {
+        let (sender, receiver) = shared_mpmc::<u32>(1);
+        let other = receiver.clone();
+        let (first_wakes, first_waker) = counting_waker();
+        let (second_wakes, second_waker) = counting_waker();
+        let mut second = pin!(other.recv());
+        {
+            let mut first = pin!(receiver.recv());
+            assert!(poll(first.as_mut(), &first_waker).is_pending());
+            assert!(poll(second.as_mut(), &second_waker).is_pending());
+            // The value wakes the one that has waited longest, and only it.
+            sender.try_send(1).unwrap();
+            assert_eq!((count(&first_wakes), count(&second_wakes)), (1, 0));
+            // It goes away without taking the value: the next one is woken.
+        }
+        assert_eq!(count(&second_wakes), 1);
+        assert!(matches!(poll(second.as_mut(), &second_waker), Poll::Ready(Some(1))));
+
+        // The same for senders waiting for room.
+        sender.try_send(2).unwrap();
+        let again = sender.clone();
+        let mut later = pin!(again.send(4));
+        {
+            let mut sooner = pin!(sender.send(3));
+            assert!(poll(sooner.as_mut(), &first_waker).is_pending());
+            assert!(poll(later.as_mut(), &second_waker).is_pending());
+            assert_eq!(receiver.try_recv(), Some(2));
+            assert_eq!((count(&first_wakes), count(&second_wakes)), (2, 1));
+        }
+        assert_eq!(count(&second_wakes), 2);
+        assert!(matches!(poll(later.as_mut(), &second_waker), Poll::Ready(Ok(()))));
+        assert_eq!(receiver.try_recv(), Some(4));
+
+        // A wait that is given up before any wake-up passes nothing on.
+        {
+            let mut idle = pin!(receiver.recv());
+            assert!(poll(idle.as_mut(), &first_waker).is_pending());
+        }
+        assert_eq!((count(&first_wakes), count(&second_wakes)), (2, 2));
+    }
+
+    #[test]
+    fn the_last_receiver_closes_the_channel_and_drops_what_is_queued() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        struct Counted(Arc<AtomicUsize>);
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let (sender, receiver) = shared_mpmc(1);
+        let other = receiver.clone();
+        sender.try_send(Counted(dropped.clone())).ok().unwrap();
+        let (wakes, waker) = counting_waker();
+        {
+            let mut send = pin!(sender.send(Counted(dropped.clone())));
+            assert!(poll(send.as_mut(), &waker).is_pending());
+            drop(receiver);
+            // One receiver is left: still open.
+            assert!(!sender.is_closed());
+            assert_eq!(count(&wakes), 0);
+            drop(other);
+            assert_eq!(count(&wakes), 1);
+            assert_eq!(dropped.load(Ordering::Relaxed), 1);
+            // The waiting sender gets its value back.
+            let Poll::Ready(Err(SendError(returned))) = poll(send.as_mut(), &waker) else {
+                panic!("the send should have failed");
+            };
+            drop(returned);
+        }
+        assert_eq!(dropped.load(Ordering::Relaxed), 2);
+        assert!(sender.is_closed());
+        assert!(matches!(sender.try_send(Counted(dropped.clone())), Err(TrySendError::Closed(_))));
+    }
+
+    #[test]
+    fn threads_share_work_without_losing_or_repeating_any() {
+        let values: u64 = if cfg!(miri) { 100 } else { 20_000 };
+        let (producers, consumers) = (4u64, 4);
+        let (sender, receiver) = shared_mpmc(8);
+        let sending: Vec<_> = (0..producers)
+            .map(|producer| {
+                let sender = sender.clone();
+                std::thread::spawn(move || {
+                    block_on(async move {
+                        for value in 0..values {
+                            sender.send(producer * values + value).await.unwrap();
+                        }
+                    });
+                })
+            })
+            .collect();
+        drop(sender);
+        let receiving: Vec<_> = (0..consumers)
+            .map(|_| {
+                let receiver = receiver.clone();
+                std::thread::spawn(move || {
+                    block_on(async move {
+                        let (mut sum, mut seen) = (0u64, 0u64);
+                        while let Some(value) = receiver.recv().await {
+                            sum += value;
+                            seen += 1;
+                        }
+                        (sum, seen)
+                    })
+                })
+            })
+            .collect();
+        drop(receiver);
+        for thread in sending {
+            thread.join().unwrap();
+        }
+        let (mut sum, mut seen) = (0, 0);
+        for thread in receiving {
+            let (part, count) = thread.join().unwrap();
+            sum += part;
+            seen += count;
+        }
+        let total = producers * values;
+        assert_eq!(seen, total);
+        assert_eq!(sum, total * (total - 1) / 2);
     }
 }
