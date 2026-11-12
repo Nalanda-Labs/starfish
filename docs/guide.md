@@ -114,7 +114,8 @@ fn main() -> starfish::Result<()> {
 
 **Caveats**
 
-- Linux 6.0 or later on x86-64 only.
+- Linux 6.0 or later, on a 64-bit processor. It has only been run on
+  x86-64; it builds for AArch64 and RISC-V, untried.
 - io_uring must be available to the process. Some container runtimes block
   it with their default seccomp profile, and it can be switched off
   system-wide (`kernel.io_uring_disabled`). `run` then fails with
@@ -2159,4 +2160,4 @@ the pieces fit.
 - No TLS, no HTTP, no DNS resolution: addresses are `SocketAddr`s.
 - No calls for links or for changing permissions.
 - No work stealing or load balancing between shards.
-- Only Linux on x86-64.
+- Only Linux, and only run on x86-64 so far.

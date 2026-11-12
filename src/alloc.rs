@@ -73,6 +73,18 @@ const GROW_PAGES: usize = 512;
 /// Bytes in one growth step: 2 MiB. Also the alignment of the region and
 /// of the first data page.
 const GROW_BYTES: usize = GROW_PAGES << PAGE_SHIFT;
+/// The step in which the descriptor array is committed: 64 KiB.
+///
+/// The kernel changes access to memory a whole page of its own at a time,
+/// and its page is not always the 4 KiB this allocator counts in: some
+/// AArch64 kernels use 16 or 64 KiB. Committing in steps of the largest of
+/// these, from a start that is a multiple of it, is right for all of them.
+/// (The pages for allocations are committed 2 MiB at a time, which is a
+/// multiple of every page size as well.)
+const COMMIT_STEP: usize = 64 << 10;
+const _: () = assert!(HEADER_BYTES.is_multiple_of(COMMIT_STEP));
+const _: () = assert!(GROW_BYTES.is_multiple_of(COMMIT_STEP));
+
 /// Index of the first page that holds allocations. The pages before it
 /// are the header and the descriptor array; the sum of the two is rounded up
 /// to 2 MiB so that the data pages start on a huge-page boundary. It comes to
@@ -408,6 +420,26 @@ fn reserve_region() -> usize {
     0
 }
 
+/// The kernel's page size, which on some architectures is larger than the
+/// 4 KiB this allocator counts in. Asked of the system once and remembered.
+/// Always a power of two, and 4 KiB if the system will not say.
+fn os_page_size() -> usize {
+    static OS_PAGE: AtomicUsize = AtomicUsize::new(0);
+    let known = OS_PAGE.load(Ordering::Relaxed);
+    if known != 0 {
+        return known;
+    }
+    // SAFETY: a query with no side effects, which does not allocate.
+    let asked = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let size = usize::try_from(asked)
+        .ok()
+        .filter(|size| size.is_power_of_two())
+        .unwrap_or(PAGE)
+        .max(PAGE);
+    OS_PAGE.store(size, Ordering::Relaxed);
+    size
+}
+
 /// Makes `len` bytes at `addr` usable, by giving the pages read and write
 /// permission. Returns whether the kernel agreed. The pages read as zeros
 /// until written, and take up memory only once touched.
@@ -592,7 +624,7 @@ unsafe fn grow(h: *mut Heap, want: usize) -> bool {
     }
     // Descriptors for the new pages first.
     let desc_size = std::mem::size_of::<PageDesc>();
-    let Some(needed) = new_top.wrapping_mul(desc_size).checked_next_multiple_of(PAGE) else {
+    let Some(needed) = new_top.wrapping_mul(desc_size).checked_next_multiple_of(COMMIT_STEP) else {
         return false;
     };
     let committed = (*h).desc_committed;
@@ -870,12 +902,19 @@ unsafe fn free_local(h: *mut Heap, ptr: *mut u8) {
             (*h).allocated_bytes = (*h).allocated_bytes.wrapping_sub(pages << PAGE_SHIFT);
             if pages >= RELEASE_PAGES {
                 // Hand the memory back; the address range stays ours and
-                // reads as zeros when touched again.
-                libc::madvise(
-                    ptr.cast::<libc::c_void>(),
-                    pages << PAGE_SHIFT,
-                    libc::MADV_DONTNEED,
-                );
+                // reads as zeros when touched again. The kernel takes
+                // whole pages of its own size, which may be larger than
+                // ours, so only those that lie entirely inside the span.
+                let mask = os_page_size().wrapping_sub(1);
+                let start = (ptr as usize).wrapping_add(mask) & !mask;
+                let end = (ptr as usize).wrapping_add(pages << PAGE_SHIFT) & !mask;
+                if end > start {
+                    libc::madvise(
+                        start as *mut libc::c_void,
+                        end.wrapping_sub(start),
+                        libc::MADV_DONTNEED,
+                    );
+                }
             }
             free_pages(h, page, pages);
         }
@@ -1050,7 +1089,7 @@ pub(crate) fn enter() -> Option<Entered> {
             (*heap).base = heap as usize;
             (*heap).top = FIRST_DATA_PAGE;
             let first_desc = FIRST_DATA_PAGE.wrapping_mul(std::mem::size_of::<PageDesc>());
-            (*heap).desc_committed = first_desc & !(PAGE - 1);
+            (*heap).desc_committed = first_desc & !(COMMIT_STEP - 1);
         }
         ready.store(true, Ordering::Release);
     }

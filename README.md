@@ -18,8 +18,12 @@ and has not been verified.
 
 ## Requirements
 
-- Linux 6.0 or later, x86-64. (`write_zc` needs 6.0; direct-I/O alignment is
-  read from the kernel from 6.1 and assumed to be 4096 before that.)
+- Linux 6.0 or later. (`write_zc` and `RecvStream` need 6.0; direct-I/O
+  alignment is read from the kernel from 6.1 and assumed to be 4096 before
+  that.)
+- A 64-bit processor. It is developed and tested on x86-64. Nothing in it
+  is specific to a processor and it builds for AArch64 and RISC-V (CI
+  checks the AArch64 build), but it has not been run on either.
 - A filesystem with `O_DIRECT` support for `DmaFile`.
 
 ## Example

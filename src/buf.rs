@@ -604,11 +604,19 @@ impl RecvParts {
             return Err(invalid());
         }
         let entries = count.max(1).checked_next_power_of_two().ok_or_else(invalid)?;
+        // The kernel wants the ring to start on a page of its own size,
+        // which on some architectures is larger than 4 KiB.
+        // SAFETY: a query with no side effects.
+        let os_page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+            .ok()
+            .filter(|size| size.is_power_of_two())
+            .unwrap_or(REGION_ALIGN)
+            .max(REGION_ALIGN);
         let bytes = usize::from(entries)
             .checked_mul(std::mem::size_of::<io_uring::types::BufRingEntry>())
-            .and_then(|bytes| bytes.checked_next_multiple_of(REGION_ALIGN))
+            .and_then(|bytes| bytes.checked_next_multiple_of(os_page))
             .ok_or_else(invalid)?;
-        let layout = Layout::from_size_align(bytes, REGION_ALIGN).map_err(|_| invalid())?;
+        let layout = Layout::from_size_align(bytes, os_page).map_err(|_| invalid())?;
         // SAFETY: the layout has a non-zero size.
         let ptr = unsafe { alloc_zeroed(layout) };
         let ptr = NonNull::new(ptr).ok_or(io::ErrorKind::OutOfMemory)?;

@@ -86,6 +86,9 @@
 // Everything public is documented, and can be printed for debugging.
 #![warn(missing_docs, missing_debug_implementations)]
 
+#[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
+compile_error!("starfish needs Linux (it is built on io_uring) and a 64-bit processor");
+
 /// Implements `Debug` for types whose insides would mean nothing to a
 /// reader: prints the type's name and, where given, a few telling values.
 ///
