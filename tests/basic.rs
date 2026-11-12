@@ -2010,6 +2010,192 @@ fn a_removed_group_frees_its_place_and_its_tasks_carry_on() {
         .unwrap();
 }
 
+/// A connected pair of TCP streams on the loopback interface.
+async fn tcp_pair() -> (TcpStream, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepting = spawn(async move { listener.accept().await.unwrap() });
+    let client = TcpStream::connect(addr).await.unwrap();
+    (client, accepting.await.unwrap())
+}
+
+#[test]
+fn a_receive_stream_hands_over_what_arrives_until_the_peer_closes() {
+    rt(1)
+        .recv_buffers(8, 4096)
+        .run(|| async {
+            let (client, server) = tcp_pair().await;
+            // The server echoes each buffer as it is, then reports the end.
+            let echo = spawn(async move {
+                let mut incoming = server.recv_stream().unwrap();
+                let mut pieces = 0;
+                while let Some(data) = incoming.next().await.unwrap() {
+                    assert!(!data.is_empty() && data.len() <= 4096);
+                    pieces += 1;
+                    let (result, _) = server.write_all(data).await;
+                    result.unwrap();
+                }
+                // The end stays the end.
+                assert!(incoming.next().await.unwrap().is_none());
+                pieces
+            });
+
+            // Far more than the pool holds at once: 1 MiB through 8 buffers.
+            let sent: Vec<u8> = (0..1u32 << 20).map(|i| (i.wrapping_mul(2654435761) >> 24) as u8).collect();
+            let writer = {
+                let sent = sent.clone();
+                let client = Rc::new(client);
+                let writing = client.clone();
+                let task = spawn(async move {
+                    let (result, _) = writing.write_all(sent).await;
+                    result.unwrap();
+                    writing.shutdown(std::net::Shutdown::Write).unwrap();
+                });
+                (client, task)
+            };
+            let (client, writing) = writer;
+            let mut back = Vec::new();
+            loop {
+                let (result, buf) = client.read(Vec::with_capacity(64 << 10)).await;
+                if result.unwrap() == 0 {
+                    break;
+                }
+                back.extend_from_slice(&buf);
+            }
+            writing.await.unwrap();
+            assert!(back == sent, "the echo differs from what was sent");
+            assert!(echo.await.unwrap() >= 256);
+        })
+        .unwrap();
+}
+
+#[test]
+fn receive_streams_wait_while_every_buffer_is_held() {
+    rt(1)
+        .recv_buffers(2, 4096)
+        .run(|| async {
+            let (client, server) = tcp_pair().await;
+            let (result, _) = client.write_all(vec![7u8; 5 * 4096]).await;
+            result.unwrap();
+            let mut incoming = server.recv_stream().unwrap();
+            let first = incoming.next().await.unwrap().unwrap();
+            let second = incoming.next().await.unwrap().unwrap();
+            let mut received = first.len() + second.len();
+            // Both buffers are held: nothing more can arrive, however long
+            // the wait. Giving up on the wait loses nothing.
+            assert!(timeout(Duration::from_millis(30), incoming.next()).await.is_err());
+            drop(first);
+            // One buffer back is enough for the stream to go on.
+            let third = incoming.next().await.unwrap().unwrap();
+            received += third.len();
+            assert!(third.iter().all(|&byte| byte == 7));
+            drop(second);
+            drop(third);
+            while received < 5 * 4096 {
+                received += incoming.next().await.unwrap().unwrap().len();
+            }
+            assert_eq!(received, 5 * 4096);
+
+            // A second stream on another connection shares the pool.
+            let (other_client, other_server) = tcp_pair().await;
+            let mut other = other_server.recv_stream().unwrap();
+            let (result, _) = other_client.write_all("hello").await;
+            result.unwrap();
+            assert_eq!(&*other.next().await.unwrap().unwrap(), b"hello");
+
+            // Nothing sent, nothing received; then the data, after a wait
+            // that was given up.
+            assert!(timeout(Duration::from_millis(10), incoming.next()).await.is_err());
+            let (result, _) = client.write_all("late").await;
+            result.unwrap();
+            let mut late = incoming.next().await.unwrap().unwrap();
+            assert_eq!(&*late, b"late");
+            // A buffer can be changed in place and shortened.
+            late.make_ascii_uppercase();
+            late.truncate(2);
+            assert_eq!(&*late, b"LA");
+        })
+        .unwrap();
+}
+
+#[test]
+fn dropping_a_receive_stream_returns_its_buffers() {
+    use starfish::net::{UnixListener, UnixStream};
+
+    let path = scratch("recv-socket");
+    rt(1)
+        .recv_buffers(4, 4096)
+        .run({
+            let path = path.clone();
+            move || async move {
+                // Each round fills the whole pool with data nobody collects,
+                // then drops the stream. If the buffers did not come back,
+                // the second round would have nothing to receive into.
+                for round in 0..20 {
+                    let (client, server) = tcp_pair().await;
+                    let mut incoming = server.recv_stream().unwrap();
+                    let (result, _) = client.write_all(vec![round as u8; 8 * 4096]).await;
+                    result.unwrap();
+                    let one = incoming.next().await.unwrap().unwrap();
+                    assert!(one.iter().all(|&byte| byte == round as u8));
+                    // Let the kernel fill the rest of the pool.
+                    sleep(Duration::from_millis(2)).await;
+                    drop(incoming);
+                    // The buffer handed over outlives the stream.
+                    assert!(one.iter().all(|&byte| byte == round as u8));
+                    drop(one);
+                    // What the stream had not received is still on the
+                    // connection for an ordinary read.
+                    let (result, buf) = server.read(Vec::with_capacity(4096)).await;
+                    assert!(result.unwrap() > 0);
+                    assert!(buf.iter().all(|&byte| byte == round as u8));
+                }
+
+                // The same over a Unix-domain socket, to the end.
+                let listener = UnixListener::bind(&path).unwrap();
+                let accepting = spawn(async move { listener.accept().await.unwrap() });
+                let client = UnixStream::connect(&path).await.unwrap();
+                let server = accepting.await.unwrap();
+                let (result, _) = client.write_all("over a unix socket").await;
+                result.unwrap();
+                client.shutdown(std::net::Shutdown::Write).unwrap();
+                let mut incoming = server.recv_stream().unwrap();
+                let mut text = Vec::new();
+                while let Some(data) = incoming.next().await.unwrap() {
+                    text.extend_from_slice(&data);
+                }
+                assert_eq!(text, b"over a unix socket");
+                starfish::fs::remove_file(&path).await.unwrap();
+            }
+        })
+        .unwrap();
+}
+
+#[test]
+fn a_receive_stream_needs_receive_buffers_and_reports_errors() {
+    rt(1)
+        .run(|| async {
+            let (_client, server) = tcp_pair().await;
+            let refused = server.recv_stream().err().unwrap();
+            assert_eq!(refused.kind(), std::io::ErrorKind::Unsupported);
+        })
+        .unwrap();
+    rt(1)
+        .recv_buffers(2, 4096)
+        .run(|| async {
+            let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let server = listener.accept().await.unwrap();
+            let mut incoming = server.recv_stream().unwrap();
+            // A reset connection is an error, not an end.
+            socket2::SockRef::from(&client).set_linger(Some(Duration::ZERO)).unwrap();
+            drop(client);
+            let outcome = incoming.next().await;
+            assert_eq!(outcome.err().unwrap().kind(), std::io::ErrorKind::ConnectionReset);
+        })
+        .unwrap();
+}
+
 #[test]
 fn a_cloned_tcp_listener_shares_one_queue_between_shards() {
     rt(2)

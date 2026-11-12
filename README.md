@@ -46,7 +46,7 @@ wrong). `cargo doc --open` shows it together with the API reference.
 
 ## Examples
 
-There are 50 programs in `examples/`. Run one with
+There are 51 programs in `examples/`. Run one with
 `cargo run --release --example <name>`. Those marked *server* run until
 Ctrl-C; the others do their work and exit.
 
@@ -78,6 +78,7 @@ Ctrl-C; the others do their work and exit.
 | | `udp_ping` | Datagrams between two UDP sockets |
 | | `unix_socket` | A Unix-domain server shared by all shards, with caller identity |
 | | `fixed_buffers` | Registered buffers and zero-copy sends |
+| | `recv_stream` | Receiving with one standing request and buffers the kernel picks |
 | | `echo` | *Server.* Echo with a connection limit and orderly shutdown |
 | | `http_hello` | *Server.* A minimal HTTP/1.1 responder on every shard |
 | | `chat` | *Server.* A chat room with a queue per client |
@@ -148,7 +149,9 @@ The servers listen on 127.0.0.1, ports 7000 to 7006.
 - **Buffers:** I/O takes owned buffers (`Vec<u8>`, `AlignedBuf`, and others
   through `buf::IoBuf`). `buf::FixedBuf` comes from a per-shard pool
   registered with io_uring; `TcpStream::write_zc` sends from one without
-  copying.
+  copying. `net::RecvStream` receives the other way round: one standing
+  request per connection, into buffers (`buf::RecvBuf`) the kernel picks
+  from a per-shard pool as data arrives.
 - **Memory:** `alloc::ShardAlloc`, an optional global allocator with one heap
   per shard, and `alloc::on_pressure` to shed memory when a shard is over
   its limit.
@@ -215,13 +218,19 @@ runs:
 | | starfish | Monoio | Tokio |
 |---|---|---|---|
 | Echo, 1 thread, 64 connections (requests/s) | 347–353k | 347–354k | 372–379k |
+| The same, receiving through `RecvStream` | 366–393k | | |
 | Echo, 4 threads, 64 connections (requests/s) | 1.09–1.12M | 1.08M | 0.59–0.62M |
+| The same, receiving through `RecvStream` | 1.20–1.24M | | |
 | Spawn a task and await it (ns) | 52 | 38–39 | 107–109 |
 | Connect and close, 1 thread, 64 clients (connections/s) | 300–306k | 279–285k | 244–252k |
 
 Read as: level with Monoio on the echo test, slower than Monoio at spawning
 tasks, behind Tokio on one thread and well ahead of it on four, and ahead
-of both at making and dropping connections. (That last row is the range of
+of both at making and dropping connections. Receiving through a
+`RecvStream` (`bench_echo multishot`) is about a tenth faster than with a
+`read` per message, which puts it ahead of Tokio on one thread as well; the
+`RecvStream` rows are three runs each, from a later session than the
+others. (That last row is the range of
 five runs of three seconds on one pinned core, over a Unix-domain socket.)
 
 ### Where the time goes
@@ -243,6 +252,10 @@ figures above in proportion:
   instructions in the kernel than Tokio's epoll path (30.8k against
   28.7k), and starfish about 1,300 more of its own (4,467 against 3,150;
   Monoio 4,097). That is the whole of Tokio's lead on one thread.
+- Receiving through a `RecvStream` removes most of that difference: 28.2k
+  instructions in the kernel and 4,129 in the runtime per request, and
+  12.6–12.9k processor cycles against 14.2–14.4k for the `read` path and
+  13.4–13.7k for Tokio.
 
 Throughput varies by several per cent from run to run on this machine, as
 the processor's clock speed does. To compare two builds, count cycles and

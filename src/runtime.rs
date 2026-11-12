@@ -20,7 +20,7 @@ use io_uring::IoUring;
 use slab::Slab;
 
 use crate::error::{Error, Result};
-use crate::buf::{FixedPool, Region};
+use crate::buf::{FixedPool, RecvParts, Region};
 use crate::ioqueue::{DeviceGroup, DeviceTable, IoProperties, IoScheduler};
 use crate::reactor::{completions_pending, Reactor};
 use crate::stall::{self, StallTimer};
@@ -275,6 +275,8 @@ struct ShardParts {
     preempt: IoUring,
     /// Memory of the shard's registered buffers, if configured.
     fixed: Option<Region>,
+    /// The shard's receive buffers and their ring, if configured.
+    recv: Option<RecvParts>,
     /// Indexed by target shard; `None` at the shard's own index.
     outgoing: Vec<Option<Outgoing>>,
     /// One queue from every other shard.
@@ -406,12 +408,13 @@ impl Shard {
             ring_disabled,
             preempt,
             fixed,
+            recv,
             outgoing,
             incoming,
         } = parts;
         let eventfd = shared.eventfd.as_raw_fd();
         let disk = IoScheduler::new(devices, GroupCache::new(runtime.groups.clone()), config.io_depth);
-        let reactor = Reactor::new(ring, ring_disabled, preempt, eventfd, disk, config.task_quota);
+        let reactor = Reactor::new(ring, ring_disabled, preempt, eventfd, disk, config.task_quota, recv);
         let run_queue = RunQueues::new(runtime.groups.clone());
         let calls = runtime
             .shards
@@ -990,6 +993,7 @@ pub struct Runtime {
     io_properties: Vec<(PathBuf, IoProperties)>,
     io_latency_goal: Option<Duration>,
     fixed_buffers: Option<(u16, usize)>,
+    recv_buffers: Option<(u16, usize)>,
 }
 
 impl Default for Runtime {
@@ -1028,6 +1032,7 @@ impl Runtime {
             io_properties: Vec::new(),
             io_latency_goal: None,
             fixed_buffers: None,
+            recv_buffers: None,
         }
     }
 
@@ -1208,6 +1213,27 @@ impl Runtime {
         self
     }
 
+    /// Gives every shard a pool of `count` buffers of `size` bytes
+    /// (rounded up to whole pages) for the kernel to receive into, which is
+    /// what [`TcpStream::recv_stream`](crate::net::TcpStream::recv_stream)
+    /// and its Unix-domain counterpart need. At most 32,768 buffers; zero,
+    /// the default, means no pool.
+    ///
+    /// One receive fills at most one buffer, so `size` is the most a single
+    /// [`RecvBuf`](crate::buf::RecvBuf) can hold; 4096 suits request/response
+    /// protocols and 16 KiB or more suits bulk transfer. `count` bounds how
+    /// much received data the shard's tasks can hold at one time: when every
+    /// buffer is held, the shard's receive streams wait. A few per
+    /// connection that is active at once is a reasonable start.
+    ///
+    /// The pool is shared by all receive streams of the shard. Starting the
+    /// runtime fails if the kernel cannot register it, which needs Linux
+    /// 5.19.
+    pub fn recv_buffers(mut self, count: u16, size: usize) -> Runtime {
+        self.recv_buffers = (count > 0).then_some((count, size));
+        self
+    }
+
     /// The number of shards this runtime will start.
     pub fn shard_count(&self) -> usize {
         self.shards
@@ -1264,6 +1290,16 @@ impl Runtime {
                 }
                 None => None,
             };
+            let recv = match self.recv_buffers {
+                Some((count, size)) => {
+                    let parts = RecvParts::new(count, size)?;
+                    // SAFETY: the memory is kept by the shard's reactor,
+                    // which frees it only after closing the ring.
+                    unsafe { Reactor::register_recv(&ring, &parts)? };
+                    Some(parts)
+                }
+                None => None,
+            };
             shared.push(shard.clone());
             parts.push(ShardParts {
                 shared: shard,
@@ -1272,6 +1308,7 @@ impl Runtime {
                 ring_disabled,
                 preempt: IoUring::new(4)?,
                 fixed,
+                recv,
                 outgoing: Vec::with_capacity(self.shards),
                 incoming: Vec::with_capacity(self.shards),
             });

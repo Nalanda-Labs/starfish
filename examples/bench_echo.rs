@@ -1,10 +1,12 @@
 //! Request-response throughput over loopback TCP: starfish against Tokio
 //! and Monoio.
 //!
-//! `cargo run --release --example bench_echo -- <starfish|tokio|monoio> [threads] [connections] [seconds]`
+//! `cargo run --release --example bench_echo -- <starfish|multishot|tokio|monoio> [threads] [connections] [seconds]`
 //!
-//! Server and clients share the same threads in both cases: each
+//! Server and clients share the same threads in every case: each
 //! connection sends a 64-byte message and waits for it to come back.
+//! `multishot` is starfish receiving through `RecvStream`, on both sides,
+//! instead of with one `read` per message.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -16,12 +18,16 @@ static GLOBAL: starfish::alloc::ShardAlloc = starfish::alloc::ShardAlloc;
 
 const MESSAGE: usize = 64;
 
-fn run_starfish(threads: usize, connections: usize, seconds: u64) -> u64 {
+fn run_starfish(threads: usize, connections: usize, seconds: u64, multishot: bool) -> u64 {
     use starfish::net::{TcpListener, TcpStream};
     use starfish::{shard_id, sleep, spawn, submit_to_all, Runtime};
 
+    // Two buffers for each end of every connection; a pool the test never
+    // exhausts. Without `multishot` there is no pool at all.
+    let buffers = if multishot { (connections * 4).clamp(64, 32768) as u16 } else { 0 };
     Runtime::new()
         .shards(threads)
+        .recv_buffers(buffers, 4096)
         .run(move || async move {
             let probe = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
             let addr: SocketAddr = probe.local_addr().unwrap();
@@ -32,6 +38,15 @@ fn run_starfish(threads: usize, connections: usize, seconds: u64) -> u64 {
                     while let Ok(stream) = listener.accept().await {
                         spawn(async move {
                             stream.set_nodelay(true).ok();
+                            if multishot {
+                                let mut incoming = stream.recv_stream().unwrap();
+                                while let Ok(Some(data)) = incoming.next().await {
+                                    if stream.write_all(data).await.0.is_err() {
+                                        return;
+                                    }
+                                }
+                                return;
+                            }
                             let mut buf = Vec::with_capacity(4096);
                             loop {
                                 let (result, returned) = stream.read(buf).await;
@@ -67,12 +82,17 @@ fn run_starfish(threads: usize, connections: usize, seconds: u64) -> u64 {
                                 let mut out = vec![7u8; MESSAGE];
                                 let mut buf = Vec::with_capacity(4096);
                                 let mut done = 0u64;
+                                let mut incoming = multishot.then(|| stream.recv_stream().unwrap());
                                 while !stop.load(Ordering::Relaxed) {
                                     let (result, returned) = stream.write_all(out).await;
                                     result.unwrap();
                                     out = returned;
                                     let mut got = 0;
                                     while got < MESSAGE {
+                                        if let Some(incoming) = incoming.as_mut() {
+                                            got += incoming.next().await.unwrap().unwrap().len();
+                                            continue;
+                                        }
                                         let (result, returned) = stream.read(buf).await;
                                         got += result.unwrap();
                                         buf = returned;
@@ -284,8 +304,9 @@ fn main() {
     let requests = match which {
         "tokio" => run_tokio(threads, connections, seconds),
         "monoio" => run_monoio(threads, connections, seconds),
-        _ => run_starfish(threads, connections, seconds),
+        "multishot" => run_starfish(threads, connections, seconds, true),
+        _ => run_starfish(threads, connections, seconds, false),
     };
     let rate = requests as f64 / start.elapsed().as_secs_f64();
-    println!("{which:6} threads={threads} connections={connections}: {rate:>10.0} requests/s");
+    println!("{which:9} threads={threads} connections={connections}: {rate:>10.0} requests/s");
 }

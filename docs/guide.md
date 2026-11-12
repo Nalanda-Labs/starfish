@@ -31,6 +31,7 @@ the code.
 - [Streams on direct I/O](#streams-on-direct-io)
 - [Directories and file management](#directories-and-file-management)
 - [Registered buffers and zero-copy sends](#registered-buffers-and-zero-copy-sends)
+- [Receiving with buffers the kernel picks](#receiving-with-buffers-the-kernel-picks)
 - [Scheduling groups](#scheduling-groups)
 - [The disk I/O scheduler and device capacity](#the-disk-io-scheduler-and-device-capacity)
 - [Memory](#memory)
@@ -1445,6 +1446,68 @@ async fn send_block(stream: &TcpStream, block: &[u8]) -> starfish::Result<usize>
 - [`acquire`](crate::buf::FixedBuf::acquire) fails with
   [`Error::NoFixedBuffers`](crate::Error::NoFixedBuffers) if the runtime
   was started without a pool.
+
+# Receiving with buffers the kernel picks
+
+A `read` is a request to the kernel each time: here is a buffer, fill it.
+A [`RecvStream`](crate::net::RecvStream) asks once. With
+[`Runtime::recv_buffers`](crate::Runtime::recv_buffers), every shard offers
+the kernel a pool of buffers; a receive stream leaves one standing request
+on a connection, and from then on the kernel takes a buffer from the pool
+whenever data arrives, fills it, and reports it.
+[`next`](crate::net::RecvStream::next) hands the buffers over one at a time
+as [`RecvBuf`](crate::buf::RecvBuf)s.
+
+```rust,no_run
+use starfish::net::TcpStream;
+
+// In a runtime started with `Runtime::new().recv_buffers(1024, 4096)`.
+async fn echo(stream: TcpStream) -> std::io::Result<()> {
+    let mut incoming = stream.recv_stream()?;
+    while let Some(data) = incoming.next().await? {
+        // The buffer received is sent back as it is; nothing is copied.
+        let (result, _) = stream.write_all(data).await;
+        result?;
+    }
+    Ok(())
+}
+```
+
+Two things are gained. A request per receive is saved: on the echo
+benchmark that is about a tenth of the whole cost of a request (see the
+README). And memory follows the data: ten thousand idle connections each
+waiting in `read` hold ten thousand buffers, while ten thousand idle
+receive streams hold none.
+
+A `RecvBuf` reads as a byte slice, can be changed in place, and can be
+passed to any write call. Dropping it gives the buffer back to the pool.
+`next` is safe to drop: data that arrives meanwhile waits in the stream, so
+it can be used in `select` and under `timeout`. Unix-domain streams have
+the same call.
+
+**Caveats**
+
+- The pool is shared by every receive stream of the shard, and data
+  arrives whether or not `next` is being called. When every buffer is
+  held, by tasks keeping `RecvBuf`s or by streams nobody is reading from,
+  all the shard's receive streams wait. Drop each `RecvBuf` as soon as its
+  bytes have been used or copied, and do not leave a receive stream open
+  on a connection that is no longer being read.
+- One receive fills at most one buffer, so data arrives in pieces no
+  larger than the pool's buffer size, cut without regard to the protocol.
+  There is no buffered reader over a receive stream; a protocol that
+  needs lines or frames has to assemble them itself.
+- Dropping a receive stream discards data it had received and not handed
+  over. Those bytes are gone from the connection. Drop it when done with
+  the connection, not to go back to `read` in the middle of one.
+- Use one way of receiving per connection at a time. A `read` or a second
+  receive stream alongside the first would each get some of the data.
+- A receive stream belongs to the shard it was made on and borrows the
+  socket, so the connection cannot be moved to another shard while one
+  exists.
+- The pool is fixed when the runtime starts: at most 32,768 buffers per
+  shard, all of one size. Without `recv_buffers`, `recv_stream` fails
+  with `Unsupported`.
 
 # Scheduling groups
 

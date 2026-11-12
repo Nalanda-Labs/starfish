@@ -2,17 +2,20 @@
 
 use std::any::Any;
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
 use std::os::fd::RawFd;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use io_uring::{opcode, squeue, types, IoUring};
 use slab::Slab;
 
+use crate::buf::{RecvParts, RecvRing, Region};
 use crate::ioqueue::{Direction, IoScheduler, QueuedRequest};
 use crate::runtime::try_current;
 
@@ -30,6 +33,9 @@ const CLOSE: u64 = u64::MAX - 2;
 /// practice one flush makes room; the bound is there so that a ring the
 /// kernel refuses to drain produces an error instead of a hang.
 const PUSH_ATTEMPTS: usize = 64;
+/// The number under which a shard's receive-buffer ring is registered with
+/// its io_uring. Each shard has one ring of its own, so one number does.
+pub(crate) const RECV_GROUP: u16 = 0;
 
 /// Where an operation is in its life: waiting in a disk queue, in the
 /// kernel, finished, or in one of two states in which its future is gone or
@@ -69,6 +75,23 @@ struct OpState {
     /// Whether the future may have its result as soon as it is known,
     /// before the kernel lets go of `held`.
     early: bool,
+    /// For an operation that completes many times (a multishot receive):
+    /// the completions its owner has not collected yet, each a result and
+    /// the flags that came with it. `None` for every other operation.
+    multi: Option<VecDeque<(i32, u32)>>,
+}
+
+/// What `Reactor::poll_multi` found when the owner of a multishot operation
+/// asked for its next completion.
+pub(crate) enum MultiPoll {
+    /// The next completion: its result and its flags.
+    Item(i32, u32),
+    /// The kernel has ended the operation and every completion has been
+    /// collected. The reactor has forgotten it; to go on, submit another.
+    Finished,
+    /// Nothing yet. Carries the waker this poll replaced, to be dropped once
+    /// the reactor is no longer borrowed.
+    Pending(Option<Waker>),
 }
 
 /// What `Reactor::poll_op` found when a future asked about its operation.
@@ -171,6 +194,10 @@ pub(crate) struct Reactor {
     closing: usize,
     /// `drain` has run: nothing will collect completions any more.
     drained: bool,
+    /// The shard's receive buffers, if the runtime was started with any.
+    /// Declared after `ring`, so that the ring is closed, and the kernel
+    /// has let go of this memory, before it is freed.
+    recv: Option<RecvRing>,
 }
 
 impl Reactor {
@@ -184,6 +211,7 @@ impl Reactor {
         eventfd: RawFd,
         disk: IoScheduler,
         quota: Duration,
+        recv: Option<RecvParts>,
     ) -> Reactor {
         let quota = types::Timespec::new()
             .sec(quota.as_secs())
@@ -204,6 +232,7 @@ impl Reactor {
             disabled,
             closing: 0,
             drained: false,
+            recv: recv.map(RecvRing::new),
         }
     }
 
@@ -330,12 +359,133 @@ impl Reactor {
             partial: None,
             held: None,
             early: false,
+            multi: None,
         });
         if let Err(err) = self.push(&sqe.user_data(key as u64)) {
             self.ops.try_remove(key);
             return Err(err);
         }
         Ok(key)
+    }
+
+    /// Submits an operation that completes many times, such as a multishot
+    /// receive. Its completions are queued in its record, to be collected
+    /// one at a time with `poll_multi`. Returns its slot number.
+    ///
+    /// The entry must point at no memory of the caller's: such an operation
+    /// has no data for the reactor to keep.
+    pub(crate) fn submit_multi(&mut self, sqe: squeue::Entry) -> io::Result<usize> {
+        let key = self.ops.insert(OpState {
+            stage: Stage::InKernel,
+            waker: None,
+            disk: None,
+            class: 0,
+            partial: None,
+            held: None,
+            early: false,
+            multi: Some(VecDeque::new()),
+        });
+        if let Err(err) = self.push(&sqe.user_data(key as u64)) {
+            self.ops.try_remove(key);
+            return Err(err);
+        }
+        Ok(key)
+    }
+
+    /// Hands the owner of a multishot operation its next completion, or
+    /// leaves its waker to be woken when there is one.
+    pub(crate) fn poll_multi(&mut self, key: usize, waker: &mut Option<Waker>) -> MultiPoll {
+        let Some(state) = self.ops.get_mut(key) else {
+            return MultiPoll::Finished;
+        };
+        if let Some((result, flags)) = state.multi.as_mut().and_then(VecDeque::pop_front) {
+            return MultiPoll::Item(result, flags);
+        }
+        if matches!(state.stage, Stage::Completed(_)) {
+            self.ops.try_remove(key);
+            return MultiPoll::Finished;
+        }
+        MultiPoll::Pending(waker.take().and_then(|waker| state.waker.replace(waker)))
+    }
+
+    /// Lets go of a multishot operation whose owner is being dropped.
+    /// Receive buffers in completions nobody collected go back to the pool,
+    /// now and for whatever the kernel still delivers before the
+    /// cancellation takes hold. Returns wakers for the caller to drop or
+    /// wake once the reactor is no longer borrowed: the owner's own, and
+    /// those of receive streams that were waiting for a buffer.
+    pub(crate) fn abandon_multi(&mut self, key: usize) -> Vec<Waker> {
+        let mut wakers = Vec::new();
+        let Some(state) = self.ops.get_mut(key) else {
+            return wakers;
+        };
+        wakers.extend(state.waker.take());
+        let finished = matches!(state.stage, Stage::Completed(_));
+        let uncollected: Vec<(i32, u32)> = state
+            .multi
+            .as_mut()
+            .map(|queue| queue.drain(..).collect())
+            .unwrap_or_default();
+        if finished {
+            self.ops.try_remove(key);
+        } else {
+            state.stage = Stage::Orphaned {
+                data: Box::new(()),
+                result_is_fd: false,
+            };
+            self.cancel(key as u64);
+        }
+        if let Some(recv) = self.recv.as_mut() {
+            let region = recv.region().clone();
+            for (_, flags) in uncollected {
+                if let Some(index) = io_uring::cqueue::buffer_select(flags) {
+                    recv.give_back(&region, index, &mut wakers);
+                }
+            }
+        }
+        wakers
+    }
+
+    /// Registers a receive-buffer ring with `ring`, under [`RECV_GROUP`].
+    ///
+    /// # Safety
+    ///
+    /// The memory of `parts` must stay valid, and in place, for as long as
+    /// the ring exists.
+    pub(crate) unsafe fn register_recv(ring: &IoUring, parts: &RecvParts) -> io::Result<()> {
+        let (addr, entries) = parts.ring();
+        ring.submitter()
+            .register_buf_ring_with_flags(addr, entries, RECV_GROUP, 0)
+    }
+
+    /// The memory of the shard's receive buffers, or `None` if the runtime
+    /// was started without any.
+    pub(crate) fn recv_region(&self) -> Option<Rc<Region>> {
+        self.recv.as_ref().map(|recv| recv.region().clone())
+    }
+
+    /// Whether the kernel has a receive buffer to fill. If every buffer is
+    /// lent out, takes the waker out of `waker`, to be woken when one comes
+    /// back. `None` if the runtime was started without receive buffers.
+    pub(crate) fn recv_available(&mut self, waker: &mut Option<Waker>) -> Option<bool> {
+        let recv = self.recv.as_mut()?;
+        if recv.available() {
+            return Some(true);
+        }
+        if let Some(waker) = waker.take() {
+            recv.wait(waker);
+        }
+        Some(false)
+    }
+
+    /// Takes back a receive buffer the application is done with. Returns
+    /// the wakers of receive streams that were waiting for one.
+    pub(crate) fn recv_give_back(&mut self, region: &Rc<Region>, index: u16) -> Vec<Waker> {
+        let mut wakers = Vec::new();
+        if let Some(recv) = self.recv.as_mut() {
+            recv.give_back(region, index, &mut wakers);
+        }
+        wakers
     }
 
     /// Submits an operation whose buffer the reactor keeps. The future gets
@@ -355,6 +505,7 @@ impl Reactor {
             partial: None,
             held: None,
             early: true,
+            multi: None,
         });
         if let Err(err) = self.push(&sqe.user_data(key as u64)) {
             self.ops.try_remove(key);
@@ -385,6 +536,7 @@ impl Reactor {
             partial: None,
             held: None,
             early: false,
+            multi: None,
         });
         let sqe = sqe.user_data(key as u64);
         let class = self.disk.enqueue(key, device, class, direction, bytes, sqe);
@@ -493,6 +645,34 @@ impl Reactor {
                 user_data => {
                     let key = user_data as usize;
                     let Some(state) = self.ops.get_mut(key) else { continue };
+                    if let Some(queue) = state.multi.as_mut() {
+                        // One of many completions. The operation goes on
+                        // for as long as the kernel says more will follow.
+                        let more = io_uring::cqueue::more(cqe.flags());
+                        let buffer = io_uring::cqueue::buffer_select(cqe.flags());
+                        if matches!(state.stage, Stage::Orphaned { .. }) {
+                            // Its owner is gone: nobody will read this, so
+                            // the buffer goes straight back on offer.
+                            if let (Some(index), Some(recv)) = (buffer, self.recv.as_mut()) {
+                                recv.offer(index);
+                            }
+                            if !more {
+                                self.ops.try_remove(key);
+                            }
+                            continue;
+                        }
+                        if let (Some(_), Some(recv)) = (buffer, self.recv.as_mut()) {
+                            recv.lend();
+                        }
+                        queue.push_back((cqe.result(), cqe.flags()));
+                        if !more {
+                            state.stage = Stage::Completed(cqe.result());
+                        }
+                        if let Some(waker) = state.waker.take() {
+                            self.ready.push(waker);
+                        }
+                        continue;
+                    }
                     if io_uring::cqueue::more(cqe.flags()) {
                         // More completions follow for this operation; the
                         // kernel still uses its buffer. Keep the outcome.

@@ -11,6 +11,11 @@
 //! The kernel maps and pins registered memory once instead of on every
 //! request, and sends from it are zero-copy: the network stack transmits
 //! straight from the buffer.
+//!
+//! A [`RecvBuf`] goes the other way: it is a buffer the kernel chose, from
+//! a pool each shard offers it
+//! ([`Runtime::recv_buffers`](crate::Runtime::recv_buffers)), and filled
+//! with data received on a [`RecvStream`](crate::net::RecvStream).
 
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::collections::BTreeMap;
@@ -20,6 +25,7 @@ use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::ptr::NonNull;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use crate::error::{Error, Result};
@@ -543,4 +549,275 @@ impl Drop for Acquire {
 }
 
 debug_impl!(FixedBuf, "index" => |buf| buf.index, "len" => |buf| buf.len);
+
+/// The memory of a ring through which one shard hands receive buffers to
+/// the kernel: an array of entries, each naming one buffer, that both
+/// sides read and only this side writes.
+///
+/// The kernel takes buffers from the front as data arrives; the shard adds
+/// buffers at the back as the application returns them. Unlike the
+/// registered buffers of a [`FixedBuf`], which the application picks, these
+/// are picked by the kernel at the moment data arrives, which is what lets
+/// one request receive again and again.
+struct RingMemory {
+    ptr: NonNull<u8>,
+    layout: Layout,
+    /// Number of entries; a power of two.
+    entries: u16,
+}
+
+// SAFETY: the memory is exclusively owned. It is allocated on the thread
+// that starts the runtime and moved to its shard before use.
+unsafe impl Send for RingMemory {}
+
+impl Drop for RingMemory {
+    /// Frees the ring's memory. By now the io_uring it was registered with
+    /// is closed.
+    fn drop(&mut self) {
+        // SAFETY: allocated in `RecvParts::new` with this layout.
+        unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
+    }
+}
+
+/// What a shard's receive-buffer pool is made of, before the shard's
+/// thread takes it over: the buffers and the ring that offers them to the
+/// kernel.
+pub(crate) struct RecvParts {
+    region: Region,
+    ring: RingMemory,
+}
+
+/// The most buffers a receive pool can have: the largest ring the kernel
+/// accepts.
+const MAX_RECV_BUFFERS: u16 = 1 << 15;
+
+impl RecvParts {
+    /// Allocates `count` buffers of at least `size` bytes (rounded up to
+    /// whole pages) and a ring with room to offer all of them.
+    pub(crate) fn new(count: u16, size: usize) -> io::Result<RecvParts> {
+        let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "receive buffer pool is too large");
+        if count > MAX_RECV_BUFFERS {
+            return Err(invalid());
+        }
+        let region = Region::new(count, size)?;
+        if u32::try_from(region.size).is_err() {
+            return Err(invalid());
+        }
+        let entries = count.max(1).checked_next_power_of_two().ok_or_else(invalid)?;
+        let bytes = usize::from(entries)
+            .checked_mul(std::mem::size_of::<io_uring::types::BufRingEntry>())
+            .and_then(|bytes| bytes.checked_next_multiple_of(REGION_ALIGN))
+            .ok_or_else(invalid)?;
+        let layout = Layout::from_size_align(bytes, REGION_ALIGN).map_err(|_| invalid())?;
+        // SAFETY: the layout has a non-zero size.
+        let ptr = unsafe { alloc_zeroed(layout) };
+        let ptr = NonNull::new(ptr).ok_or(io::ErrorKind::OutOfMemory)?;
+        Ok(RecvParts {
+            region,
+            ring: RingMemory { ptr, layout, entries },
+        })
+    }
+
+    /// The ring's address and its number of entries, as the kernel wants
+    /// them for registration.
+    pub(crate) fn ring(&self) -> (u64, u16) {
+        (self.ring.ptr.as_ptr() as u64, self.ring.entries)
+    }
+}
+
+/// One shard's receive buffers and the ring that offers them to the
+/// kernel.
+///
+/// Every buffer is in one of three places: on offer in the ring, lent to
+/// the application as a [`RecvBuf`] (or waiting in a receive stream's queue
+/// to become one), or, briefly, in the kernel's hands on its way from the
+/// first to the second. The pool counts the lent ones, because when all are
+/// lent the kernel has nothing to receive into and receive streams have to
+/// wait for one to come back.
+pub(crate) struct RecvRing {
+    region: Rc<Region>,
+    ring: RingMemory,
+    /// Where the next buffer goes in the ring; only ever counts up, wrapping.
+    tail: u16,
+    /// Buffers the kernel has filled that have not been given back yet.
+    lent: usize,
+    /// Receive streams that found every buffer lent.
+    waiters: Vec<Waker>,
+}
+
+impl RecvRing {
+    /// Takes over the pool's memory and offers every buffer to the kernel.
+    pub(crate) fn new(parts: RecvParts) -> RecvRing {
+        let RecvParts { region, ring } = parts;
+        let count = region.count;
+        let mut pool = RecvRing {
+            region: Rc::new(region),
+            ring,
+            tail: 0,
+            lent: 0,
+            waiters: Vec::new(),
+        };
+        for index in 0..count {
+            pool.offer(index);
+        }
+        pool
+    }
+
+    /// Puts buffer `index` at the back of the ring, where the kernel will
+    /// find it.
+    pub(crate) fn offer(&mut self, index: u16) {
+        let mask = self.ring.entries.wrapping_sub(1);
+        let base = self.ring.ptr.as_ptr().cast::<io_uring::types::BufRingEntry>();
+        // SAFETY: the slot is inside the ring's allocation, since the mask
+        // keeps it below the number of entries. The kernel does not read a
+        // slot until the tail has moved past it, and nothing else writes
+        // the ring, so the write races with nothing. The tail is a field
+        // of the first entry that the kernel only reads; it is written
+        // atomically because the kernel may read it at any moment.
+        unsafe {
+            let entry = base.add(usize::from(self.tail & mask));
+            (*entry).set_addr(self.region.buffer(index) as u64);
+            (*entry).set_len(self.region.size as u32);
+            (*entry).set_bid(index);
+            self.tail = self.tail.wrapping_add(1);
+            let tail = io_uring::types::BufRingEntry::tail(base).cast::<AtomicU16>();
+            (*tail).store(self.tail, Ordering::Release);
+        }
+    }
+
+    /// Notes that the kernel has filled a buffer and handed it over.
+    pub(crate) fn lend(&mut self) {
+        self.lent = self.lent.saturating_add(1);
+    }
+
+    /// Takes back a buffer that was lent and offers it to the kernel again.
+    /// Appends to `wake` the receive streams that were waiting for one.
+    ///
+    /// A buffer of some other pool, which can only be one from a runtime
+    /// that has since stopped, is ignored.
+    pub(crate) fn give_back(&mut self, region: &Rc<Region>, index: u16, wake: &mut Vec<Waker>) {
+        if !Rc::ptr_eq(&self.region, region) || index >= self.region.count {
+            return;
+        }
+        self.lent = self.lent.saturating_sub(1);
+        self.offer(index);
+        wake.append(&mut self.waiters);
+    }
+
+    /// Whether the kernel has, or is about to have, a buffer to receive
+    /// into: not every buffer is lent.
+    pub(crate) fn available(&self) -> bool {
+        self.lent < usize::from(self.region.count)
+    }
+
+    /// Asks for `waker` to be woken when a buffer comes back.
+    pub(crate) fn wait(&mut self, waker: Waker) {
+        self.waiters.push(waker);
+    }
+
+    /// The buffers' memory, for making a [`RecvBuf`].
+    pub(crate) fn region(&self) -> &Rc<Region> {
+        &self.region
+    }
+}
+
+/// Data received through a [`RecvStream`](crate::net::RecvStream): one of
+/// the shard's receive buffers, holding what one receive brought.
+///
+/// It reads as a byte slice, and can be changed in place. Dropping it gives
+/// the buffer back to the pool, which the kernel then receives into again,
+/// so hold on to these no longer than the data is needed: while every
+/// buffer of the pool is held, nothing is received on the shard's receive
+/// streams. To keep the bytes, copy them out.
+///
+/// It can be sent as it is, without copying, by passing it to a write call
+/// such as [`TcpStream::write_all`](crate::net::TcpStream::write_all). It
+/// cannot leave the shard it was received on.
+pub struct RecvBuf {
+    region: Rc<Region>,
+    index: u16,
+    len: usize,
+}
+
+impl RecvBuf {
+    /// Wraps buffer `index` of `region`, of which the kernel filled the
+    /// first `len` bytes.
+    pub(crate) fn new(region: Rc<Region>, index: u16, len: usize) -> RecvBuf {
+        let len = len.min(region.size);
+        RecvBuf { region, index, len }
+    }
+
+    /// Number of bytes received.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the buffer holds no bytes. A receive stream never returns
+    /// such a buffer: the end of the stream is `None`.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Shortens the buffer to its first `len` bytes; no effect if it is
+    /// already that short. Useful before sending part of it back.
+    pub fn truncate(&mut self, len: usize) {
+        self.len = self.len.min(len);
+    }
+}
+
+impl Deref for RecvBuf {
+    /// A receive buffer reads as a slice of the bytes received.
+    type Target = [u8];
+
+    /// The bytes received.
+    fn deref(&self) -> &[u8] {
+        // SAFETY: the buffer lies inside the region, which the `Rc` keeps
+        // alive; `len` is within its size and the memory is initialised
+        // (zeroed at allocation). The kernel does not touch a buffer
+        // between handing it over and being offered it again, which
+        // happens when this value is dropped.
+        unsafe { std::slice::from_raw_parts(self.region.buffer(self.index), self.len) }
+    }
+}
+
+impl DerefMut for RecvBuf {
+    /// The bytes received, for changing in place.
+    fn deref_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as in `deref`; a buffer is lent to one `RecvBuf` at a
+        // time, so access is exclusive.
+        unsafe { std::slice::from_raw_parts_mut(self.region.buffer(self.index), self.len) }
+    }
+}
+
+impl Drop for RecvBuf {
+    /// Gives the buffer back to the shard's pool, for the kernel to receive
+    /// into again, and wakes the receive streams that were waiting for a
+    /// buffer. Outside a shard there is no pool to give it to.
+    fn drop(&mut self) {
+        let Some(shard) = try_current() else { return };
+        let wakers = shard
+            .reactor
+            .with(|reactor| reactor.recv_give_back(&self.region, self.index));
+        for waker in wakers.unwrap_or_default() {
+            wake_quietly(waker);
+        }
+    }
+}
+
+// SAFETY: the buffer's memory belongs to the region, which does not move
+// and which the value keeps alive.
+unsafe impl IoBuf for RecvBuf {
+    /// The start of the received bytes.
+    fn as_ptr(&self) -> *const u8 {
+        self.region.buffer(self.index)
+    }
+
+    /// The number of bytes received.
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+debug_impl!(RecvBuf, "index" => |buf| buf.index, "len" => |buf| buf.len);
+
 debug_impl!(Acquire);

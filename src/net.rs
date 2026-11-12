@@ -8,20 +8,27 @@
 //! [`FixedBuf`] use the shard's registered memory, and
 //! [`TcpStream::write_zc`] transmits from one without copying.
 //!
+//! A [`RecvStream`] receives without being given a buffer at all: the
+//! kernel picks one from the shard's pool as data arrives, and one request
+//! serves every receive on the connection.
+//!
 //! [`BufReader`] and [`BufWriter`] (from [`io`](crate::io), re-exported
 //! here) put a buffer in front of a TCP stream, for protocols made of lines
 //! or of many small pieces.
 
 use std::io;
+use std::marker::PhantomData;
 use std::net::{Shutdown, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::rc::Rc;
+use std::task::{Context, Poll};
 
 use io_uring::{opcode, types};
 use socket2::{Domain, Protocol, SockAddr, SockRef, Socket, Type};
 
-use crate::buf::{FixedBuf, IoBuf, IoBufMut};
-use crate::reactor::{HeldOp, Op};
+use crate::buf::{FixedBuf, IoBuf, IoBufMut, RecvBuf};
+use crate::reactor::{HeldOp, MultiPoll, Op, RECV_GROUP};
+use crate::runtime::{try_current, wake_quietly};
 
 pub use crate::io::{BufReader, BufWriter};
 
@@ -214,6 +221,215 @@ macro_rules! buffered_stream {
 
 buffered_stream!(TcpStream);
 buffered_stream!(UnixStream);
+
+/// The receiving side of a stream socket, served by one standing request.
+///
+/// An ordinary [`read`](TcpStream::read) is a request to the kernel each
+/// time: here is a buffer, fill it. A receive stream asks once. From then
+/// on the kernel takes a buffer from the shard's pool
+/// ([`Runtime::recv_buffers`](crate::Runtime::recv_buffers)) whenever data
+/// arrives on the connection, fills it and reports it, and
+/// [`next`](Self::next) hands those buffers over one at a time. On a busy
+/// connection that saves a request per receive, and memory is tied up only
+/// by connections that have data, not by every connection that is waiting
+/// for some.
+///
+/// ```no_run
+/// use starfish::net::TcpStream;
+///
+/// # async fn example(stream: TcpStream) -> std::io::Result<()> {
+/// let mut incoming = stream.recv_stream()?;
+/// while let Some(data) = incoming.next().await? {
+///     // `data` is a buffer of the pool; sending it back copies nothing.
+///     let (result, _) = stream.write_all(data).await;
+///     result?;
+/// }
+/// # Ok(()) }
+/// ```
+///
+/// Made by [`TcpStream::recv_stream`] and [`UnixStream::recv_stream`]. It
+/// borrows the socket and stays on the shard it was made on.
+///
+/// # What to watch for
+///
+/// - Data arrives whether or not `next` is being called, into buffers that
+///   wait in the stream. A task that stops calling `next` without dropping
+///   the stream holds those buffers, and when every buffer of the pool is
+///   held, the shard's receive streams all wait. Give buffers back promptly
+///   (by dropping each [`RecvBuf`]) and size the pool for the connections
+///   that are active at once.
+/// - Dropping the stream discards data it has received and not handed
+///   over, which is gone from the connection. Drop it when done with the
+///   connection, not to switch back to `read` in the middle.
+/// - Use one way of receiving per connection at a time: a `read`, or a
+///   second receive stream, alongside this one would each get some of the
+///   data, in no useful order.
+#[must_use = "a receive stream receives nothing until `next` is called"]
+pub struct RecvStream<'a> {
+    fd: RawFd,
+    /// The standing request, once made; `None` before the first `next`,
+    /// and after the kernel ended it, until it is made again.
+    key: Option<usize>,
+    /// The peer has closed its side: there is nothing more to receive.
+    ended: bool,
+    _socket: PhantomData<&'a OwnedFd>,
+    /// The request belongs to the ring of the shard that made it.
+    _not_send: PhantomData<*const ()>,
+}
+
+/// The error for a receive stream on a runtime without receive buffers.
+fn no_recv_buffers() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "the runtime was started without receive buffers (Runtime::recv_buffers)",
+    )
+}
+
+impl<'a> RecvStream<'a> {
+    /// A receive stream for `fd`, which the caller keeps open for `'a`.
+    /// Nothing is asked of the kernel until the first `next`.
+    fn new(fd: RawFd) -> io::Result<RecvStream<'a>> {
+        let shard = try_current().ok_or_else(|| io::Error::other(crate::Error::NoRuntime))?;
+        let pool = shard.reactor.with(|reactor| reactor.recv_region()).flatten();
+        if pool.is_none() {
+            return Err(no_recv_buffers());
+        }
+        Ok(RecvStream {
+            fd,
+            key: None,
+            ended: false,
+            _socket: PhantomData,
+            _not_send: PhantomData,
+        })
+    }
+
+    /// Waits for the next piece of data and returns the buffer holding it,
+    /// or `None` once the peer has closed its side of the connection (and
+    /// on every call after that).
+    ///
+    /// A buffer holds what one receive brought: at least one byte, at most
+    /// the pool's buffer size, with no relation to how the peer divided its
+    /// writes.
+    ///
+    /// Dropping the future loses nothing: data that arrives meanwhile is
+    /// kept for the next call. That makes it safe to use in
+    /// [`select`](crate::select()) and under [`timeout`](crate::timeout).
+    ///
+    /// # Errors
+    ///
+    /// The kernel's error for the connection, such as `ConnectionReset`.
+    /// The stream can still be used after an error, though a broken
+    /// connection will only report it again.
+    pub async fn next(&mut self) -> io::Result<Option<RecvBuf>> {
+        std::future::poll_fn(|cx| self.poll_next(cx)).await
+    }
+
+    /// One step of [`next`](Self::next): hands over a completion the
+    /// kernel has posted, makes the standing request if there is none, or
+    /// leaves the task's waker where it will be woken.
+    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<RecvBuf>>> {
+        let Some(shard) = try_current() else {
+            return Poll::Ready(Err(io::Error::other(crate::Error::NoRuntime)));
+        };
+        loop {
+            if self.ended {
+                return Poll::Ready(Ok(None));
+            }
+            let mut waker = Some(cx.waker().clone());
+            let key = match self.key {
+                Some(key) => key,
+                None => {
+                    // The request is only worth making while the kernel has
+                    // a buffer to fill; without one it would end at once.
+                    let fd = self.fd;
+                    let made = shard.reactor.with(|reactor| match reactor.recv_available(&mut waker) {
+                        None => Err(no_recv_buffers()),
+                        Some(false) => Ok(None),
+                        Some(true) => {
+                            let sqe = opcode::RecvMulti::new(types::Fd(fd), RECV_GROUP).build();
+                            reactor.submit_multi(sqe).map(Some)
+                        }
+                    });
+                    match made {
+                        Some(Ok(Some(key))) => {
+                            self.key = Some(key);
+                            key
+                        }
+                        // Every buffer is lent; woken when one comes back.
+                        Some(Ok(None)) => return Poll::Pending,
+                        Some(Err(err)) => return Poll::Ready(Err(err)),
+                        None => {
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
+                        }
+                    }
+                }
+            };
+            let polled = shard
+                .reactor
+                .with(|reactor| (reactor.poll_multi(key, &mut waker), reactor.recv_region()));
+            let (result, flags, region) = match polled {
+                Some((MultiPoll::Item(result, flags), region)) => (result, flags, region),
+                Some((MultiPoll::Finished, _)) => {
+                    // The kernel ended the request; make another.
+                    self.key = None;
+                    continue;
+                }
+                Some((MultiPoll::Pending(previous), _)) => {
+                    drop(previous);
+                    return Poll::Pending;
+                }
+                None => {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+            };
+            let buffer = match (io_uring::cqueue::buffer_select(flags), region) {
+                (Some(index), Some(region)) => Some(RecvBuf::new(region, index, result.max(0) as usize)),
+                _ => None,
+            };
+            if result > 0 {
+                return Poll::Ready(buffer.map(Some).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "data arrived without a buffer")
+                }));
+            }
+            // Nothing was received; a buffer that came along goes back.
+            drop(buffer);
+            match result.wrapping_neg() {
+                0 => self.ended = true,
+                // The kernel found the pool empty and ended the request.
+                // The next turn waits for a buffer and asks again.
+                libc::ENOBUFS => {}
+                code => return Poll::Ready(Err(io::Error::from_raw_os_error(code))),
+            }
+        }
+    }
+}
+
+impl Drop for RecvStream<'_> {
+    /// Withdraws the standing request. Data received and not handed over
+    /// is discarded and its buffers go back to the pool, as do those of
+    /// anything the kernel still delivers before the request is gone.
+    fn drop(&mut self) {
+        let (Some(key), Some(shard)) = (self.key, try_current()) else {
+            return;
+        };
+        let wakers = shard.reactor.with(|reactor| reactor.abandon_multi(key));
+        for waker in wakers.unwrap_or_default() {
+            wake_quietly(waker);
+        }
+    }
+}
+
+impl std::fmt::Debug for RecvStream<'_> {
+    /// Prints the socket's descriptor and whether the stream has ended.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecvStream")
+            .field("fd", &self.fd)
+            .field("ended", &self.ended)
+            .finish_non_exhaustive()
+    }
+}
 
 /// Looks up the addresses of a host name, with the system's resolver.
 ///
@@ -439,6 +655,19 @@ impl TcpStream {
     /// none: there would be no telling that from a closed connection.
     pub async fn read<B: IoBufMut>(&self, buf: B) -> (io::Result<usize>, B) {
         stream_read(self.fd.as_raw_fd(), buf).await
+    }
+
+    /// Starts receiving through the shard's pool of receive buffers: the
+    /// kernel picks a buffer as data arrives, and one standing request
+    /// serves the whole connection. See [`RecvStream`].
+    ///
+    /// # Errors
+    ///
+    /// `Unsupported` if the runtime was started without
+    /// [`recv_buffers`](crate::Runtime::recv_buffers), and an error outside
+    /// a runtime.
+    pub fn recv_stream(&self) -> io::Result<RecvStream<'_>> {
+        RecvStream::new(self.fd.as_raw_fd())
     }
 
     /// Writes some prefix of `buf` and returns how many bytes were sent, which
@@ -875,6 +1104,19 @@ impl UnixStream {
     /// none: there would be no telling that from a closed connection.
     pub async fn read<B: IoBufMut>(&self, buf: B) -> (io::Result<usize>, B) {
         stream_read(self.fd.as_raw_fd(), buf).await
+    }
+
+    /// Starts receiving through the shard's pool of receive buffers: the
+    /// kernel picks a buffer as data arrives, and one standing request
+    /// serves the whole connection. See [`RecvStream`].
+    ///
+    /// # Errors
+    ///
+    /// `Unsupported` if the runtime was started without
+    /// [`recv_buffers`](crate::Runtime::recv_buffers), and an error outside
+    /// a runtime.
+    pub fn recv_stream(&self) -> io::Result<RecvStream<'_>> {
+        RecvStream::new(self.fd.as_raw_fd())
     }
 
     /// Writes some prefix of `buf` and returns how many bytes were sent,
