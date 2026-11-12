@@ -527,8 +527,8 @@ impl DirEntry {
 /// on a thread outside the runtime ([`run_blocking`](crate::run_blocking))
 /// while the task waits. That costs more than other file calls and the
 /// whole listing is held in memory: fine for finding one's files at
-/// start-up, not for a hot path or for directories with millions of
-/// entries.
+/// start-up, not for a hot path. For a directory too large to hold as one
+/// list, use [`ReadDir`], which reads it a part at a time.
 pub async fn read_dir(path: impl AsRef<Path>) -> io::Result<Vec<DirEntry>> {
     let directory = path.as_ref().to_path_buf();
     crate::run_blocking(move || {
@@ -545,6 +545,163 @@ pub async fn read_dir(path: impl AsRef<Path>) -> io::Result<Vec<DirEntry>> {
     })
     .await?
 }
+
+/// A directory being listed a part at a time, for directories too large
+/// to hold in memory as one list, or of which only the beginning is wanted.
+///
+/// [`read_dir`] reads the whole directory before returning anything. This
+/// reads a batch of entries, hands them out one by one, and reads the next
+/// batch when they are used up, so memory stays bounded by the batch size
+/// whatever the directory holds, and stopping early costs nothing more.
+///
+/// ```no_run
+/// use starfish::fs::ReadDir;
+///
+/// # async fn example() -> std::io::Result<()> {
+/// let mut listing = ReadDir::open("/var/spool/queue").await?;
+/// let mut files = 0u64;
+/// while let Some(entry) = listing.next().await? {
+///     if entry.is_file() {
+///         files += 1;
+///     }
+/// }
+/// # Ok(()) }
+/// ```
+///
+/// Like `read_dir`, it works on a thread outside the runtime
+/// ([`run_blocking`](crate::run_blocking)), once to open the directory and
+/// once per batch; the entries of a batch are then handed out without
+/// waiting. `.` and `..` are left out and the order is whatever the
+/// filesystem returns. An entry created or removed while the listing is
+/// under way may or may not appear.
+pub struct ReadDir {
+    directory: PathBuf,
+    /// The system's listing. It travels to the blocking thread for each
+    /// batch and comes back; `None` while it is away, at the end, and for
+    /// good if a call was dropped while it was away.
+    listing: Option<std::fs::ReadDir>,
+    /// Entries read and not handed out yet.
+    batch: std::collections::VecDeque<DirEntry>,
+    batch_size: usize,
+    /// The directory has been read to its end.
+    finished: bool,
+    /// A failure met while reading the current batch, to be reported once
+    /// the entries read before it have been handed out.
+    failed: Option<io::Error>,
+}
+
+/// How many entries [`ReadDir`] reads at a time unless told otherwise.
+const READ_DIR_BATCH: usize = 256;
+
+impl ReadDir {
+    /// Opens a directory for listing.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` if nothing is at `path`, `NotADirectory` if it is not a
+    /// directory, `PermissionDenied` if it may not be read.
+    pub async fn open(path: impl AsRef<Path>) -> io::Result<ReadDir> {
+        let directory = path.as_ref().to_path_buf();
+        let opened = directory.clone();
+        let listing = crate::run_blocking(move || std::fs::read_dir(opened)).await??;
+        Ok(ReadDir {
+            directory,
+            listing: Some(listing),
+            batch: std::collections::VecDeque::new(),
+            batch_size: READ_DIR_BATCH,
+            finished: false,
+            failed: None,
+        })
+    }
+
+    /// Sets how many entries are read at a time; 256 unless set, and at
+    /// least 1. A larger batch means fewer trips to a blocking thread and
+    /// more entries held in memory at once.
+    pub fn batch_size(mut self, entries: usize) -> ReadDir {
+        self.batch_size = entries.max(1);
+        self
+    }
+
+    /// The next entry, or `None` at the end of the directory (and on every
+    /// call after that).
+    ///
+    /// It returns at once while the current batch lasts, and waits for a
+    /// blocking thread when the next batch has to be read.
+    ///
+    /// # Errors
+    ///
+    /// The system's error if reading the directory fails, after the entries
+    /// read before the failure; the listing ends there. Also an error if an earlier call was dropped while it was
+    /// reading a batch: the listing's position went with that call. Do not
+    /// put `next` under a [`timeout`](crate::timeout) or in a
+    /// [`select`](crate::select()) unless the listing is to be abandoned
+    /// when the other side wins.
+    pub async fn next(&mut self) -> io::Result<Option<DirEntry>> {
+        if let Some(entry) = self.batch.pop_front() {
+            return Ok(Some(entry));
+        }
+        if let Some(err) = self.failed.take() {
+            return Err(err);
+        }
+        if self.finished {
+            return Ok(None);
+        }
+        let Some(mut listing) = self.listing.take() else {
+            return Err(io::Error::other(
+                "an earlier call on this directory listing was dropped before it finished",
+            ));
+        };
+        let directory = self.directory.clone();
+        let wanted = self.batch_size;
+        let read = crate::run_blocking(move || {
+            let mut entries = std::collections::VecDeque::with_capacity(wanted.min(4096));
+            let mut outcome = Ok(false);
+            while entries.len() < wanted {
+                match listing.next() {
+                    Some(Ok(entry)) => entries.push_back(DirEntry {
+                        directory: directory.clone(),
+                        name: entry.file_name(),
+                        file_type: entry.file_type().ok(),
+                    }),
+                    Some(Err(err)) => {
+                        outcome = Err(err);
+                        break;
+                    }
+                    None => {
+                        outcome = Ok(true);
+                        break;
+                    }
+                }
+            }
+            (listing, entries, outcome)
+        })
+        .await;
+        let (listing, entries, outcome) = match read {
+            Ok(read) => read,
+            Err(err) => {
+                self.finished = true;
+                return Err(io::Error::other(err));
+            }
+        };
+        self.batch = entries;
+        match outcome {
+            // The end: the system's listing is closed here, by dropping it.
+            Ok(true) => self.finished = true,
+            Ok(false) => self.listing = Some(listing),
+            Err(err) => {
+                // Entries read before the failure are handed out first.
+                self.finished = true;
+                self.failed = Some(err);
+            }
+        }
+        match self.batch.pop_front() {
+            Some(entry) => Ok(Some(entry)),
+            None => self.failed.take().map_or(Ok(None), Err),
+        }
+    }
+}
+
+debug_impl!(ReadDir, "directory" => |listing| listing.directory, "finished" => |listing| listing.finished);
 
 /// Makes a change to a directory durable: a file created, removed or
 /// renamed in it survives a crash only once this has returned.

@@ -1835,7 +1835,10 @@ fn blocking_work_runs_off_the_shard() {
             for _ in 0..50 {
                 used.insert(run_blocking(|| std::thread::current().id()).await.unwrap());
             }
-            assert!(used.len() <= 3, "{} threads for sequential work", used.len());
+            // The pool belongs to the whole process, and other tests use
+            // it at the same time, so this is not always one thread; it is
+            // far from one per piece of work.
+            assert!(used.len() <= 10, "{} threads for sequential work", used.len());
 
             // Many at once, from two shards, each on a thread of its own.
             let burst = |count: u64| async move {
@@ -1949,6 +1952,57 @@ fn files_are_read_and_written_in_order_through_a_cursor() {
                 assert_eq!(tail.get_ref().get_ref().size().await.unwrap(), size + 8);
 
                 remove_file(&path).await.unwrap();
+            }
+        })
+        .unwrap();
+}
+
+#[test]
+fn a_directory_can_be_listed_a_part_at_a_time() {
+    use starfish::fs::{create_dir, read_dir, remove_dir_all, ReadDir};
+
+    let root = scratch("listing");
+    rt(1)
+        .run({
+            let root = root.clone();
+            move || async move {
+                create_dir(&root).await.unwrap();
+                create_dir(root.join("sub")).await.unwrap();
+                for index in 0..1000 {
+                    File::create(root.join(format!("file-{index:04}"))).await.unwrap();
+                }
+                // Batches smaller than, equal to and larger than the
+                // directory all give the same entries as the whole listing.
+                let mut whole: Vec<_> = read_dir(&root).await.unwrap().iter().map(|e| e.path()).collect();
+                whole.sort();
+                assert_eq!(whole.len(), 1001);
+                for batch in [1, 7, 256, 1001, 5000] {
+                    let mut listing = ReadDir::open(&root).await.unwrap().batch_size(batch);
+                    let (mut paths, mut directories) = (Vec::new(), 0);
+                    while let Some(entry) = listing.next().await.unwrap() {
+                        directories += usize::from(entry.is_dir());
+                        paths.push(entry.path());
+                    }
+                    // The end stays the end.
+                    assert!(listing.next().await.unwrap().is_none());
+                    paths.sort();
+                    assert!(paths == whole, "batches of {batch} differ from the whole listing");
+                    assert_eq!(directories, 1);
+                }
+                // Stopping early is allowed, and so is an empty directory.
+                let mut listing = ReadDir::open(&root).await.unwrap().batch_size(10);
+                for _ in 0..25 {
+                    listing.next().await.unwrap().unwrap();
+                }
+                drop(listing);
+                let mut empty = ReadDir::open(root.join("sub")).await.unwrap();
+                assert!(empty.next().await.unwrap().is_none());
+
+                let missing = ReadDir::open(root.join("nowhere")).await.err().unwrap();
+                assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+                let not_one = ReadDir::open(root.join("file-0000")).await.err().unwrap();
+                assert_eq!(not_one.kind(), std::io::ErrorKind::NotADirectory);
+                remove_dir_all(&root).await.unwrap();
             }
         })
         .unwrap();

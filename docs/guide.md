@@ -1371,9 +1371,15 @@ async fn replace(dir: &str, name: &str, contents: Vec<u8>) -> std::io::Result<()
 
 - `read_dir` is the one call that is not done through io_uring, because
   the kernel offers no way. It runs as [blocking work](#blocking-work) on
-  a thread outside the runtime and returns the whole listing at once. That is fine for finding one's files
-  at start-up, and wrong for a hot path or for directories with millions
-  of entries.
+  a thread outside the runtime and returns the whole listing at once.
+  That is fine for finding one's files at start-up, and wrong for a hot
+  path.
+- For a directory too large to hold as one list, or of which only the
+  beginning is wanted, [`ReadDir`](crate::fs::ReadDir) reads a batch of
+  entries at a time (256 unless told otherwise) and hands them out one by
+  one. A `ReadDir::next` that is dropped while it is reading a batch
+  takes the listing's position with it, and later calls fail: do not put
+  it under `timeout` or in `select`.
 - The order of a listing is whatever the filesystem returns. Sort it if
   the order matters.
 - `rename` replaces the target if it exists, and both names must be on
