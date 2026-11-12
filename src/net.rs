@@ -33,6 +33,18 @@ fn to_socket_addr(addr: SockAddr) -> io::Result<SocketAddr> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "not an IP socket address"))
 }
 
+/// Turns the kernel's form of a socket address into a Unix-domain address.
+/// Fails with `InvalidData` for an address of another family, which a
+/// Unix-domain socket never has.
+fn to_unix_addr(addr: SockAddr) -> io::Result<std::os::unix::net::SocketAddr> {
+    if addr.is_unnamed() {
+        // An end that never bound: the address with the empty path.
+        return std::os::unix::net::SocketAddr::from_pathname("");
+    }
+    addr.as_unix()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "not a Unix socket address"))
+}
+
 /// A length as the 32-bit number one io_uring operation takes, clamped to
 /// the largest it can express. A longer buffer is transferred in part, like
 /// any other short read or write.
@@ -356,6 +368,21 @@ impl TcpListener {
     /// does not care about the number finds its own port.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         to_socket_addr(SockRef::from(&self.fd).local_addr()?)
+    }
+
+    /// Another handle to the same listening socket, for another shard.
+    ///
+    /// Both handles accept from one queue of connections; each connection
+    /// goes to one of them, whichever shard is waiting. The other way to
+    /// serve one port from several shards is a listener per shard bound with
+    /// [`BindOptions::reuse_port`], where the kernel spreads connections by
+    /// their addresses and each shard has a queue of its own. That spreads
+    /// load more evenly and is the better default; a shared queue suits a
+    /// socket handed over by a supervisor, which can only be bound once.
+    pub fn try_clone(&self) -> io::Result<TcpListener> {
+        Ok(TcpListener {
+            fd: self.fd.try_clone()?,
+        })
     }
 
     /// Waits for the next connection.
@@ -785,6 +812,14 @@ impl UnixListener {
         })
     }
 
+    /// The address the listener is bound to, from which
+    /// [`as_pathname`](std::os::unix::net::SocketAddr::as_pathname) gives the
+    /// socket file's path, as it was written when binding (a relative path
+    /// stays relative).
+    pub fn local_addr(&self) -> io::Result<std::os::unix::net::SocketAddr> {
+        to_unix_addr(SockRef::from(&self.fd).local_addr()?)
+    }
+
     /// Another handle to the same listening socket, for another shard.
     ///
     /// Both handles accept from one queue of connections; each connection goes
@@ -862,6 +897,22 @@ impl UnixStream {
     /// 0 once it has consumed what was sent.
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         SockRef::from(&self.fd).shutdown(how)
+    }
+
+    /// The address of the other end. For the connecting side this is the
+    /// listener's path. For an accepted connection it is usually unnamed
+    /// ([`is_unnamed`](std::os::unix::net::SocketAddr::is_unnamed)), since
+    /// clients rarely bind before connecting; to learn who is calling, use
+    /// [`peer_credentials`](Self::peer_credentials).
+    pub fn peer_addr(&self) -> io::Result<std::os::unix::net::SocketAddr> {
+        to_unix_addr(SockRef::from(&self.fd).peer_addr()?)
+    }
+
+    /// The address of this end: the listener's path for an accepted
+    /// connection, and usually unnamed for one made with
+    /// [`connect`](Self::connect).
+    pub fn local_addr(&self) -> io::Result<std::os::unix::net::SocketAddr> {
+        to_unix_addr(SockRef::from(&self.fd).local_addr()?)
     }
 
     /// The process on the other end: its process, user and group ids, as

@@ -1955,6 +1955,33 @@ fn files_are_read_and_written_in_order_through_a_cursor() {
 }
 
 #[test]
+fn a_cloned_tcp_listener_shares_one_queue_between_shards() {
+    rt(2)
+        .run(|| async {
+            let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let other = listener.try_clone().unwrap();
+            assert_eq!(other.local_addr().unwrap(), addr);
+            // Only the other shard accepts, through its clone.
+            let accepted = spawn(submit_to(1, move || async move {
+                let stream = other.accept().await.unwrap();
+                let (result, buf) = stream.read(Vec::with_capacity(16)).await;
+                result.unwrap();
+                (shard_id().unwrap(), buf)
+            }));
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let (result, _) = stream.write_all("over there").await;
+            result.unwrap();
+            assert_eq!(accepted.await.unwrap().unwrap(), (1, b"over there".to_vec()));
+            // The original still listens once the clone is gone.
+            let pending = spawn(async move { listener.accept().await.map(|_| ()) });
+            let _second = TcpStream::connect(addr).await.unwrap();
+            pending.await.unwrap().unwrap();
+        })
+        .unwrap();
+}
+
+#[test]
 fn unix_sockets_connect_processes_on_one_machine() {
     use starfish::net::{UnixListener, UnixStream};
 
@@ -1964,6 +1991,7 @@ fn unix_sockets_connect_processes_on_one_machine() {
             let path = path.clone();
             move || async move {
                 let listener = UnixListener::bind(&path).unwrap();
+                assert_eq!(listener.local_addr().unwrap().as_pathname(), Some(path.as_path()));
                 // A path holds one socket; a second bind is refused, and so
                 // is one over the file a listener leaves behind.
                 let taken = UnixListener::bind(&path).err().unwrap();
@@ -1978,6 +2006,11 @@ fn unix_sockets_connect_processes_on_one_machine() {
                     let listener = listener.try_clone().unwrap();
                     acceptors.push(spawn(submit_to(shard, move || async move {
                         let stream = listener.accept().await.unwrap();
+                        // The accepted end is at the listener's path; the
+                        // client never bound, so it has no name.
+                        let here = stream.local_addr().unwrap();
+                        assert_eq!(here.as_pathname(), listener.local_addr().unwrap().as_pathname());
+                        assert!(stream.peer_addr().unwrap().is_unnamed());
                         let me = stream.peer_credentials().unwrap();
                         // SAFETY: plain system calls.
                         let (pid, uid) = unsafe { (libc::getpid(), libc::getuid()) };
@@ -1997,6 +2030,8 @@ fn unix_sockets_connect_processes_on_one_machine() {
                 let mut served_by = Vec::new();
                 for client in 0..3 {
                     let stream = UnixStream::connect(&path).await.unwrap();
+                    assert_eq!(stream.peer_addr().unwrap().as_pathname(), Some(path.as_path()));
+                    assert!(stream.local_addr().unwrap().is_unnamed());
                     let (result, _) = stream.write_all(format!("hello {client}\n")).await;
                     result.unwrap();
                     let (result, reply) = stream.read(Vec::with_capacity(64)).await;
