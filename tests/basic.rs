@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use starfish::fs::{AlignedBuf, DmaFile, File, DMA_ALIGNMENT};
 use starfish::net::{BufReader, BufWriter, TcpListener, TcpStream};
 use starfish::signal::Signals;
-use starfish::sync::{channel, shared_channel, Gate, Semaphore};
+use starfish::sync::{channel, shared_spsc, Gate, Semaphore};
 use starfish::{shard_count, shard_id, sleep, spawn, submit_to, submit_to_all, timeout, yield_now};
 use starfish::{maybe_yield, Error, Runtime, SchedulingGroup, Sharded};
 use std::cell::RefCell;
@@ -567,7 +567,7 @@ fn direct_io_round_trip() {
             let (memory, disk) = (file.memory_alignment(), file.disk_alignment());
             assert!(memory.is_power_of_two() && disk.is_power_of_two());
             assert!(memory <= DMA_ALIGNMENT && disk <= DMA_ALIGNMENT, "{memory} {disk}");
-            let exact = file.alloc(1).unwrap();
+            let exact = file.alloc_buf(1).unwrap();
             assert_eq!(exact.capacity(), memory.max(disk));
             assert_eq!(exact.alignment(), memory.max(disk));
             assert!(AlignedBuf::with_alignment(100, 3).is_err());
@@ -872,7 +872,7 @@ fn zero_copy_send_returns_before_the_buffer_does() {
                 let mut buf = FixedBuf::acquire().await.unwrap();
                 let chunk: Vec<u8> = (0..40_000u32).map(|i| (i ^ round) as u8).collect();
                 buf.fill_from(&chunk);
-                let mut sent = stream.send_zc(buf).await.unwrap();
+                let mut sent = stream.write_zc(buf).await.unwrap();
                 // A short send is finished by copying the rest.
                 while sent < chunk.len() {
                     let (result, _) = stream.write(chunk[sent..].to_vec()).await;
@@ -1458,7 +1458,7 @@ fn shared_channel_carries_a_stream_between_shards() {
         .run(|| async {
             // Shard 1 produces as fast as it can; shard 2 consumes, pausing
             // now and then. Four places in the queue are enough.
-            let (mut sender, mut receiver) = shared_channel(4);
+            let (mut sender, mut receiver) = shared_spsc(4);
             let producer = spawn(submit_to(1, move || async move {
                 for value in 0..VALUES {
                     sender.send(value).await.unwrap();
@@ -1482,7 +1482,7 @@ fn shared_channel_carries_a_stream_between_shards() {
             assert_eq!(count, VALUES);
 
             // The receiver goes away while the sender is blocked.
-            let (mut sender, receiver) = shared_channel(2);
+            let (mut sender, receiver) = shared_spsc(2);
             let blocked = spawn(submit_to(1, move || async move {
                 let mut sent = 0u32;
                 while sender.send(sent).await.is_ok() {
@@ -1495,7 +1495,7 @@ fn shared_channel_carries_a_stream_between_shards() {
             let sent = timeout(Duration::from_secs(5), blocked).await.unwrap().unwrap().unwrap();
 
             // The sender goes away while the receiver waits.
-            let (sender, mut receiver) = shared_channel::<u32>(2);
+            let (sender, mut receiver) = shared_spsc::<u32>(2);
             let waiting = spawn(async move { receiver.recv().await });
             yield_now().await;
             submit_to(1, move || async move { drop(sender) }).await.unwrap();
@@ -1727,11 +1727,11 @@ fn direct_files_can_end_between_blocks() {
             let path = path.clone();
             move || async move {
                 let file = DmaFile::create(&path).await.unwrap();
-                let block = file.alloc(1).unwrap().capacity();
+                let block = file.alloc_buf(1).unwrap().capacity();
                 file.allocate(0, 4 * block as u64).await.unwrap();
 
                 // Whole blocks go in; the file is then cut to what counts.
-                let mut buf = file.alloc(block).unwrap();
+                let mut buf = file.alloc_buf(block).unwrap();
                 buf.fill_padded(b"twelve bytes");
                 let (result, _) = file.write_at(buf, 0).await;
                 assert_eq!(result.unwrap(), block);
@@ -1740,7 +1740,7 @@ fn direct_files_can_end_between_blocks() {
                 assert_eq!(file.size().await.unwrap(), 12);
 
                 // A read of whole blocks stops at the end of the file.
-                let (result, buf) = file.read_at(file.alloc(block).unwrap(), 0).await;
+                let (result, buf) = file.read_at(file.alloc_buf(block).unwrap(), 0).await;
                 assert_eq!(result.unwrap(), 12);
                 assert_eq!(&buf[..], b"twelve bytes");
                 file.close().await.unwrap();
@@ -1907,7 +1907,7 @@ fn files_are_read_and_written_in_order_through_a_cursor() {
                 let found = metadata(&path).await.unwrap();
                 assert_eq!(found.len(), expected.len() as u64);
                 assert!(found.is_file() && !found.is_dir() && !found.is_empty());
-                assert_eq!(found.permissions() & 0o600, 0o600);
+                assert_eq!(found.mode() & 0o600, 0o600);
                 let age = found.modified().elapsed().unwrap_or_default();
                 assert!(age < Duration::from_secs(60), "{age:?}");
                 assert!(metadata(path.parent().unwrap()).await.unwrap().is_dir());
@@ -2676,7 +2676,7 @@ fn zero_copy_send_of_a_whole_buffer() {
                     *byte = round.wrapping_add(index as u8);
                 }
                 expected.extend_from_slice(&buf);
-                stream.send_all_zc(buf).await.unwrap();
+                stream.write_all_zc(buf).await.unwrap();
             }
             stream.shutdown(std::net::Shutdown::Write).unwrap();
             let received = receiver.await.unwrap();
@@ -2871,6 +2871,34 @@ fn names_are_resolved_and_trees_removed_off_the_shard() {
                 assert_eq!(metadata(&root).await.unwrap_err().kind(), std::io::ErrorKind::NotFound);
                 assert_eq!(remove_dir_all(&root).await.unwrap_err().kind(), std::io::ErrorKind::NotFound);
             }
+        })
+        .unwrap();
+}
+
+#[test]
+fn invoke_on_each_reports_every_shard_separately() {
+    rt(3)
+        .run(|| async {
+            let service = Sharded::start(|shard| Cell::new(shard * 10)).await.unwrap();
+            let outcomes = service
+                .invoke_on_each(|cell| async move {
+                    assert!(cell.get() != 10, "the instance on shard 1 refuses");
+                    cell.get()
+                })
+                .await
+                .unwrap();
+            assert_eq!(outcomes.len(), 3);
+            assert!(matches!(outcomes[0], Ok(0)));
+            assert!(matches!(outcomes[1], Err(Error::Panicked { .. })));
+            assert!(matches!(outcomes[2], Ok(20)));
+            // The same call through `invoke_on_all` keeps only the failure.
+            let all = service
+                .invoke_on_all(|cell| async move {
+                    assert!(cell.get() != 10, "the instance on shard 1 refuses");
+                })
+                .await;
+            assert!(matches!(all, Err(Error::Panicked { .. })));
+            service.stop().await.unwrap();
         })
         .unwrap();
 }

@@ -155,7 +155,7 @@ impl Rng {
 async fn run_phase(path: PathBuf, phase: Phase, plan: Plan) -> io::Result<Rates> {
     let shard = shard_id()? as u64;
     let base = shard.saturating_mul(plan.region);
-    let file = Rc::new(DmaFile::open_with(&path, libc::O_RDWR, 0).await?);
+    let file = Rc::new(DmaFile::open_raw(&path, libc::O_RDWR, 0).await?);
 
     let (direction, size, sequential) = match phase {
         Phase::Fill => (Direction::Write, plan.sequential, true),
@@ -181,7 +181,7 @@ async fn run_phase(path: PathBuf, phase: Phase, plan: Plan) -> io::Result<Rates>
                 ^ (worker as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
             let mut rng = Rng(seed | 1);
             let size_bytes = usize::try_from(size).map_err(|_| io::ErrorKind::InvalidInput)?;
-            let mut buf = file.alloc(size_bytes)?;
+            let mut buf = file.alloc_buf(size_bytes)?;
             if direction == Direction::Write {
                 // Not zeros: some devices and filesystems special-case them.
                 buf.set_len(size_bytes);

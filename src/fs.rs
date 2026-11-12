@@ -552,7 +552,7 @@ pub async fn read_dir(path: impl AsRef<Path>) -> io::Result<Vec<DirEntry>> {
 /// A directory is itself a file, of names, and like any file it has to be
 /// synced. Syncing the file whose name changed is not enough.
 pub async fn sync_dir(path: impl AsRef<Path>) -> io::Result<()> {
-    let directory = File::open_with(path, libc::O_RDONLY | libc::O_DIRECTORY, 0).await?;
+    let directory = File::open_raw(path, libc::O_RDONLY | libc::O_DIRECTORY, 0).await?;
     directory.sync_all().await?;
     directory.close().await
 }
@@ -699,7 +699,7 @@ impl OpenOptions {
     /// the kernel is asked. Otherwise the kernel's error: `NotFound`,
     /// `AlreadyExists` with [`create_new`](Self::create_new), `PermissionDenied`.
     pub async fn open(&self, path: impl AsRef<Path>) -> io::Result<File> {
-        File::open_with(path, self.flags()?, self.mode).await
+        File::open_raw(path, self.flags()?, self.mode).await
     }
 
     /// Opens a file for direct I/O.
@@ -711,7 +711,7 @@ impl OpenOptions {
         if self.append {
             return Err(invalid("a file opened for direct I/O cannot be in append mode"));
         }
-        DmaFile::open_with(path, self.flags()?, self.mode).await
+        DmaFile::open_raw(path, self.flags()?, self.mode).await
     }
 }
 
@@ -735,7 +735,7 @@ impl File {
     ///
     /// `NotFound` if there is no such file; the kernel's error otherwise.
     pub async fn open(path: impl AsRef<Path>) -> io::Result<File> {
-        File::open_with(path, libc::O_RDONLY, 0).await
+        File::open_raw(path, libc::O_RDONLY, 0).await
     }
 
     /// Opens a file for reading and writing, creating it if it does not exist
@@ -744,12 +744,12 @@ impl File {
     /// For any other combination, such as keeping the contents or refusing to
     /// replace an existing file, use [`OpenOptions`].
     pub async fn create(path: impl AsRef<Path>) -> io::Result<File> {
-        File::open_with(path, libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC, 0o644).await
+        File::open_raw(path, libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC, 0o644).await
     }
 
     /// Opens a file with raw `open(2)` flags and creation mode. For the
     /// usual combinations, [`OpenOptions`] says the same in words.
-    pub async fn open_with(path: impl AsRef<Path>, flags: i32, mode: u32) -> io::Result<File> {
+    pub async fn open_raw(path: impl AsRef<Path>, flags: i32, mode: u32) -> io::Result<File> {
         let fd = open_fd(path.as_ref(), flags, mode).await?;
         let info = stat_fd(&fd).await?;
         Ok(File {
@@ -920,7 +920,7 @@ impl<F: std::borrow::Borrow<File>> Cursor<F> {
 
 impl<F: std::borrow::Borrow<File>> crate::io::Read for Cursor<F> {
     /// Reads at the cursor's position and moves it past what was read.
-    async fn read_some(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+    async fn read_owned(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
         let (result, buf) = self.file.borrow().read_at(buf, self.position).await;
         if let Ok(read) = &result {
             self.position = self.position.saturating_add(*read as u64);
@@ -933,7 +933,7 @@ impl<F: std::borrow::Borrow<File>> crate::io::Write for Cursor<F> {
     /// Writes all of `buf` at the cursor's position and moves it past what
     /// was written. After a failed write the position is unchanged, though part
     /// of the buffer may have been written.
-    async fn write_whole(&mut self, buf: Vec<u8>) -> (io::Result<()>, Vec<u8>) {
+    async fn write_all_owned(&mut self, buf: Vec<u8>) -> (io::Result<()>, Vec<u8>) {
         let (result, buf) = self.file.borrow().write_all_at(buf, self.position).await;
         if result.is_ok() {
             self.position = self.position.saturating_add(buf.len() as u64);
@@ -977,7 +977,7 @@ impl Metadata {
 
     /// The permission bits, as in `chmod`: `0o644` and the like, including
     /// the set-user-id, set-group-id and sticky bits.
-    pub fn permissions(&self) -> u32 {
+    pub fn mode(&self) -> u32 {
         self.mode & 0o7777
     }
 
@@ -1039,7 +1039,7 @@ unsafe impl Sync for AlignedBuf {}
 impl AlignedBuf {
     /// Allocates an empty buffer aligned to [`DMA_ALIGNMENT`], with room for
     /// `capacity` bytes rounded up to whole blocks. To match a particular file
-    /// exactly, use [`DmaFile::alloc`].
+    /// exactly, use [`DmaFile::alloc_buf`].
     ///
     /// # Errors
     ///
@@ -1170,7 +1170,7 @@ impl Drop for AlignedBuf {
 /// The device dictates how buffers, offsets and lengths must be aligned.
 /// The file asks the kernel for these requirements when it is opened and
 /// reports them as [`memory_alignment`](Self::memory_alignment) and
-/// [`disk_alignment`](Self::disk_alignment); [`alloc`](Self::alloc) returns
+/// [`disk_alignment`](Self::disk_alignment); [`alloc_buf`](Self::alloc_buf) returns
 /// a buffer that satisfies both. A call that breaks them fails with
 /// `InvalidInput` before reaching the kernel.
 pub struct DmaFile {
@@ -1188,18 +1188,18 @@ impl DmaFile {
     /// `NotFound` if there is no such file, and `EINVAL` on a filesystem without
     /// direct I/O.
     pub async fn open(path: impl AsRef<Path>) -> io::Result<DmaFile> {
-        DmaFile::open_with(path, libc::O_RDONLY, 0).await
+        DmaFile::open_raw(path, libc::O_RDONLY, 0).await
     }
 
     /// Opens a file for direct reading and writing, creating it if it does
     /// not exist and emptying it if it does.
     pub async fn create(path: impl AsRef<Path>) -> io::Result<DmaFile> {
-        DmaFile::open_with(path, libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC, 0o644).await
+        DmaFile::open_raw(path, libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC, 0o644).await
     }
 
     /// Opens a file with raw `open(2)` flags (plus `O_DIRECT`) and creation
     /// mode. Fails with `EINVAL` on filesystems without direct I/O.
-    pub async fn open_with(path: impl AsRef<Path>, flags: i32, mode: u32) -> io::Result<DmaFile> {
+    pub async fn open_raw(path: impl AsRef<Path>, flags: i32, mode: u32) -> io::Result<DmaFile> {
         let fd = open_fd(path.as_ref(), flags | libc::O_DIRECT, mode).await?;
         let info = stat_fd(&fd).await?;
         Ok(DmaFile {
@@ -1227,7 +1227,7 @@ impl DmaFile {
     /// Allocates an empty buffer suitable for this file, with room for at
     /// least `capacity` bytes rounded up to whole blocks. Its memory satisfies
     /// both of the file's alignment requirements.
-    pub fn alloc(&self, capacity: usize) -> io::Result<AlignedBuf> {
+    pub fn alloc_buf(&self, capacity: usize) -> io::Result<AlignedBuf> {
         AlignedBuf::with_alignment(capacity, self.memory_alignment.max(self.disk_alignment))
     }
 
@@ -1436,7 +1436,7 @@ impl<F: std::borrow::Borrow<DmaFile>> DmaStreamWriter<F> {
     /// buffers mean fewer, larger writes.
     pub fn new(file: F, buffer_size: usize) -> io::Result<DmaStreamWriter<F>> {
         let block = file.borrow().disk_alignment().max(1);
-        let buf = file.borrow().alloc(buffer_size)?;
+        let buf = file.borrow().alloc_buf(buffer_size)?;
         Ok(DmaStreamWriter {
             file,
             buf: Some(buf),
@@ -1567,7 +1567,7 @@ impl<F: std::borrow::Borrow<DmaFile>> DmaStreamWriter<F> {
 
 impl<F: std::borrow::Borrow<DmaFile>> crate::io::Write for DmaStreamWriter<F> {
     /// Adds the buffer's contents to the stream.
-    async fn write_whole(&mut self, buf: Vec<u8>) -> (io::Result<()>, Vec<u8>) {
+    async fn write_all_owned(&mut self, buf: Vec<u8>) -> (io::Result<()>, Vec<u8>) {
         (self.write_all(&buf).await, buf)
     }
 }
@@ -1638,7 +1638,7 @@ impl<F: std::borrow::Borrow<DmaFile>> DmaStreamReader<F> {
     /// the bytes up to `position` are passed over.
     pub fn at(file: F, position: u64, buffer_size: usize) -> io::Result<DmaStreamReader<F>> {
         let block = file.borrow().disk_alignment().max(1);
-        let first = file.borrow().alloc(buffer_size)?;
+        let first = file.borrow().alloc_buf(buffer_size)?;
         let skip = usize::try_from(position.checked_rem(block as u64).unwrap_or(0)).unwrap_or(0);
         Ok(DmaStreamReader {
             file,
@@ -1668,7 +1668,7 @@ impl<F: std::borrow::Borrow<DmaFile>> DmaStreamReader<F> {
         // filled, not time that is being saved.
         self.ahead = buffers.min(64);
         while self.spare.len() <= self.ahead {
-            self.spare.push(self.file.borrow().alloc(self.buffer_size)?);
+            self.spare.push(self.file.borrow().alloc_buf(self.buffer_size)?);
         }
         Ok(self)
     }
@@ -1814,7 +1814,7 @@ impl<F: std::borrow::Borrow<DmaFile>> DmaStreamReader<F> {
 
 impl<F: std::borrow::Borrow<DmaFile>> crate::io::Read for DmaStreamReader<F> {
     /// Fills the vector with what is buffered, up to its capacity.
-    async fn read_some(&mut self, mut buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+    async fn read_owned(&mut self, mut buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
         buf.clear();
         let room = buf.capacity();
         let available = match self.fill().await {

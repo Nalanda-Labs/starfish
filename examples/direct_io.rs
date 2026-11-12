@@ -22,9 +22,9 @@ async fn app(dir: std::path::PathBuf) -> starfish::Result<()> {
     );
 
     // The smallest buffer this file accepts is one block.
-    let block = file.alloc(1)?.capacity();
+    let block = file.alloc_buf(1)?.capacity();
     for n in 0..4u64 {
-        let mut buf = file.alloc(block)?;
+        let mut buf = file.alloc_buf(block)?;
         // Records rarely fill a block; the rest is zeros.
         buf.fill_padded(format!("record {n}").as_bytes());
         let (result, _) = file.write_at(buf, n * block as u64).await;
@@ -34,7 +34,7 @@ async fn app(dir: std::path::PathBuf) -> starfish::Result<()> {
     println!("wrote 4 blocks of {block} bytes");
 
     // One read for all four blocks.
-    let (result, buf) = file.read_at(file.alloc(4 * block)?, 0).await;
+    let (result, buf) = file.read_at(file.alloc_buf(4 * block)?, 0).await;
     println!("read {} bytes back", result?);
     for record in buf.chunks(block) {
         let text: Vec<u8> = record.iter().copied().take_while(|byte| *byte != 0).collect();
@@ -42,7 +42,7 @@ async fn app(dir: std::path::PathBuf) -> starfish::Result<()> {
     }
 
     // Breaking the rules is caught before the kernel sees the request.
-    let (result, _) = file.read_at(file.alloc(block)?, 1).await;
+    let (result, _) = file.read_at(file.alloc_buf(block)?, 1).await;
     if let Err(err) = result {
         println!("reading at offset 1: {err}");
     }

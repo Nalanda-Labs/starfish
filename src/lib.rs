@@ -7,7 +7,7 @@
 //! Shards talk to each other only by message passing: [`submit_to`] runs a
 //! closure on another shard and returns its result, [`Sharded`] keeps one
 //! instance of a service on every shard, and a
-//! [`shared_channel`](sync::shared_channel) or
+//! [`shared_spsc`](sync::shared_spsc) or
 //! [`shared_mpsc`](sync::shared_mpsc) carries a stream of values from one
 //! shard, or from several, to another. All of them slow the sender down
 //! when the receiving shard falls behind.
@@ -155,7 +155,7 @@ pub use blocking::run_blocking;
 pub use error::{Error, Result};
 pub use ioqueue::IoProperties;
 pub use runtime::{shard_count, shard_id, Runtime};
-pub use sched::{maybe_yield, need_preempt, SchedulingGroup};
+pub use sched::{maybe_yield, should_yield, SchedulingGroup};
 pub use select::{interval, select, select3, select_all, Either, Either3, Interval};
 pub use sharded::Sharded;
 pub use smp::{submit_to, submit_to_all, submit_to_each};

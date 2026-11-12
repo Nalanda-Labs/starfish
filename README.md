@@ -18,7 +18,7 @@ and has not been verified.
 
 ## Requirements
 
-- Linux 6.0 or later, x86-64. (`send_zc` needs 6.0; direct-I/O alignment is
+- Linux 6.0 or later, x86-64. (`write_zc` needs 6.0; direct-I/O alignment is
   read from the kernel from 6.1 and assumed to be 4096 before that.)
 - A filesystem with `O_DIRECT` support for `DmaFile`.
 
@@ -64,7 +64,7 @@ Ctrl-C; the others do their work and exit.
 | | `sharded_counter` | A `Sharded` service with one instance per shard |
 | | `kv_store` | Data split across shards by key hash |
 | | `parallel_primes` | Dividing a computation over all shards |
-| | `shared_channel` | Streaming values between shards with backpressure |
+| | `shared_spsc` | Streaming values between shards with backpressure |
 | | `shared_mpsc` | Many shards reporting to one |
 | Coordination | `semaphore` | Limiting concurrency and budgeting memory |
 | | `rate_limiter` | A token bucket from a semaphore and a timer |
@@ -118,7 +118,7 @@ The servers listen on 127.0.0.1, ports 7000 to 7006.
   an orderly way on Ctrl-C or `SIGTERM`.
 - **Shards:** `submit_to` runs a closure on another shard over a lock-free
   queue dedicated to that pair of shards; `Sharded<T>` keeps one instance of
-  a service per shard, built and finished by futures if need be; `sync::shared_channel` streams values from one shard
+  a service per shard, built and finished by futures if need be; `sync::shared_spsc` streams values from one shard
   to another, and `sync::shared_mpsc` from several shards to one. A shard
   that falls behind slows its senders down: calls in progress between two
   shards are limited, and the channels are bounded. An idle shard can be
@@ -147,7 +147,7 @@ The servers listen on 127.0.0.1, ports 7000 to 7006.
   A buffered read that times out loses nothing and can be tried again.
 - **Buffers:** I/O takes owned buffers (`Vec<u8>`, `AlignedBuf`, and others
   through `buf::IoBuf`). `buf::FixedBuf` comes from a per-shard pool
-  registered with io_uring; `TcpStream::send_zc` sends from one without
+  registered with io_uring; `TcpStream::write_zc` sends from one without
   copying.
 - **Memory:** `alloc::ShardAlloc`, an optional global allocator with one heap
   per shard, and `alloc::on_pressure` to shed memory when a shard is over

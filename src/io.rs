@@ -41,7 +41,7 @@ pub trait Read {
     /// the buffer holds exactly the bytes read, at most its capacity.
     /// `Ok(0)` means there is nothing more (or the buffer has no
     /// capacity).
-    fn read_some(&mut self, buf: Vec<u8>) -> impl Future<Output = (io::Result<usize>, Vec<u8>)>;
+    fn read_owned(&mut self, buf: Vec<u8>) -> impl Future<Output = (io::Result<usize>, Vec<u8>)>;
 
     /// Starts a read whose future does not borrow the source, or hands
     /// the buffer back if this source cannot do that.
@@ -64,7 +64,7 @@ pub trait Write {
     /// Writes all of `buf`, in as many steps as it takes, and hands the buffer
     /// back with the outcome. On an error, how much was written before it is not
     /// known.
-    fn write_whole(&mut self, buf: Vec<u8>) -> impl Future<Output = (io::Result<()>, Vec<u8>)>;
+    fn write_all_owned(&mut self, buf: Vec<u8>) -> impl Future<Output = (io::Result<()>, Vec<u8>)>;
 }
 
 /// Default size of the buffers of [`BufReader`] and [`BufWriter`]: large
@@ -233,7 +233,7 @@ impl<S: Read> BufReader<S> {
                 match self.stream.start_read(buf) {
                     Ok(pending) => self.pending = Some(pending),
                     Err(buf) => {
-                        let (result, buf) = self.stream.read_some(buf).await;
+                        let (result, buf) = self.stream.read_owned(buf).await;
                         self.buf = buf;
                         result?;
                         return Ok(self.buffer());
@@ -472,7 +472,7 @@ impl<S: Write> BufWriter<S> {
             return Ok(());
         }
         let buf = std::mem::take(&mut self.buf);
-        let (result, mut buf) = self.stream.write_whole(buf).await;
+        let (result, mut buf) = self.stream.write_all_owned(buf).await;
         buf.clear();
         self.buf = buf;
         result

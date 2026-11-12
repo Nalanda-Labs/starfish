@@ -425,7 +425,7 @@ impl SchedulingGroup {
 /// The runtime cannot interrupt a task, so loops that may run long should
 /// check this, or simply await [`maybe_yield`]. The check is two memory
 /// reads, cheap enough for the inside of a loop.
-pub fn need_preempt() -> bool {
+pub fn should_yield() -> bool {
     completions_pending()
 }
 
@@ -447,7 +447,7 @@ pub fn need_preempt() -> bool {
 /// # }
 /// ```
 pub async fn maybe_yield() {
-    if need_preempt() {
+    if should_yield() {
         yield_now().await;
     }
 }

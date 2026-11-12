@@ -5,18 +5,18 @@
 //! held to the consumer's pace, and compared with one `submit_to` per
 //! value nothing is allocated per value.
 //!
-//! Run with `cargo run --release --example shared_channel`.
+//! Run with `cargo run --release --example shared_spsc`.
 
 use std::time::{Duration, Instant};
 
-use starfish::sync::shared_channel;
+use starfish::sync::shared_spsc;
 use starfish::{maybe_yield, sleep, spawn, submit_to, Runtime};
 
 const VALUES: u64 = 2_000_000;
 
 async fn app() -> starfish::Result<()> {
     // Made here, then each end is moved to the shard that uses it.
-    let (mut sender, mut receiver) = shared_channel(64);
+    let (mut sender, mut receiver) = shared_spsc(64);
     let start = Instant::now();
 
     let producer = spawn(submit_to(1, move || async move {
@@ -48,7 +48,7 @@ async fn app() -> starfish::Result<()> {
 
     // A slow consumer slows the producer down instead of letting the
     // queue grow: 100 values at 1 ms each take the producer 100 ms too.
-    let (mut sender, mut receiver) = shared_channel(4);
+    let (mut sender, mut receiver) = shared_spsc(4);
     let producer = spawn(submit_to(1, move || async move {
         let start = Instant::now();
         for value in 0..100u32 {

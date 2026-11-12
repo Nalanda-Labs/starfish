@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::runtime::{current, drop_quietly};
-use crate::smp::{submit_to, submit_to_all};
+use crate::smp::{submit_to, submit_to_all, submit_to_each};
 
 /// The number given to the next service to be started. Every service gets a
 /// number of its own, unique in the process, under which each shard files its
@@ -235,6 +235,57 @@ impl<T: 'static> Sharded<T> {
         .await?
         .into_iter()
         .collect()
+    }
+
+    /// Runs `f` against every instance, each on its own shard and all at the
+    /// same time, and returns every shard's outcome in shard order: its
+    /// result, or why there is none.
+    ///
+    /// Where [`invoke_on_all`](Self::invoke_on_all) gives up at the first
+    /// failure and discards the rest, this says what happened on each shard.
+    /// Use it when the calls have effects and it matters which of them took
+    /// place, or when one shard failing should not hide the others' answers.
+    ///
+    /// ```no_run
+    /// # use std::cell::Cell;
+    /// # async fn example(hits: starfish::Sharded<Cell<u64>>) -> starfish::Result<()> {
+    /// let outcomes = hits.invoke_on_each(|hits| async move { hits.get() }).await?;
+    /// for (shard, outcome) in outcomes.iter().enumerate() {
+    ///     match outcome {
+    ///         Ok(count) => println!("shard {shard}: {count}"),
+    ///         Err(error) => println!("shard {shard} failed: {error}"),
+    ///     }
+    /// }
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// The call as a whole fails only with [`Error::NoRuntime`], outside a
+    /// runtime. Every other failure is one shard's, and is in its place in
+    /// the list: [`Error::Panicked`] if `f` panicked there,
+    /// [`Error::Canceled`] if the shard shut down first,
+    /// [`Error::ServiceStopped`] if the service is no longer running there.
+    pub async fn invoke_on_each<F, Fut, R>(&self, f: F) -> Result<Vec<Result<R>>>
+    where
+        F: Fn(Rc<T>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + 'static,
+        R: Send + 'static,
+    {
+        let this = *self;
+        let f = Arc::new(f);
+        let outcomes = submit_to_each(move || {
+            let f = f.clone();
+            async move {
+                let instance = this.local()?;
+                Ok(f(instance).await)
+            }
+        })
+        .await?;
+        Ok(outcomes
+            .into_iter()
+            .map(|outcome| outcome.and_then(|inner| inner))
+            .collect())
     }
 
     /// Runs `map` against every instance, then combines the results on the

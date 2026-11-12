@@ -39,7 +39,7 @@ fn main() -> starfish::Result<()> {
             let file = DmaFile::create(&path).await?;
             let mut offset = 0;
             while offset < FILE_SIZE {
-                let mut buf = file.alloc(1 << 20)?;
+                let mut buf = file.alloc_buf(1 << 20)?;
                 buf.set_len(1 << 20);
                 buf.fill(0x5a);
                 let (result, _) = file.write_at(buf, offset).await;
@@ -62,7 +62,7 @@ fn main() -> starfish::Result<()> {
                         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(worker as u64 + 1);
                         let mut state = seed | 1;
                         spawn(async move {
-                            let mut buf = file.alloc(BLOCK as usize)?;
+                            let mut buf = file.alloc_buf(BLOCK as usize)?;
                             while Instant::now() < deadline {
                                 state ^= state << 13;
                                 state ^= state >> 7;

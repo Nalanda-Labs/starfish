@@ -6,7 +6,7 @@
 //!
 //! Reads and writes accept any [`IoBufMut`] / [`IoBuf`]. Reads into a
 //! [`FixedBuf`] use the shard's registered memory, and
-//! [`TcpStream::send_zc`] transmits from one without copying.
+//! [`TcpStream::write_zc`] transmits from one without copying.
 //!
 //! [`BufReader`] and [`BufWriter`] (from [`io`](crate::io), re-exported
 //! here) put a buffer in front of a TCP stream, for protocols made of lines
@@ -181,7 +181,7 @@ macro_rules! buffered_stream {
     };
     (@impl $stream:ty, $holder:ty) => {
         impl crate::io::Read for $holder {
-            async fn read_some(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+            async fn read_owned(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
                 <$stream>::read(self, buf).await
             }
 
@@ -193,7 +193,7 @@ macro_rules! buffered_stream {
         }
 
         impl crate::io::Write for $holder {
-            async fn write_whole(&mut self, buf: Vec<u8>) -> (io::Result<()>, Vec<u8>) {
+            async fn write_all_owned(&mut self, buf: Vec<u8>) -> (io::Result<()>, Vec<u8>) {
                 <$stream>::write_all(self, buf).await
             }
         }
@@ -450,9 +450,9 @@ impl TcpStream {
     /// up. For small messages [`write`](Self::write) is faster.
     ///
     /// The kernel may accept less than the whole buffer, and the buffer is
-    /// gone either way; [`send_all_zc`](Self::send_all_zc) sends all of
+    /// gone either way; [`write_all_zc`](Self::write_all_zc) sends all of
     /// it.
-    pub async fn send_zc(&self, buf: FixedBuf) -> io::Result<usize> {
+    pub async fn write_zc(&self, buf: FixedBuf) -> io::Result<usize> {
         let fd = types::Fd(self.fd.as_raw_fd());
         let len = clamp_len(buf.len());
         let sqe = opcode::SendZc::new(fd, IoBuf::as_ptr(&buf), len)
@@ -466,10 +466,10 @@ impl TcpStream {
     }
 
     /// Sends all of `buf` without copying it, in as many steps as it
-    /// takes. Like [`send_zc`](Self::send_zc), it returns once the data is
+    /// takes. Like [`write_zc`](Self::write_zc), it returns once the data is
     /// queued, and the buffer goes back to the pool when the peer has
     /// acknowledged all of it.
-    pub async fn send_all_zc(&self, buf: FixedBuf) -> io::Result<()> {
+    pub async fn write_all_zc(&self, buf: FixedBuf) -> io::Result<()> {
         let fd = types::Fd(self.fd.as_raw_fd());
         let index = IoBuf::fixed_index(&buf);
         let start = IoBuf::as_ptr(&buf);

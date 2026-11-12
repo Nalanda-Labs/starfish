@@ -2,7 +2,7 @@
 //!
 //! Each shard gets a pool of buffers that the kernel has mapped and pinned
 //! in advance. Reads into them skip the per-request mapping, and
-//! `send_zc` transmits from them without copying the data.
+//! `write_zc` transmits from them without copying the data.
 //!
 //! Run with `cargo run --release --example fixed_buffers`.
 
@@ -44,7 +44,7 @@ async fn app() -> starfish::Result<()> {
         buf.fill(round as u8);
         // The buffer is given away for good; it returns to the pool by
         // itself. The call reports how much of it was accepted.
-        sent += stream.send_zc(buf).await?;
+        sent += stream.write_zc(buf).await?;
     }
     stream.shutdown(Shutdown::Write)?;
 

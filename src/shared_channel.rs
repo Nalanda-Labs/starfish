@@ -64,7 +64,7 @@ impl Parked {
     }
 }
 
-/// What the two ends of a [`shared_channel`] have in common besides the
+/// What the two ends of a [`shared_spsc`] have in common besides the
 /// queue itself: each end's request to be woken, and whether each end still
 /// exists.
 #[derive(Default)]
@@ -81,7 +81,7 @@ struct Shared {
 /// Create it anywhere and move each end to the shard that will use it, for
 /// instance inside a [`submit_to`](crate::submit_to) closure. Each end is
 /// used by one task at a time. When the queue is full,
-/// [`send`](SharedSender::send) waits, so a shard that produces faster
+/// [`send`](SharedSpscSender::send) waits, so a shard that produces faster
 /// than another consumes is slowed down to its pace instead of filling
 /// memory.
 ///
@@ -91,10 +91,10 @@ struct Shared {
 ///
 /// ```no_run
 /// use starfish::submit_to;
-/// use starfish::sync::shared_channel;
+/// use starfish::sync::shared_spsc;
 ///
 /// # async fn example() -> starfish::Result<()> {
-/// let (mut sender, mut receiver) = shared_channel(64);
+/// let (mut sender, mut receiver) = shared_spsc(64);
 /// let producer = starfish::spawn(submit_to(1, move || async move {
 ///     for n in 0..10_000u64 {
 ///         if sender.send(n).await.is_err() {
@@ -111,31 +111,31 @@ struct Shared {
 /// # Ok(())
 /// # }
 /// ```
-pub fn shared_channel<T: Send>(capacity: usize) -> (SharedSender<T>, SharedReceiver<T>) {
+pub fn shared_spsc<T: Send>(capacity: usize) -> (SharedSpscSender<T>, SharedSpscReceiver<T>) {
     let (producer, consumer) = spsc::channel(capacity);
     let shared = Arc::new(Shared::default());
-    let sender = SharedSender {
+    let sender = SharedSpscSender {
         queue: producer,
         shared: shared.clone(),
     };
-    let receiver = SharedReceiver {
+    let receiver = SharedSpscReceiver {
         queue: consumer,
         shared,
     };
     (sender, receiver)
 }
 
-/// The sending end of a [`shared_channel`].
+/// The sending end of a [`shared_spsc`].
 ///
 /// It can be moved to another shard, and is used by one task at a time; the
 /// methods that send take `&mut self`. Dropping it tells the receiver that no
 /// more values will come, once it has taken those already queued.
-pub struct SharedSender<T> {
+pub struct SharedSpscSender<T> {
     queue: Producer<T>,
     shared: Arc<Shared>,
 }
 
-impl<T> SharedSender<T> {
+impl<T> SharedSpscSender<T> {
     /// Queues `value`, waiting for room if the queue is full.
     ///
     /// Dropping the future before it completes drops the value without
@@ -208,7 +208,7 @@ impl<T> SharedSender<T> {
     }
 }
 
-impl<T> Drop for SharedSender<T> {
+impl<T> Drop for SharedSpscSender<T> {
     /// Marks the sender gone and wakes the receiver, so that a receiver
     /// waiting on an empty queue learns that nothing more will come.
     fn drop(&mut self) {
@@ -217,18 +217,18 @@ impl<T> Drop for SharedSender<T> {
     }
 }
 
-/// The receiving end of a [`shared_channel`].
+/// The receiving end of a [`shared_spsc`].
 ///
 /// It can be moved to another shard, and is used by one task at a time.
 /// Dropping it makes every later send fail, and wakes a sender that is
 /// waiting for room. Values still queued at that point are dropped with the
 /// queue.
-pub struct SharedReceiver<T> {
+pub struct SharedSpscReceiver<T> {
     queue: Consumer<T>,
     shared: Arc<Shared>,
 }
 
-impl<T> SharedReceiver<T> {
+impl<T> SharedSpscReceiver<T> {
     /// Takes the next value, waiting for one if the queue is empty.
     /// `None` means no value will ever come: the queue is empty and the
     /// sender has been dropped.
@@ -269,7 +269,7 @@ impl<T> SharedReceiver<T> {
     }
 }
 
-impl<T> Drop for SharedReceiver<T> {
+impl<T> Drop for SharedSpscReceiver<T> {
     /// Marks the receiver gone and wakes the sender, so that a sender waiting
     /// for room learns that there will never be any.
     fn drop(&mut self) {
@@ -587,8 +587,8 @@ impl<T> Drop for SharedMpscReceiver<T> {
     }
 }
 
-debug_impl!(<T> SharedSender<T>);
-debug_impl!(<T> SharedReceiver<T>);
+debug_impl!(<T> SharedSpscSender<T>);
+debug_impl!(<T> SharedSpscReceiver<T>);
 debug_impl!(<T> SharedMpscSender<T>);
 debug_impl!(<T> SharedMpscReceiver<T>, "senders" => |receiver| receiver.lanes.len());
 
@@ -653,7 +653,7 @@ mod tests {
 
     #[test]
     fn a_full_queue_parks_the_sender_until_there_is_room() {
-        let (mut sender, mut receiver) = shared_channel(2);
+        let (mut sender, mut receiver) = shared_spsc(2);
         sender.try_send(1).unwrap();
         sender.try_send(2).unwrap();
         assert!(matches!(sender.try_send(3), Err(TrySendError::Full(3))));
@@ -676,7 +676,7 @@ mod tests {
 
     #[test]
     fn an_empty_queue_parks_the_receiver_until_a_value_or_the_end() {
-        let (mut sender, mut receiver) = shared_channel::<u32>(2);
+        let (mut sender, mut receiver) = shared_spsc::<u32>(2);
         let (wakes, waker) = counting_waker();
         {
             let mut receive = pin!(receiver.recv());
@@ -700,7 +700,7 @@ mod tests {
 
     #[test]
     fn a_sender_learns_that_the_receiver_is_gone() {
-        let (mut sender, receiver) = shared_channel(2);
+        let (mut sender, receiver) = shared_spsc(2);
         sender.try_send(Arc::new(1)).unwrap();
         sender.try_send(Arc::new(2)).unwrap();
         let waiting_value = Arc::new(3);
@@ -725,7 +725,7 @@ mod tests {
     #[test]
     fn two_threads_exchange_every_value_in_order() {
         let values: u64 = if cfg!(miri) { 300 } else { 200_000 };
-        let (mut sender, mut receiver) = shared_channel(4);
+        let (mut sender, mut receiver) = shared_spsc(4);
         let producer = std::thread::spawn(move || {
             block_on(async move {
                 for value in 0..values {
@@ -747,7 +747,7 @@ mod tests {
 
     #[test]
     fn a_receiver_that_leaves_releases_a_sender_on_another_thread() {
-        let (mut sender, mut receiver) = shared_channel(2);
+        let (mut sender, mut receiver) = shared_spsc(2);
         let producer = std::thread::spawn(move || {
             block_on(async move {
                 let mut sent = 0u64;

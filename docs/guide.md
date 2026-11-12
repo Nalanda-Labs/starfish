@@ -235,7 +235,7 @@ A loop that may run for long should give way to other tasks.
 ([`task_quota`](crate::Runtime::task_quota)) is used up, and checking costs
 two memory reads, so it can go inside the loop.
 [`yield_now`](crate::yield_now) yields unconditionally, and
-[`need_preempt`](crate::need_preempt) is the bare check.
+[`should_yield`](crate::should_yield) is the bare check.
 
 ```rust,no_run
 async fn checksum(data: &[u8]) -> u64 {
@@ -396,7 +396,7 @@ async fn shards() -> starfish::Result<()> {
   closure, a task on the other shard, and a wake-up through the kernel
   when that shard is asleep (see
   [Idle shards](#idle-shards-and-spin_before_sleep) below). Batch small pieces of work, or use a
-  [`shared_channel`](crate::sync::shared_channel) for a stream.
+  [`shared_spsc`](crate::sync::shared_spsc) for a stream.
 - Dropping the returned future stops the wait, not the call. The closure
   still runs to the end on the other shard; only its result is discarded.
 - A call to the shard it is made on runs in place, without a message or
@@ -490,6 +490,9 @@ async fn counters() -> starfish::Result<()> {
   service from every shard if any one fails.
 - The instance type needs no `Send`, but the factory and the closures
   given to `invoke_on` do, since they travel to the other shards.
+- `invoke_on_all` returns the first failure and drops the other shards'
+  results. [`invoke_on_each`](crate::Sharded::invoke_on_each) returns
+  every shard's outcome, for when it matters which calls took place.
 - `stop` removes the instances; it does not call anything on them. For
   an instance that must finish work first,
   [`stop_with`](crate::Sharded::stop_with) runs a future against each
@@ -529,18 +532,18 @@ an ever longer list of calls to run.
 # Streaming between shards
 
 For many values going the same way, one `submit_to` each is wasteful.
-[`shared_channel`](crate::sync::shared_channel) is a bounded queue with
+[`shared_spsc`](crate::sync::shared_spsc) is a bounded queue with
 one end on each shard. A value costs no allocation and no task, the other
 shard is woken only when it is waiting, and a full queue makes the sender
 wait.
 
 ```rust,no_run
 use starfish::submit_to;
-use starfish::sync::shared_channel;
+use starfish::sync::shared_spsc;
 
 async fn stream() -> starfish::Result<u64> {
     // Made here; each end is then moved to the shard that uses it.
-    let (mut sender, mut receiver) = shared_channel(64);
+    let (mut sender, mut receiver) = shared_spsc(64);
     let producer = starfish::spawn(submit_to(1, move || async move {
         for n in 0..10_000u64 {
             if sender.send(n).await.is_err() {
@@ -618,7 +621,7 @@ async fn collect() -> starfish::Result<u64> {
   faster than the others gets no more than its turn, and waits.
 - One receiver. There is no way to have several shards take from one
   queue.
-- As with `shared_channel`, a value queued just as the receiver is
+- As with `shared_spsc`, a value queued just as the receiver is
   dropped is lost without an error, and the capacity is rounded up to a
   power of two, at least 2.
 
@@ -714,7 +717,7 @@ async fn pipeline() {
 - Dropping the receiver drops the values still queued, and every waiting
   and later send fails, handing its value back.
 - Both ends belong to their shard. Between shards, use
-  [`shared_channel`](crate::sync::shared_channel).
+  [`shared_spsc`](crate::sync::shared_spsc).
 
 ## A single answer
 
@@ -1137,7 +1140,7 @@ async fn files() -> std::io::Result<()> {
 
 | Call | Does |
 |---|---|
-| `open`, `create`, `OpenOptions`, `open_with` | Open for reading; create or truncate; any combination in words; raw `open(2)` flags |
+| `open`, `create`, `OpenOptions`, `open_raw` | Open for reading; create or truncate; any combination in words; raw `open(2)` flags |
 | `read_at`, `write_at`, `write_all_at` | Transfer data at an offset |
 | `sync_all`, `sync_data` | Flush to the device, with or without all metadata |
 | `size`, `set_len`, `allocate` | Ask, set and reserve the length |
@@ -1199,7 +1202,7 @@ async fn open() -> std::io::Result<()> {
 cache, for programs that keep their own cache. Reads and writes go
 straight to the device and never wait behind the kernel's caching.
 Buffers, offsets and lengths must be aligned as the device demands; the
-file reports the requirements and [`alloc`](crate::fs::DmaFile::alloc)
+file reports the requirements and [`alloc_buf`](crate::fs::DmaFile::alloc_buf)
 returns a buffer that meets them.
 
 ```rust,no_run
@@ -1211,7 +1214,7 @@ async fn direct() -> std::io::Result<()> {
     // filesystem.
     file.allocate(0, 64 << 20).await?;
 
-    let mut block = file.alloc(4096)?;
+    let mut block = file.alloc_buf(4096)?;
     block.fill_padded(b"record"); // zero-padded to whole blocks
     let (result, block) = file.write_at(block, 0).await;
     result?;
@@ -1238,7 +1241,7 @@ async fn direct() -> std::io::Result<()> {
   [`set_len`](crate::fs::DmaFile::set_len).
 - A buffer whose memory, offset or length breaks the alignment rules is
   refused with `InvalidInput` before the kernel sees it. An ordinary
-  `Vec<u8>` is almost never aligned; use `alloc`, an `AlignedBuf` or a
+  `Vec<u8>` is almost never aligned; use `alloc_buf`, an `AlignedBuf` or a
   `FixedBuf`.
 - A read takes as many whole blocks as fit in the buffer's capacity; a
   capacity below one block is refused with `InvalidInput`.
@@ -1399,9 +1402,9 @@ maps and pins them once instead of on every request. A
 [`FixedBuf`](crate::buf::FixedBuf) from the pool works with every read and
 write call, on sockets and on files, including direct I/O.
 
-[`TcpStream::send_zc`](crate::net::TcpStream::send_zc) transmits from such
+[`TcpStream::write_zc`](crate::net::TcpStream::write_zc) transmits from such
 a buffer without copying it, as much of it as the kernel takes at once;
-[`send_all_zc`](crate::net::TcpStream::send_all_zc) transmits all of it.
+[`write_all_zc`](crate::net::TcpStream::write_all_zc) transmits all of it.
 
 ```rust,no_run
 use starfish::buf::FixedBuf;
@@ -1411,22 +1414,22 @@ use starfish::net::TcpStream;
 async fn send_block(stream: &TcpStream, block: &[u8]) -> starfish::Result<usize> {
     let mut buf = FixedBuf::acquire().await?;
     let length = buf.fill_from(block);
-    stream.send_all_zc(buf).await?;
+    stream.write_all_zc(buf).await?;
     Ok(length)
 }
 ```
 
 **Caveats**
 
-- `send_zc` returns when the data is queued, but the buffer goes back to
+- `write_zc` returns when the data is queued, but the buffer goes back to
   the pool only when the peer has acknowledged the data. A peer that
   reads slowly, or has silently gone away, holds buffers for as long as
   TCP takes to notice. With a small pool, one bad connection can leave
   every sender on the shard waiting in `acquire`. Size the pool for the
   number of connections, and put a `timeout` on `acquire`.
-- `send_zc` may accept only part of the buffer. It returns how much, and
+- `write_zc` may accept only part of the buffer. It returns how much, and
   the buffer is gone either way. To send all of a buffer use
-  [`send_all_zc`](crate::net::TcpStream::send_all_zc), which keeps going
+  [`write_all_zc`](crate::net::TcpStream::write_all_zc), which keeps going
   until everything is queued.
 - Zero-copy pays off from roughly 10 KiB per send. For small messages the
   bookkeeping costs more than the copy it saves; use `write`.
